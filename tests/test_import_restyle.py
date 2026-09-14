@@ -13,7 +13,7 @@ from bookclub.import_config import ImportConfig
 from bookclub.import_publication import matches_clean_content
 from bookclub.service import Service
 from bookclub.store import ClubError, Store
-from test_archive_import import ArchiveHarness
+from test_archive_import import ArchiveHarness, confirm_book_thread
 from test_bookclub import ClubFixture
 from test_bookclub_discord import not_found
 
@@ -34,6 +34,7 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.runner = SimpleNamespace(analyze=AsyncMock(), login_status=AsyncMock(),
                                       begin_login=AsyncMock(), close=AsyncMock())
         self.importer = ArchiveImporter(self.service, self.config, self.runner)
+        confirm_book_thread(self.store, self.book)
 
     async def asyncSetUp(self):
         asyncio.get_running_loop().slow_callback_duration = 1.0

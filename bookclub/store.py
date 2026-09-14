@@ -181,6 +181,24 @@ class Store:
                     db.execute("""ALTER TABLE bc_books ADD COLUMN reading_meetings INTEGER
                       CHECK(reading_meetings IS NULL OR reading_meetings BETWEEN 1 AND 100)""")
                 db.execute("INSERT INTO bc_migrations(version) VALUES(8)")
+            if not db.execute("SELECT 1 FROM bc_migrations WHERE version=9").fetchone():
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_preparation(
+                  guild_id INTEGER NOT NULL, source_id INTEGER NOT NULL,
+                  revision INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(guild_id,source_id))""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_selections(
+                  guild_id INTEGER NOT NULL, source_id INTEGER NOT NULL, thread_id INTEGER NOT NULL,
+                  decision TEXT NOT NULL CHECK(decision IN ('pending','included','excluded')),
+                  title TEXT, author TEXT, book_id TEXT REFERENCES bc_books(id),
+                  actor_id INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                  PRIMARY KEY(guild_id,source_id,thread_id))""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_coverage(
+                  guild_id INTEGER NOT NULL, source_id INTEGER NOT NULL, thread_id INTEGER NOT NULL,
+                  state TEXT NOT NULL CHECK(state IN ('unread','partial','complete','limited')),
+                  updated_at INTEGER NOT NULL, PRIMARY KEY(guild_id,source_id,thread_id))""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_preview_cursors(
+                  id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, source_id INTEGER NOT NULL,
+                  payload TEXT NOT NULL, created_at INTEGER NOT NULL)""")
+                db.execute("INSERT INTO bc_migrations(version) VALUES(9)")
 
     @contextmanager
     def tx(self):

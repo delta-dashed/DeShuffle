@@ -267,7 +267,7 @@ class ImportStoreTests(unittest.TestCase):
         self.assertEqual(migrated.one("SELECT note FROM legacy_notes")["note"], "preserved")
         self.assertEqual(migrated.one("PRAGMA user_version")["user_version"], 7)
         self.assertEqual(migrated.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": version} for version in range(1, 9)])
+                         [{"version": version} for version in range(1, 10)])
         run = ImportStore(migrated).reserve_run(1, 10, 20, "budget", "key", 1, 100, 100, {})
         restored = ImportStore(Store(self.path))
         self.assertEqual(restored.run(1, run["id"]), run)

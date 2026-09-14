@@ -15,7 +15,7 @@ from bookclub.import_config import ImportConfig
 from bookclub.service import Service
 from bookclub.store import ClubError, Store
 from bookclub.ui import Club, interaction_error
-from test_archive_import import ArchiveHarness
+from test_archive_import import ArchiveHarness, confirm_book_thread
 from test_bookclub import ClubFixture
 
 
@@ -28,6 +28,7 @@ class RecoveryFixture(ClubFixture):
                                    allowed_channel_ids=(41,), max_runs=1, max_accounted_tokens=100_000)
         self.runner = SimpleNamespace(login_status=AsyncMock(return_value=False), analyze=AsyncMock(), close=AsyncMock())
         self.importer = ArchiveImporter(self.service, self.config, self.runner)
+        confirm_book_thread(self.store, self.book)
 
     async def failed(self, state='failed'):
         snapshot = await self.importer.preview(self.h.guild, 99, 41, thread_id=51)
