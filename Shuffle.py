@@ -26,6 +26,26 @@ intents.members = True  # do not forget to enable in Dev Portal
 intents.guild_scheduled_events = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+
+@bot.event
+async def setup_hook():
+    if os.getenv('BOOKCLUB_ENABLED', '').lower() in ('1', 'true', 'yes'):
+        from bookclub.config import load_config
+        from bookclub.store import Store
+        from bookclub.ui import Club
+
+        store = Store(VOICE_STATS_DB_FILE)
+        config_file = os.getenv('BOOKCLUB_CONFIG_FILE')
+        guild_ids = None
+        if config_file:
+            guild_settings = load_config(config_file)
+            for guild_id, settings in guild_settings.items():
+                store.import_config(guild_id, settings)
+            guild_ids = set(guild_settings)
+        await bot.add_cog(Club(bot, store, guild_ids=guild_ids))
+
+
 USE_GUILD_ONLY_APP_COMMANDS = True
 
 # text_channel_id -> shuffle state
@@ -1983,6 +2003,8 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     """Log command failures and return a visible error instead of timing out."""
     if isinstance(error, commands.CommandNotFound):
         return
+    if ctx.cog and ctx.cog.qualified_name == 'Club':
+        return
 
     original = getattr(error, "original", error)
     print("Command error:")
@@ -2004,6 +2026,11 @@ async def on_app_command_error(
     error: discord.app_commands.AppCommandError,
 ):
     """Log slash command failures and answer the interaction with the exception."""
+    root = getattr(getattr(interaction, 'command', None), 'root_parent', None)
+    if root is not None and root.name == 'club':
+        from bookclub.ui import interaction_error
+        await interaction_error(interaction, getattr(error, 'original', error))
+        return
     original = getattr(error, "original", error)
     print("App command error:")
     print("".join(traceback.format_exception(type(original), original, original.__traceback__)))
