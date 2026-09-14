@@ -97,7 +97,7 @@ class CatalogStoreTests(unittest.TestCase):
             db.execute("DROP TABLE bc_forum_tags")
             db.execute("ALTER TABLE bc_publications DROP COLUMN managed_name")
             db.execute("ALTER TABLE bc_setup_resources DROP COLUMN name")
-            db.execute("DELETE FROM bc_migrations WHERE version=6")
+            db.execute("DELETE FROM bc_migrations WHERE version>=6")
         migrated = Store(self.path)
         self.assertEqual(migrated.book(1, book["id"]), book)
         self.assertEqual(migrated.one("SELECT note FROM legacy")["note"], "keep")
@@ -109,7 +109,7 @@ class CatalogStoreTests(unittest.TestCase):
         self.assertIsNone(migrated.setup_resource(1, "books")["name"])
         self.assertEqual(migrated.bindings(1, 13), [])
         self.assertEqual(Store(self.path).rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": i} for i in range(1, 7)])
+                         [{"version": i} for i in range(1, 8)])
 
     def test_tag_bindings_survive_restart_and_scope_to_forum(self):
         self.store.bind_tag(1, 13, "catalog", 100)

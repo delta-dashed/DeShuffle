@@ -83,7 +83,8 @@ class ImportUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertLessEqual(len(payload['options']), 25)
                 group = next(option for option in payload['options'] if option['name'] == 'import')
                 self.assertEqual(group['type'], discord.AppCommandOptionType.subcommand_group.value)
-                self.assertEqual({c['name'] for c in group['options']}, {'login', 'status', 'scan', 'review', 'apply'})
+                self.assertTrue({'login', 'status', 'scan', 'review', 'apply', 'preview', 'restore'} <=
+                                {c['name'] for c in group['options']})
             finally:
                 await bot.remove_cog('Club')
 

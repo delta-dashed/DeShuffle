@@ -571,6 +571,35 @@ class Service:
                 raise
             log.warning('Essay webhook %s deleted during edit; header %s remains unchanged', hook.id, starter.id)
 
+    async def _own_essay_candidates(self, guild, book, member, forum):
+        """Resolve durable author bindings using current Discord access, never a nickname."""
+        candidates = []
+        essays = sorted((essay for essay in self.store.essays(book['id'], submitted_only=False)
+                         if essay['author_id'] == member.id),
+                        key=lambda essay: (not essay['submitted'], essay['source_id']))
+        for essay in essays:
+            try:
+                thread = await self.bot.fetch_channel(essay['channel_id'])
+                if getattr(thread, 'guild', None) is None or thread.guild.id != guild.id:
+                    raise ClubError('Сохранённое эссе относится к другому серверу. Организатору: /club diagnose.')
+                if not isinstance(thread, discord.Thread) or thread.parent_id != forum.id:
+                    if essay['managed']:
+                        raise ClubError('Форум эссе изменён. Организатору нужно проверить существующую тему автора.')
+                    continue
+                if not self.can_read(thread, member):
+                    raise ClubError('Нет доступа к существующему эссе или истории его темы. Обратитесь к организатору.')
+                await thread.fetch_message(essay['source_id'])
+            except discord.NotFound:
+                self.store.delete_essay(guild.id, source_id=essay['source_id'])
+                continue
+            candidates.append((essay, thread))
+        return candidates
+
+    async def own_essays(self, guild, book_id, actor_id):
+        """Open existing work without sending messages, unarchiving, or creating a draft."""
+        member, book, forum = await self.essay_access(guild, book_id, actor_id)
+        return [essay for essay, _ in await self._own_essay_candidates(guild, book, member, forum)]
+
     async def create_essay_space(self, guild, book_id, actor_id):
         """One recoverable workspace per book/author; the author writes their own messages."""
         async with self.locks[guild.id]:
@@ -582,6 +611,20 @@ class Service:
             if not all(getattr(forum.permissions_for(guild.me), p, False) for p in
                        ('view_channel', 'send_messages', 'send_messages_in_threads', 'read_message_history')):
                 raise ClubError('Боту не хватает прав в форуме эссе. Организатору: /club diagnose.')
+            # Imported and manually registered works have managed=0. They still
+            # belong to this author and take precedence over an accidental draft.
+            existing = await self._own_essay_candidates(guild, book, member, forum)
+            for essay, thread in existing:
+                if essay['source_id'] == thread.id:
+                    if not await self.register_thread(thread, prompt=False):
+                        raise ClubError('Не удалось подтвердить пост автора. Организатору: /club diagnose.')
+                    essay = self.store.one('SELECT * FROM bc_essays WHERE guild_id=? AND source_id=?',
+                                           (guild.id, thread.id))
+                    if essay['book_id'] != book_id or essay['author_id'] != actor_id:
+                        raise ClubError('Связь эссе изменилась. Обновите карточку книги.')
+                if thread.archived:
+                    await thread.edit(archived=False)
+                return essay
             key = f'essay-space:{book_id}:{actor_id}'
             pub = self.store.publication(key)
             existing = [e for e in self.store.essays(book_id, submitted_only=False)

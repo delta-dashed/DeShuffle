@@ -97,7 +97,7 @@ class SetupStoreTests(StoreFixture, unittest.TestCase):
         restored = Store(self.path)
         self.assertEqual(restored.setup_resource(1, "news")["channel_id"], 11)
         self.assertEqual(restored.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": i} for i in range(1, 7)])
+                         [{"version": i} for i in range(1, 8)])
 
 
 class ConfigImportTests(StoreFixture, unittest.TestCase):

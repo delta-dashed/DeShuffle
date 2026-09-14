@@ -161,6 +161,20 @@ class Store:
                     if name not in columns:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT")
                 db.execute("INSERT INTO bc_migrations(version) VALUES(6)")
+            if not db.execute("SELECT 1 FROM bc_migrations WHERE version=7").fetchone():
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_plan_restores(
+                  run_id TEXT PRIMARY KEY REFERENCES bc_import_runs(id), guild_id INTEGER NOT NULL,
+                  actor_id INTEGER NOT NULL, old_state TEXT NOT NULL, plan_sha256 TEXT NOT NULL,
+                  created_at INTEGER NOT NULL)""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_restyle_audit(
+                  id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, run_id TEXT NOT NULL REFERENCES bc_import_runs(id),
+                  actor_id INTEGER NOT NULL, action TEXT NOT NULL, thread_id INTEGER NOT NULL,
+                  old_message_id INTEGER NOT NULL, new_message_id INTEGER NOT NULL, created_at INTEGER NOT NULL,
+                  UNIQUE(guild_id,run_id,action,old_message_id,new_message_id))""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_restyle_threads(
+                  guild_id INTEGER NOT NULL, run_id TEXT NOT NULL REFERENCES bc_import_runs(id),
+                  thread_id INTEGER NOT NULL, PRIMARY KEY(guild_id,run_id,thread_id))""")
+                db.execute("INSERT INTO bc_migrations(version) VALUES(7)")
 
     @contextmanager
     def tx(self):

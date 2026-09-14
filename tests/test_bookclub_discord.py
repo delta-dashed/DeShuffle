@@ -136,6 +136,11 @@ class DiscordHarness:
                 message.content = kwargs['content']
             return message
         message.edit = AsyncMock(side_effect=edit)
+        async def delete():
+            if ident not in channel.messages:
+                raise not_found()
+            del channel.messages[ident]
+        message.delete = AsyncMock(side_effect=delete)
         channel.messages[ident] = message
         return message
 
