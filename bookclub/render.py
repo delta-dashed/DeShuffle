@@ -80,6 +80,10 @@ def book_pages(store, book, settings):
     lines = [f'**{safe(b["title"])} · {safe(b["author"])}**', f'{STATUSES[b["status"]]} · очередь: {b["position"]}',
              f'Срок эссе: {time_label(b["deadline"], settings["timezone"])}',
              'Нажмите «Добавить своё эссе», чтобы открыть свой пост, или «Эссе участников», чтобы прочитать все работы.']
+    count = b.get('reading_meetings')
+    lines.append(f'План: {count} встреч по книге + 1 разбор эссе = {count + 1} всего.' if count is not None else
+                 'План встреч пока не задан: N встреч по книге + 1 разбор эссе.')
+    lines.append('Организатору: «Управление книгой» — статус и план; «Встречи» — даты и переносы.')
     lines.extend(essay_lines(store, b))
     lines.extend(['Материалы:', b['materials'] or 'Пока не добавлены.',
              'Камеры включены, микрофоны исправны. Спойлеры дальше границы чтения скрываем через ||текст||.',

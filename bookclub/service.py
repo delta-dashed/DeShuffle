@@ -528,13 +528,27 @@ class Service:
         forum = await self.forum_tags.fresh(guild, forum)
         marker = f'\n-# bc:{key}'
         pub = self.store.publication(key)
-        if pub:
+        imported = key.startswith('essay-import:')
+        if imported and pub and pub['message_id']:
+            if pub['guild_id'] != guild.id:
+                raise ClubError('Сохранённая шапка импорта относится к другому серверу.')
+            thread = await self.channel(guild, pub['channel_id'], discord.Thread)
+            if thread.parent_id != forum.id:
+                raise ClubError('Сохранённая шапка импорта относится к другому форуму.')
+            message = await thread.fetch_message(pub['message_id'])
+        elif pub:
+            if imported and (pub['guild_id'] != guild.id or pub['channel_id'] != forum.id):
+                raise ClubError('Резервирование шапки импорта относится к другому форуму или серверу.')
             found = await self._find_marker(guild, forum, marker, True, webhook_id=pub['webhook_id'])
             if not found:
                 raise ClubError('Предыдущая отправка не подтверждена. Организатору: /club diagnose и /club repair.')
             thread, message = found
         elif not self.store.settings(guild.id)['essay_webhooks']:
-            return await self.upsert(guild, key, forum.id, content, forum_name=name)
+            pub = await self.upsert(guild, key, forum.id, content, forum_name=name)
+            if not imported:
+                return pub
+            thread = await self.channel(guild, pub['channel_id'], discord.Thread)
+            message = await thread.fetch_message(pub['message_id'])
         else:
             if not forum.permissions_for(guild.me).manage_threads:
                 raise ClubError('Для работы с темами вебхука боту нужно право Manage Threads в форуме эссе.')
@@ -545,8 +559,33 @@ class Service:
                                       avatar_url=str(member.display_avatar.url), wait=True,
                                       applied_tags=tags, allowed_mentions=NO_MENTIONS)
             thread = await self.channel(guild, message.channel.id, discord.Thread)
+        if imported and (message.id != thread.id or message.content not in (content, content + marker)
+                         or not self.owns_starter(message, self.store.publication(key)['webhook_id'])):
+            raise ClubError('Не удалось подтвердить содержимое и автора шапки импортированного эссе.')
         self.store.save_publication(key, thread.id, message.id)
+        if imported:
+            await self.finish_import_header(thread, message, content, self.store.publication(key))
         return self.store.publication(key)
+
+    async def finish_import_header(self, thread, starter, content, pub):
+        """Remove a transient recovery marker only after its Discord ID is durable."""
+        key = pub['key']
+        marker = f'\n-# bc:{key}'
+        if (not key.startswith(f'essay-import:{thread.guild.id}:')
+                or pub['guild_id'] != thread.guild.id or pub['channel_id'] != thread.id
+                or pub['message_id'] != starter.id or starter.id != thread.id
+                or not self.owns_starter(starter, pub['webhook_id'])
+                or starter.content not in (content, content + marker)):
+            raise ClubError('Не удалось подтвердить содержимое и привязку шапки импортированного эссе.')
+        # A crash or lost edit acknowledgement can now resume by ID. The marker
+        # is needed only between the initial send and this committed binding.
+        self.store.save_publication(key, thread.id, starter.id)
+        if starter.content != content:
+            await self.edit_essay_starter(thread, starter, content, pub)
+        confirmed = await thread.fetch_message(starter.id)
+        if (confirmed.content != content or not self.owns_starter(confirmed, pub['webhook_id'])):
+            raise ClubError('Не удалось убрать служебную отметку из шапки эссе. Повторите исправление после проверки вебхука.')
+        self.store.save_publication(key, thread.id, starter.id, hashlib.sha256(content.encode()).hexdigest())
 
     async def edit_essay_starter(self, thread, starter, content, pub):
         if pub['webhook_id'] is None:
@@ -571,6 +610,35 @@ class Service:
                 raise
             log.warning('Essay webhook %s deleted during edit; header %s remains unchanged', hook.id, starter.id)
 
+    async def _own_essay_candidates(self, guild, book, member, forum):
+        """Resolve durable author bindings using current Discord access, never a nickname."""
+        candidates = []
+        essays = sorted((essay for essay in self.store.essays(book['id'], submitted_only=False)
+                         if essay['author_id'] == member.id),
+                        key=lambda essay: (not essay['submitted'], essay['source_id']))
+        for essay in essays:
+            try:
+                thread = await self.bot.fetch_channel(essay['channel_id'])
+                if getattr(thread, 'guild', None) is None or thread.guild.id != guild.id:
+                    raise ClubError('Сохранённое эссе относится к другому серверу. Организатору: /club diagnose.')
+                if not isinstance(thread, discord.Thread) or thread.parent_id != forum.id:
+                    if essay['managed']:
+                        raise ClubError('Форум эссе изменён. Организатору нужно проверить существующую тему автора.')
+                    continue
+                if not self.can_read(thread, member):
+                    raise ClubError('Нет доступа к существующему эссе или истории его темы. Обратитесь к организатору.')
+                await thread.fetch_message(essay['source_id'])
+            except discord.NotFound:
+                self.store.delete_essay(guild.id, source_id=essay['source_id'])
+                continue
+            candidates.append((essay, thread))
+        return candidates
+
+    async def own_essays(self, guild, book_id, actor_id):
+        """Open existing work without sending messages, unarchiving, or creating a draft."""
+        member, book, forum = await self.essay_access(guild, book_id, actor_id)
+        return [essay for essay, _ in await self._own_essay_candidates(guild, book, member, forum)]
+
     async def create_essay_space(self, guild, book_id, actor_id):
         """One recoverable workspace per book/author; the author writes their own messages."""
         async with self.locks[guild.id]:
@@ -582,6 +650,20 @@ class Service:
             if not all(getattr(forum.permissions_for(guild.me), p, False) for p in
                        ('view_channel', 'send_messages', 'send_messages_in_threads', 'read_message_history')):
                 raise ClubError('Боту не хватает прав в форуме эссе. Организатору: /club diagnose.')
+            # Imported and manually registered works have managed=0. They still
+            # belong to this author and take precedence over an accidental draft.
+            existing = await self._own_essay_candidates(guild, book, member, forum)
+            for essay, thread in existing:
+                if essay['source_id'] == thread.id:
+                    if not await self.register_thread(thread, prompt=False):
+                        raise ClubError('Не удалось подтвердить пост автора. Организатору: /club diagnose.')
+                    essay = self.store.one('SELECT * FROM bc_essays WHERE guild_id=? AND source_id=?',
+                                           (guild.id, thread.id))
+                    if essay['book_id'] != book_id or essay['author_id'] != actor_id:
+                        raise ClubError('Связь эссе изменилась. Обновите карточку книги.')
+                if thread.archived:
+                    await thread.edit(archived=False)
+                return essay
             key = f'essay-space:{book_id}:{actor_id}'
             pub = self.store.publication(key)
             existing = [e for e in self.store.essays(book_id, submitted_only=False)
@@ -647,17 +729,33 @@ class Service:
             if (not key.startswith(f'essay-import:{thread.guild.id}:') or not pub
                     or pub['guild_id'] != thread.guild.id or pub['channel_id'] != thread.id
                     or pub['message_id'] != thread.id
-                    or '-# bc:' + key not in starter.content.splitlines()
                     or not self.owns_starter(starter, pub['webhook_id'])):
                 return False
+            marker = '\n-# bc:' + key
+            if any(line.startswith('-# bc:') for line in starter.content.splitlines()):
+                if not starter.content.endswith(marker) or any(
+                        line.startswith('-# bc:') for line in starter.content[:-len(marker)].splitlines()):
+                    return False
+            # content_hash is a projection cache cleared on restart/publish.
+            # Provenance rests on the source ledger, exact IDs and real sender;
+            # a clean header must not require a visible marker or cached hash.
             target_book = self.store.book(thread.guild.id, book_id if correct and book_id else old['book_id'])
             if correct and target_book['id'] != old['book_id']:
-                # Keep the original attribution and source link while correcting
-                # the heading. The source ledger remains bound to the same copy.
+                # Keep original attribution while correcting the heading. A
+                # completed import remains authenticated without a public marker.
                 _, separator, remainder = starter.content.partition('\n')
                 content = f'**Архивное эссе по книге «{safe(target_book["title"])}»**'
                 content += separator + remainder
-                await self.edit_essay_starter(thread, starter, content, pub)
+                if content.endswith(marker):
+                    content = content[:-len(marker)]
+                try:
+                    await self.edit_essay_starter(thread, starter, content, pub)
+                except Exception:
+                    confirmed = await thread.fetch_message(starter.id)
+                    if confirmed.content != content or not self.owns_starter(confirmed, pub['webhook_id']):
+                        raise
+                confirmed = await thread.fetch_message(starter.id)
+                await self.finish_import_header(thread, confirmed, content, pub)
             self.store.register_essay(thread.guild.id, target_book['id'], thread.id, thread.id,
                                       old['author_id'], thread.name, thread.jump_url, correct=correct,
                                       managed=old['managed'], submitted=old['submitted'])

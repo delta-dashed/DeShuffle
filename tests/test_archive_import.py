@@ -11,6 +11,7 @@ import discord
 
 from bookclub.archive_import import ArchiveImporter, validate_plan
 from bookclub.import_config import ImportConfig
+from bookclub.import_publication import archive_chunks, archive_header
 from bookclub.service import Service
 from bookclub.store import ClubError, Store
 from test_bookclub import ClubFixture
@@ -320,7 +321,7 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
             await self.apply(run)
         self.assert_no_discord_writes()
 
-    async def test_approved_copy_preserves_text_files_author_and_original_links(self):
+    async def test_approved_copy_preserves_text_files_and_author_without_generated_source_links(self):
         attachment = SimpleNamespace(id=701, filename='essay.txt', size=13,
                                      to_file=AsyncMock(side_effect=lambda: discord.File(io.BytesIO(b'original-file'), filename='essay.txt')))
         self.h.first.attachments = [attachment]
@@ -332,25 +333,65 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(target.parent_id, 14)
         starter = target.messages[target.id]
         self.assertIn('<@1>', starter.content)
-        self.assertIn(self.h.first.jump_url, starter.content)
+        self.assertNotIn(self.h.first.jump_url, starter.content)
         hook, = self.h.hooks.values()
-        self.assertEqual(hook.send.await_args.kwargs['username'], self.h.members[1].display_name)
-        self.assertEqual(hook.send.await_args.kwargs['avatar_url'], str(self.h.members[1].display_avatar.url))
-        self.assertEqual(target.send.await_count, 2)
-        contents = [call.args[0] for call in target.send.await_args_list]
+        self.assertEqual(hook.send.await_count, 3)
+        for message in target.messages.values():
+            self.assertEqual(message.webhook_id, hook.id)
+            self.assertEqual(message.author.display_name, self.h.members[1].display_name)
+            self.assertEqual(message.author.display_avatar.url, str(self.h.members[1].display_avatar.url))
+            self.assertNotIn('bc:essay-import:', message.content)
+        self.assertEqual(starter.content, archive_header(self.book, 1))
+        for snapshot in run['snapshot']['messages']:
+            if snapshot['id'] not in ('61', '62'):
+                continue
+            for index, chunk in enumerate(archive_chunks(snapshot)):
+                pub = self.store.publication(f'essay-import:1:61:message:{snapshot["id"]}:{index}:v2')
+                self.assertEqual(target.messages[pub['message_id']].content, chunk)
+        target.send.assert_not_awaited()
+        body_calls = [call for call in hook.send.await_args_list if call.kwargs.get('thread') is not None]
+        contents = [call.args[0] for call in body_calls]
         self.assertIn(self.h.first.content, contents[0])
         self.assertIn(self.h.second.content, contents[1])
-        self.assertIn(self.h.second.jump_url, contents[1])
-        self.assertEqual(target.send.await_args_list[0].kwargs['files'][0].filename, 'essay.txt')
+        self.assertTrue(all(self.h.first.jump_url not in content and self.h.second.jump_url not in content for content in contents))
+        self.assertEqual(body_calls[0].kwargs['files'][0].filename, 'essay.txt')
+        copied = next(message.attachments[0] for message in target.messages.values() if message.attachments)
+        file = await copied.to_file()
+        self.assertEqual(file.fp.read(), b'original-file')
+        file.close()
         attachment.to_file.assert_awaited_once()
-        for call in [hook.send.await_args, *target.send.await_args_list]:
+        for call in hook.send.await_args_list:
+            self.assertEqual(call.kwargs['username'], self.h.members[1].display_name)
+            self.assertEqual(call.kwargs['avatar_url'], str(self.h.members[1].display_avatar.url))
             self.assertFalse(call.kwargs['allowed_mentions'].everyone)
             self.assertFalse(call.kwargs['allowed_mentions'].users)
         self.h.first.edit.assert_not_awaited()
         self.h.second.edit.assert_not_awaited()
         self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'done')
 
-    async def test_oversize_attachments_use_original_link_without_download(self):
+    async def test_all_long_body_chunks_are_clean_and_preserve_author_bc_text(self):
+        author_text = 'Автор обсуждает bc:essay-import:example.\n-# bc:author-note\n'
+        self.h.first.content = author_text + 'Размышления о книге. ' * 170
+        run = await self.scan()
+        await self.apply(run)
+        essay, = self.store.essays(self.book['id'])
+        target = self.h.channels[essay['source_id']]
+        first_snapshot = next(item for item in run['snapshot']['messages'] if item['id'] == '61')
+        chunks = archive_chunks(first_snapshot)
+        self.assertGreater(len(chunks), 1)
+        actual = []
+        for index, expected in enumerate(chunks):
+            key = f'essay-import:1:61:message:61:{index}:v2'
+            pub = self.store.publication(key)
+            message = target.messages[pub['message_id']]
+            self.assertEqual(message.content, expected)
+            self.assertNotIn('\n-# bc:' + key, message.content)
+            actual.append(message.content)
+        self.assertEqual(''.join(actual), self.h.first.content)
+        self.assertIn(author_text, actual[0])
+        self.assertEqual(target.messages[target.id].content, archive_header(self.book, 1))
+
+    async def test_oversize_attachments_explain_limit_without_source_link_or_download(self):
         attachment = SimpleNamespace(id=701, filename='large.zip', size=20_000_000, to_file=AsyncMock())
         self.h.first.attachments = [attachment]
         run = await self.scan()
@@ -360,48 +401,49 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         attachment.to_file.assert_not_awaited()
         essay, = self.store.essays(self.book['id'])
         target = self.h.channels[essay['source_id']]
-        self.assertIn('large.zip', target.send.await_args_list[0].args[0])
-        self.assertIn(self.h.first.jump_url, target.send.await_args_list[0].args[0])
+        body = next(message for message in target.messages.values() if message.id != target.id)
+        self.assertIn('large.zip', body.content)
+        self.assertIn('лимит', body.content)
+        self.assertNotIn(self.h.first.jump_url, body.content)
+        target.send.assert_not_awaited()
 
     async def test_repeated_apply_and_scan_do_not_duplicate_or_recharge(self):
         run = await self.scan()
         await self.apply(run)
         essay, = self.store.essays(self.book['id'])
         target = self.h.channels[essay['source_id']]
-        before_sends = target.send.await_count
+        hook, = self.h.hooks.values()
+        before_sends = hook.send.await_count
         await self.apply(run)
         await self.scan()
-        self.assertEqual(target.send.await_count, before_sends)
+        self.assertEqual(hook.send.await_count, before_sends)
+        target.send.assert_not_awaited()
         self.assertEqual(len(self.store.essays(self.book['id'])), 1)
-        hook, = self.h.hooks.values()
-        hook.send.assert_awaited_once()
+        self.assertEqual(hook.send.await_count, 3)
         self.runner.analyze.assert_awaited_once()
 
     async def test_lost_body_send_ack_recovers_existing_message_without_duplicates(self):
         run = await self.scan()
-        original_publish = self.service.publish_essay_starter
-        async def publish_and_interrupt(*args, **kwargs):
-            pub = await original_publish(*args, **kwargs)
-            thread = self.h.channels[pub['channel_id']]
-            original_send = thread.send.side_effect
-            async def send_then_lose_ack(content, **fields):
-                thread.send.side_effect = original_send
+        hook = self.h.webhook(14)
+        self.store.save_webhook(1, 14, hook.id)
+        original_send = hook.send.side_effect
+        async def send_then_lose_ack(content, **fields):
+            if fields.get('thread') is not None:
+                hook.send.side_effect = original_send
                 await original_send(content, **fields)
                 raise OSError('lost acknowledgement')
-            thread.send.side_effect = send_then_lose_ack
-            return pub
-        self.service.publish_essay_starter = publish_and_interrupt
+            return await original_send(content, **fields)
+        hook.send.side_effect = send_then_lose_ack
         with self.assertRaisesRegex(OSError, 'lost acknowledgement'):
             await self.apply(run)
-        self.service.publish_essay_starter = original_publish
         self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'review')
         await self.apply(run)
         essay, = self.store.essays(self.book['id'])
         target = self.h.channels[essay['source_id']]
         self.assertEqual(len(target.messages), 3)
-        self.assertEqual(target.send.await_count, 2)
-        hook, = self.h.hooks.values()
-        hook.send.assert_awaited_once()
+        self.assertTrue(all('bc:essay-import:' not in message.content for message in target.messages.values()))
+        target.send.assert_not_awaited()
+        self.assertEqual(hook.send.await_count, 3)
         self.runner.analyze.assert_awaited_once()
 
     async def test_lost_starter_ack_recovers_same_webhook_thread_after_restart(self):
@@ -420,11 +462,44 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.service = Service(self.h.bot, self.store)
         self.importer = ArchiveImporter(self.service, self.config, self.runner)
         await self.apply(run)
-        hook.send.assert_awaited_once()
+        self.assertEqual(hook.send.await_count, 3)
         essay, = self.store.essays(self.book['id'])
         target = self.h.channels[essay['source_id']]
         self.assertEqual(len(target.messages), 3)
-        self.assertEqual(target.send.await_count, 2)
+        self.assertTrue(all('bc:essay-import:' not in message.content for message in target.messages.values()))
+        target.send.assert_not_awaited()
+        self.runner.analyze.assert_awaited_once()
+
+    async def test_lost_starter_cleanup_ack_reuses_known_clean_thread_after_restart(self):
+        run = await self.scan()
+        hook = self.h.webhook(14)
+        self.store.save_webhook(1, 14, hook.id)
+        original_edit = hook.edit_message.side_effect
+        observed_binding = []
+        async def edit_then_lose_ack(message_id, **kwargs):
+            if kwargs['content'] == archive_header(self.book, 1):
+                observed_binding.append(self.store.publication('essay-import:1:61')['message_id'])
+                hook.edit_message.side_effect = original_edit
+                await original_edit(message_id, **kwargs)
+                raise OSError('lost starter cleanup acknowledgement')
+            return await original_edit(message_id, **kwargs)
+        hook.edit_message.side_effect = edit_then_lose_ack
+        with self.assertRaisesRegex(OSError, 'lost starter cleanup acknowledgement'):
+            await self.apply(run)
+        pub = self.store.publication('essay-import:1:61')
+        self.assertEqual(observed_binding, [pub['message_id']])
+        thread_id = pub['channel_id']
+        self.assertEqual(self.h.channels[thread_id].messages[thread_id].content, archive_header(self.book, 1))
+        self.store = Store(self.path, clock=lambda: self.now)
+        self.service = Service(self.h.bot, self.store)
+        self.importer = ArchiveImporter(self.service, self.config, self.runner)
+        await self.apply(run)
+        essay, = self.store.essays(self.book['id'])
+        self.assertEqual(essay['source_id'], thread_id)
+        self.assertEqual(len(self.h.channels[thread_id].messages), 3)
+        self.assertTrue(all('bc:essay-import:' not in message.content
+                            for message in self.h.channels[thread_id].messages.values()))
+        self.assertEqual(hook.send.await_count, 3)
         self.runner.analyze.assert_awaited_once()
 
     async def test_partial_copy_deleted_before_retry_is_recreated_with_attachment(self):
@@ -432,23 +507,26 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
                                      to_file=AsyncMock(side_effect=lambda: discord.File(io.BytesIO(b'original-file'), filename='essay.txt')))
         self.h.first.attachments = [attachment]
         run = await self.scan()
-        original_upsert = self.service.upsert
-        async def interrupt_second(guild, key, *args, **kwargs):
+        original_upsert = self.importer.publisher.upsert
+        async def interrupt_second(guild, thread, key, *args, **kwargs):
             if ':message:62:' in key:
                 raise OSError('interrupted before second part')
-            return await original_upsert(guild, key, *args, **kwargs)
-        self.service.upsert = interrupt_second
+            return await original_upsert(guild, thread, key, *args, **kwargs)
+        self.importer.publisher.upsert = interrupt_second
         with self.assertRaisesRegex(OSError, 'interrupted before second part'):
             await self.apply(run)
-        first_copy = self.store.publication('essay-import:1:61:message:61:0')
+        first_copy = self.store.publication('essay-import:1:61:message:61:0:v2')
         target = self.h.channels[first_copy['channel_id']]
         del target.messages[first_copy['message_id']]
-        self.service.upsert = original_upsert
+        self.importer.publisher.upsert = original_upsert
         await self.apply(run)
         attachment.to_file.assert_awaited()
         self.assertEqual(attachment.to_file.await_count, 2)
         self.assertEqual(len(target.messages), 3)
-        self.assertEqual(target.send.await_args_list[1].kwargs['files'][0].filename, 'essay.txt')
+        hook, = self.h.hooks.values()
+        body_calls = [call for call in hook.send.await_args_list if call.kwargs.get('thread') is not None]
+        self.assertEqual(body_calls[1].kwargs['files'][0].filename, 'essay.txt')
+        target.send.assert_not_awaited()
         self.assertEqual(len(self.store.essays(self.book['id'])), 1)
         self.runner.analyze.assert_awaited_once()
 

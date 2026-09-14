@@ -13,6 +13,7 @@ from .import_config import ImportConfig
 from .import_store import ImportStore
 from .render import safe
 from .store import ClubError
+from .import_publication import ImportPublisher, archive_chunks, archive_header
 
 
 def fingerprint(message):
@@ -58,6 +59,7 @@ class ArchiveImporter:
         self.service, self.store = service, service.store
         self.config = config or ImportConfig()
         self.ledger = ImportStore(self.store)
+        self.publisher = ImportPublisher(self.service)
         self.lock = asyncio.Lock()
         self.runner = runner
         if self.config.enabled and runner is None:
@@ -114,36 +116,50 @@ class ArchiveImporter:
 
     async def capture(self, guild, actor, source, before_id=None, thread_id=None, after_id=None):
         config = self.config
+        for value in (before_id, thread_id, after_id):
+            if value is not None and (type(value) is not int or not 0 < value < 2**63):
+                raise ClubError('Диапазон: укажите числовые ID сообщений и треда Discord.')
+        if after_id is not None and thread_id is None:
+            raise ClubError('Для after выберите конкретный thread, чтобы продолжение относилось к одному обсуждению.')
+        if after_id is not None and before_id is not None and after_id >= before_id:
+            raise ClubError('Диапазон пуст: after должен быть меньше before.')
         if isinstance(source, discord.ForumChannel) and before_id and thread_id is None:
             raise ClubError('Для старого форума выберите конкретный thread; after продолжает сообщения внутри него. before доступен для текстового канала.')
         warnings, threads = [], {}
         before = discord.Object(id=before_id) if before_id else None
-        for thread in await guild.active_threads():
-            if thread.parent_id == source.id and not thread.is_private() and (before_id is None or thread.id < before_id):
-                threads[thread.id] = thread
-        # Public archives only: private threads need their own explicit export workflow.
-        async for thread in source.archived_threads(limit=config.max_threads + 1):
-            if not thread.is_private() and (before_id is None or thread.id < before_id):
-                threads[thread.id] = thread
-        if len(threads) > config.max_threads:
-            warnings.append('Достигнут лимит тредов; более старые треды в этот план не входят.')
-        threads = dict(sorted(threads.items(), reverse=True)[:config.max_threads])
-        roots = {}
-        if isinstance(source, discord.TextChannel):
-            async for message in source.history(limit=config.max_messages, before=before):
+        if thread_id is not None:
+            selected = await self.service.bot.fetch_channel(thread_id)
+            if not isinstance(selected, discord.Thread) or selected.guild.id != guild.id or selected.parent_id != source.id or selected.is_private():
+                raise ClubError('Выберите открытый тред внутри разрешённого исходного канала.')
+            threads = {selected.id: selected}
+        else:
+            for thread in await guild.active_threads():
+                if thread.parent_id == source.id and not thread.is_private() and (before_id is None or thread.id < before_id):
+                    threads[thread.id] = thread
+            # A selected thread bypasses both inventories and unrelated root messages.
+            async for thread in source.archived_threads(limit=config.max_threads + 1):
+                if not thread.is_private() and (before_id is None or thread.id < before_id):
+                    threads[thread.id] = thread
+            if len(threads) > config.max_threads:
+                warnings.append('Достигнут лимит тредов; более старые треды в этот план не входят.')
+            threads = dict(sorted(threads.items(), reverse=True)[:config.max_threads])
+        roots, root_limit_reached = {}, False
+        if isinstance(source, discord.TextChannel) and thread_id is None:
+            async for message in source.history(limit=config.max_messages + 1, before=before):
+                if len(roots) >= config.max_messages:
+                    root_limit_reached = True
+                    break
                 roots[message.id] = message
                 # A text-channel cursor can reach archived book threads outside the first archive page.
                 if getattr(message.flags, 'has_thread', False) is True and message.id not in threads and len(threads) < config.max_threads:
                     candidate = await self.service.bot.fetch_channel(message.id)
                     if isinstance(candidate, discord.Thread) and candidate.parent_id == source.id and not candidate.is_private():
                         threads[candidate.id] = candidate
-        if thread_id is not None:
-            selected = await self.service.bot.fetch_channel(thread_id)
-            if not isinstance(selected, discord.Thread) or selected.guild.id != guild.id or selected.parent_id != source.id or selected.is_private():
-                raise ClubError('Выберите открытый тред внутри разрешённого исходного канала.')
-            threads = {selected.id: selected}
-        books = [{'ref': 'book:' + b['id'], 'book_id': b['id'], 'title': b['title'], 'author': b['author']}
-                 for b in self.store.books(guild.id)]
+        catalog = [{'ref': 'book:' + b['id'], 'book_id': b['id'], 'title': b['title'], 'author': b['author']}
+                   for b in self.store.books(guild.id)]
+        # An explicit discussion needs only its matching book. An unrelated large
+        # catalog must not make a small, selected discussion exceed the input cap.
+        books = [] if thread_id is not None else list(catalog)
         messages, attachment_bytes, exhausted, scanned = [], 0, False, 0
         snapshot = {'source_id': source.id, 'books': books, 'messages': messages, 'warnings': warnings,
                     'target_forum_id': self.store.settings(guild.id)['essays']}
@@ -157,7 +173,7 @@ class ArchiveImporter:
             if len(messages) >= config.max_messages:
                 exhausted = True
                 return
-            attachments = []
+            attachments, previous_attachment_bytes = [], attachment_bytes
             for attachment in message.attachments:
                 copy = attachment_bytes + attachment.size <= config.max_attachment_bytes and attachment.size <= guild.filesize_limit
                 if copy:
@@ -170,11 +186,21 @@ class ArchiveImporter:
             messages.append(row)
             if len(json.dumps(snapshot, ensure_ascii=False).encode()) > config.max_input_bytes:
                 messages.pop()
+                attachment_bytes = previous_attachment_bytes
                 exhausted = True
 
+        cutoff_thread = None
+        bot_member = await guild.fetch_member(self.service.bot.user.id)
         for thread in threads.values():
-            permissions = thread.permissions_for(actor)
-            if not permissions.view_channel or not permissions.read_message_history:
+            for member in (actor, bot_member):
+                permissions = thread.permissions_for(member)
+                if not permissions.view_channel or not permissions.read_message_history:
+                    if thread_id is not None:
+                        raise ClubError('У вас или бота нет доступа к истории выбранного треда.')
+                    break
+            else:
+                permissions = None
+            if permissions is not None:
                 continue
             starter = roots.get(thread.id)
             if starter is None:
@@ -184,15 +210,20 @@ class ArchiveImporter:
                     starter = None
             title = ((starter.content.splitlines()[0] if isinstance(source, discord.TextChannel) and starter and starter.content.strip() else thread.name)
                      .strip().lstrip('#>* ').strip())[:180] or thread.name[:180]
-            matched = [b for b in books if b['title'].casefold().strip(' «»"') == title.casefold().strip(' «»"')]
+            matched = [b for b in catalog if b['title'].casefold().strip(' «»"') == title.casefold().strip(' «»"')]
             ref = matched[0]['ref'] if len(matched) == 1 else 'source:' + str(thread.id)
             if not any(b['ref'] == ref for b in books):
-                books.append({'ref': ref, 'book_id': None, 'title': title, 'author': 'Автор не указан',
+                books.append(matched[0] if len(matched) == 1 else
+                             {'ref': ref, 'book_id': None, 'title': title, 'author': 'Автор не указан',
                               'source_url': starter.jump_url if starter else thread.jump_url})
-            previous_id = after_id
+                if len(json.dumps(snapshot, ensure_ascii=False).encode()) > config.max_input_bytes:
+                    books.pop()
+                    exhausted, cutoff_thread = True, thread.id
+                    break
             raw_count = 0
             async for message in thread.history(limit=config.max_messages + 1, oldest_first=True,
-                                                after=discord.Object(id=after_id) if after_id else None):
+                                                after=discord.Object(id=after_id) if after_id else None,
+                                                before=before if thread_id is not None else None):
                 raw_count += 1
                 if raw_count > config.max_messages or scanned >= config.max_messages * 2:
                     exhausted = True
@@ -202,27 +233,70 @@ class ArchiveImporter:
                     add_message(message, ref)
                 if exhausted:
                     break
-                previous_id = message.id
             if exhausted:
-                if previous_id:
-                    warnings.append(f'Продолжение треда <#{thread.id}>: /club import scan thread:{thread.id} after:{previous_id}. '
-                                    'Дополнительный анализ требует свободного лимита запусков.')
+                cutoff_thread = thread.id
                 break
         if not exhausted and thread_id is None:
-            for message in reversed(list(roots.values())):
+            # Newest first matches Discord's before cursor: an input cutoff can
+            # continue at the oldest included root without skipping newer essays.
+            for message in roots.values():
                 if message.id not in threads and not message.thread:
                     add_message(message)
                 if exhausted:
                     break
-        if exhausted:
-            warnings.append('Достигнут лимит сообщений или размера входа. План покрывает только включённый фрагмент.')
+        if not exhausted and root_limit_reached:
+            exhausted = True
         if any(not a['copy'] for m in messages for a in m['attachments']):
-            warnings.append('Вложения сверх лимита будут доступны по ссылке на оригинал; остальные копируются файлами.')
+            warnings.append('Вложения сверх лимита не копируются: в теме останутся имя файла и отметка о лимите. Остальные копируются файлами.')
+
+        base_warnings = list(warnings)
+        # Warnings are part of the stored input too. Reserve no guessed margin:
+        # count the actual UTF-8 JSON and trim complete messages until it fits.
+        while True:
+            warnings[:] = base_warnings
+            if exhausted:
+                warnings.append('Достигнут лимит сообщений или размера входа. План покрывает только включённый фрагмент.')
+                if cutoff_thread is not None:
+                    included = [int(m['id']) for m in messages if m['channel_id'] == cutoff_thread]
+                    cursor = max(included) if included else after_id
+                    continuation = f' thread:{cutoff_thread}' + (f' after:{cursor}' if cursor else '')
+                    warnings.append('Продолжение: /club import preview' + continuation + '. '
+                                    'После проверки: /club import scan' + continuation + '. '
+                                    'Дополнительный анализ требует свободного лимита запусков.')
+                elif roots:
+                    included = [int(m['id']) for m in messages if m['channel_id'] == source.id]
+                    cursor = min(included) if included else min(roots)
+                    warnings.append(f'Более старые сообщения: /club import preview source:{source.id} before:{cursor}. '
+                                    'Для отдельной книги задайте thread.')
+            if len(json.dumps(snapshot, ensure_ascii=False).encode()) <= config.max_input_bytes or not messages:
+                break
+            removed = messages.pop()
+            cutoff_thread = removed['channel_id'] if removed['channel_id'] != source.id else None
+            exhausted = True
         if not messages or not books:
-            raise ClubError('Нет новых сообщений эссе или не удалось найти названия книг. Проверьте треды и каталог клуба.\n' + '\n'.join(warnings))
+            raise ClubError('Нет новых сообщений эссе в выбранном диапазоне либо один пост с контекстом не помещается '
+                            f'в лимит {config.max_input_bytes} байт. Выберите конкретный thread и диапазон after/before.\n' + '\n'.join(warnings))
         if len(json.dumps(snapshot, ensure_ascii=False).encode()) > config.max_input_bytes:
             raise ClubError('Названия книг и контекст не помещаются в лимит входа. Уменьшите диапазон архива.')
         return snapshot
+
+    async def target_access(self, guild, actor, expected_id=None):
+        target_id = self.store.settings(guild.id)['essays']
+        if expected_id is not None and target_id != expected_id:
+            raise ClubError('Форум назначения изменён после создания снимка. Восстановление плана не выполнено.')
+        forum = await self.service.channel(guild, target_id, discord.ForumChannel)
+        for member in (actor, await guild.fetch_member(self.service.bot.user.id)):
+            permissions = forum.permissions_for(member)
+            if not permissions.view_channel or not permissions.read_message_history:
+                raise ClubError('У вас или бота нет доступа к форуму назначения.')
+        return forum
+
+    async def preview(self, guild, actor_id, source_id, before_id=None, thread_id=None, after_id=None):
+        """Capture a bounded, private sample without login, model use or reservation."""
+        actor = await self.guard(guild, actor_id, source_id)
+        source = await self.source(guild, actor, source_id)
+        await self.target_access(guild, actor)
+        return await asyncio.wait_for(self.capture(guild, actor, source, before_id, thread_id, after_id), timeout=90)
 
     async def scan(self, guild, actor_id, source_id, request_key, before_id=None, thread_id=None, after_id=None):
         actor = await self.guard(guild, actor_id, source_id)
@@ -238,6 +312,7 @@ class ArchiveImporter:
             if not await self.runner.login_status():
                 raise ClubError('Сначала выполните /club import login и войдите в Codex.')
             source = await self.source(guild, actor, source_id)
+            await self.target_access(guild, actor)
             snapshot = await asyncio.wait_for(self.capture(guild, actor, source, before_id, thread_id, after_id), timeout=90)
             schema = plan_schema(snapshot)
             payload = {'books': snapshot['books'], 'messages': [{k: m[k] for k in
@@ -274,16 +349,41 @@ class ArchiveImporter:
         await self.source(guild, actor, run['source_channel_id'])
         for channel_id in {m['channel_id'] for m in run['snapshot']['messages']} - {run['source_channel_id']}:
             channel = await self.service.bot.fetch_channel(channel_id)
-            permissions = channel.permissions_for(actor)
-            if (not isinstance(channel, discord.Thread) or channel.parent_id != run['source_channel_id'] or channel.is_private()
-                    or not permissions.view_channel or not permissions.read_message_history):
+            if (not isinstance(channel, discord.Thread) or channel.guild.id != guild.id
+                    or channel.parent_id != run['source_channel_id'] or channel.is_private()):
                 raise ClubError('Доступ к исходному треду изменён; сохранённый снимок не раскрывается.')
+            for member in (actor, await guild.fetch_member(self.service.bot.user.id)):
+                permissions = channel.permissions_for(member)
+                if not permissions.view_channel or not permissions.read_message_history:
+                    raise ClubError('Доступ к исходному треду изменён; сохранённый снимок не раскрывается.')
+        run['restoration'] = self.store.one('SELECT actor_id,old_state,plan_sha256,created_at '
+                                            'FROM bc_import_plan_restores WHERE guild_id=? AND run_id=?',
+                                            (guild.id, run_id))
         return run
+
+    async def restore_plan(self, guild, actor_id, run_id, output, *, confirm=False):
+        """Accept only original snapshot IDs, preserving the charged failed run."""
+        actor = await self.guard(guild, actor_id)
+        if not confirm:
+            raise ClubError('Проверьте JSON плана и подтвердите восстановление параметром confirm:true. '
+                            'Перенос затем отдельно подтверждается через /club import apply.')
+        async with self.lock:
+            run = await self.review(guild, actor_id, run_id)
+            if run['state'] not in {'failed', 'unknown'}:
+                raise ClubError('Восстановление допускается только для failed/unknown; готовый или выполняющийся план не заменяется.')
+            await self.target_access(guild, actor, run['snapshot']['target_forum_id'])
+            plan = validate_plan(run['snapshot'], output)
+            self.ledger.restore_plan(guild.id, run_id, actor_id, plan)
+            return await self.review(guild, actor_id, run_id)
 
     @staticmethod
     def report(run):
         lines = [f'**План импорта** `{run["id"]}` · {run["state"]}',
                  f'Источник: <#{run["source_channel_id"]}> → форум <#{run["snapshot"]["target_forum_id"]}>.']
+        if run.get('restoration'):
+            audit = run['restoration']
+            lines.append(f'План восстановлен участником <@{audit["actor_id"]}> из {audit["old_state"]}; '
+                         f'SHA-256 `{audit["plan_sha256"]}`. Нового вызова Codex и сброса бюджета не было.')
         if not run['plan']:
             return lines + [run['detail'] or 'План ещё не получен.']
         books = {b['ref']: b for b in run['snapshot']['books']}
@@ -351,31 +451,31 @@ class ArchiveImporter:
                         book = self.store.book(guild.id, candidate['book_id'])
                     else:
                         book = self.store.create_book(guild.id, candidate['title'], candidate['author'],
-                                                      candidate.get('source_url', ''), 'archive:' + item['book_ref'])
+                                                      '', 'archive:' + item['book_ref'])
                     first = snapshots[ids[0]]
                     member = SimpleNamespace(display_name=first['author_name'], display_avatar=SimpleNamespace(url=first['avatar_url']))
                     author_name = ' '.join(first['author_name'].split())[:40]
                     name = f'{book["title"][:90 - len(author_name)]} · Эссе · {author_name}'[:100]
-                    header = (f'**Архивное эссе по книге «{safe(book["title"])}»**\n'
-                              f'Автор: <@{item["author_id"]}>. Перенесено из старого обсуждения по подтверждённому плану.\n'
-                              f'[Первое исходное сообщение]({first["url"]})')
+                    header = archive_header(book, item['author_id'])
                     pub = self.store.publication(key)
                     if pub and pub['message_id']:
                         thread = await self.service.channel(guild, pub['channel_id'], discord.Thread)
                         if thread.parent_id != forum.id:
                             raise ClubError('Сохранённая тема импорта находится в другом форуме.')
-                        await thread.fetch_message(pub['message_id'])
+                        starter = await thread.fetch_message(pub['message_id'])
+                        # Finish a previously acknowledged header even if the
+                        # process stopped before removing its recovery marker.
+                        await self.service.finish_import_header(thread, starter,
+                            starter.content.removesuffix('\n-# bc:' + key), pub)
                     else:
                         pub = await self.service.publish_essay_starter(guild, forum, key, name, header, member)
                         thread = await self.service.channel(guild, pub['channel_id'], discord.Thread)
                     for ident in ids:
                         message, old = originals[ident], snapshots[ident]
-                        body = message.content
-                        attachment_lines = [f'Вложение: {safe(a["filename"])}' + ('' if a['copy'] else ' — см. оригинал') for a in old['attachments']]
-                        body += ('\n' if body else '') + '\n'.join(attachment_lines) if attachment_lines else ''
-                        chunks = [body[i:i + 1500] for i in range(0, len(body), 1500)] or ['']
+                        chunks = archive_chunks(old)
                         for index, chunk in enumerate(chunks):
-                            copy_key = f'{key}:message:{ident}:{index}'
+                            legacy_key = f'{key}:message:{ident}:{index}'
+                            copy_key = legacy_key + ':v2'
                             existing = self.store.publication(copy_key)
                             if existing and existing['message_id']:
                                 try:
@@ -390,8 +490,16 @@ class ArchiveImporter:
                                     for attachment in message.attachments:
                                         if str(attachment.id) in copy_ids:
                                             files.append(await asyncio.wait_for(attachment.to_file(), timeout=30))
-                                await self.service.upsert(guild, copy_key, thread.id,
-                                    chunk + f'\n[Оригинал сообщения]({old["url"]})', files=files)
+                                expected_files = [(a['filename'], a['size']) for a in old['attachments'] if a['copy']] if index == 0 else []
+                                copy = await self.publisher.upsert(guild, thread, copy_key, chunk, member, files=files,
+                                                                  expected_attachments=expected_files)
+                                # A partially applied pre-upgrade run can finish
+                                # without leaving its old bot copies alongside v2.
+                                legacy_chunks = archive_chunks(old, legacy=True)
+                                if index < len(legacy_chunks):
+                                    await self.publisher.retire_legacy(guild, run_id, actor_id, thread, legacy_key, copy,
+                                        legacy_chunks[index] + f'\n[Оригинал сообщения]({old["url"]})',
+                                        expected_attachments=expected_files)
                             finally:
                                 for file in files:
                                     file.close()
@@ -406,3 +514,7 @@ class ArchiveImporter:
             if settings['published']:
                 await self.service.refresh(guild)
             return results + ['План выполнен. Оригиналы сохранены; повторный apply не вызывает Codex.']
+
+    async def restyle(self, guild, actor_id, run_id, *, confirm=False):
+        from .import_restyle import restyle
+        return await restyle(self, guild, actor_id, run_id, confirm=confirm)

@@ -46,23 +46,47 @@ class WebhookHarness(DiscordHarness):
         hook.user = self.bot.user if creator is None else creator
         hook.token = 'mock-transport-token-not-a-real-credential'
 
-        async def send(content, *, thread_name, username, avatar_url, wait, allowed_mentions, **kwargs):
+        async def send(content, *, thread_name=None, thread=None, username, avatar_url, wait, allowed_mentions, **kwargs):
+            import io
             assert wait is True, 'Discord must return the created forum post'
+            assert (thread_name is None) != (thread is None), 'Choose a new or an existing forum thread'
             self.seq += 1
-            thread = self.channel(self.seq, parent_id=channel_id, owner_id=hook.id, name=thread_name)
-            starter = self.message(thread, thread.id, content)
+            if thread is None:
+                thread = self.channel(self.seq, parent_id=channel_id, owner_id=hook.id, name=thread_name)
+            else:
+                thread = self.channels[thread.id]
+                assert thread.parent_id == channel_id
+            starter = self.message(thread, self.seq, content)
             starter.webhook_id = hook.id
             starter.author = SimpleNamespace(id=hook.id, bot=True, display_name=username,
                                              display_avatar=SimpleNamespace(url=avatar_url))
+            starter.attachments = []
+            for index, file in enumerate(kwargs.get('files') or []):
+                position = file.fp.tell()
+                payload = file.fp.read()
+                file.fp.seek(position)
+                async def to_file(*, data=payload, filename=file.filename, **options):
+                    return discord.File(io.BytesIO(data), filename=filename)
+                starter.attachments.append(SimpleNamespace(
+                    id=starter.id * 100 + index, filename=file.filename, size=len(payload),
+                    to_file=AsyncMock(side_effect=to_file)))
+            async def delete(**options):
+                if starter.id not in thread.messages:
+                    raise not_found()
+                del thread.messages[starter.id]
+            starter.delete = AsyncMock(side_effect=delete)
             partial = Mock(spec=discord.PartialMessageable)
             partial.id, partial.guild = thread.id, self.guild
             response = Mock(spec=discord.WebhookMessage)
             response.id, response.channel = starter.id, partial
             response.content, response.author, response.webhook_id = content, starter.author, hook.id
+            response.attachments, response.delete = starter.attachments, starter.delete
             return response
 
         async def edit_message(message_id, *, thread, content, **kwargs):
             actual_thread = self.channels[thread.id]
+            if message_id not in actual_thread.messages:
+                raise not_found()
             message = actual_thread.messages[message_id]
             assert message.webhook_id == hook.id
             message.content = content

@@ -7,6 +7,7 @@ same deterministic item key without publishing a second copy of a message.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 
@@ -135,6 +136,30 @@ class ImportStore:
                            (usage_tokens - row["reserved_tokens"], row["budget_id"]))
             db.execute("UPDATE bc_import_runs SET state=?,detail=?,usage_tokens=?,updated_at=? WHERE id=?",
                        (state, detail, usage_tokens, self.store.clock(), run_id))
+
+    def restore_plan(self, guild_id, run_id, actor_id, plan):
+        """Recover a human-reviewed failed result without changing usage or sources.
+
+        The caller validates the plan against the immutable snapshot and rechecks
+        current Discord access. Both the state transition and audit are atomic.
+        """
+        _positive(actor_id, "Участник")
+        encoded = _json(plan, "План импорта")
+        canonical = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        digest = hashlib.sha256(canonical.encode()).hexdigest()
+        with self.store.tx() as db:
+            row = self._row(db, guild_id, run_id)
+            if row['state'] not in {'failed', 'unknown'}:
+                raise ClubError('Восстановление допускается только для failed/unknown; готовый или выполняющийся план не заменяется.')
+            if db.execute('SELECT 1 FROM bc_import_sources WHERE run_id=?', (run_id,)).fetchone():
+                raise ClubError('У запуска уже есть привязки публикаций; замена плана запрещена.')
+            timestamp = self.store.clock()
+            db.execute('''INSERT INTO bc_import_plan_restores
+                          (run_id,guild_id,actor_id,old_state,plan_sha256,created_at) VALUES(?,?,?,?,?,?)''',
+                       (run_id, guild_id, actor_id, row['state'], digest, timestamp))
+            db.execute("UPDATE bc_import_runs SET state='review',plan=?,updated_at=? WHERE id=?",
+                       (encoded, timestamp, run_id))
+            return self._decode(self._row(db, guild_id, run_id))
 
     def recover_runs(self):
         """Run only at process startup, when no model request is still in flight."""

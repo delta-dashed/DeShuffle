@@ -1,7 +1,6 @@
 """Hybrid commands and Discord forms. Private drafts only use ephemeral replies."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import asyncio
 import io
 import json
@@ -23,6 +22,7 @@ log = logging.getLogger(__name__)
 HELP = '''**Архивариус · книжный клуб**
 Участнику: `/club books`, `/club book_add`, `/club join`, `/club essay`.
 В каталоге и `/club books`: «Добавить книгу» создаёт книгу и её тему. Организатору: «Загрузить список» или `/club library import` с файлом TXT, CSV, JSON.
+В карточке книги: «Управление книгой» — статус, данные и план N + 1; «Встречи» — конкретные даты и переносы.
 Ведущему: откройте `/club meeting`, нажмите «Провести встречу» и подтвердите. Кнопка «Мой план» открывает личный черновик.
 Организатору: `/club book_edit`, `/club participant`, `/club meeting_add`, `/club meeting_attach`, `/club move`, `/club cancel`, `/club offer`, `/club replace`, `/club handover`.
 Настройка сервера: `/club setup` создаёт недостающие каналы и проверяет существующие; `check_only=True` — только проверка.
@@ -38,6 +38,18 @@ async def reply(interaction, content, **kwargs):
 
 
 async def interaction_error(interaction, error):
+    # Hybrid commands can wrap an expected error more than once. Do not follow
+    # arbitrary exception chains or loop on a malformed wrapper.
+    seen = set()
+    wrappers = (commands.CommandInvokeError, commands.HybridCommandError, app_commands.CommandInvokeError)
+    for _ in range(8):
+        if not isinstance(error, wrappers) or id(error) in seen:
+            break
+        seen.add(id(error))
+        original = getattr(error, 'original', None)
+        if not isinstance(original, Exception):
+            break
+        error = original
     if isinstance(error, ClubError):
         text = str(error)
     elif isinstance(error, discord.Forbidden):
@@ -63,12 +75,25 @@ class GuardedModal(discord.ui.Modal):
 class BookView(GuardedView):
     def __init__(self, cog, book):
         super().__init__(timeout=None)
-        for action, label in [('write', 'Добавить своё эссе'), ('list', 'Эссе участников')]:
+        for action, label in [('write', 'Добавить своё эссе'), ('own', 'Открыть моё эссе'), ('list', 'Эссе участников')]:
             button = discord.ui.Button(label=label, custom_id=f'bc:book:{book["id"]}:{action}',
                                        style=discord.ButtonStyle.primary if action == 'write' else discord.ButtonStyle.secondary)
             async def callback(interaction, selected=action):
                 await cog.book_essay_action(interaction, book, selected)
             button.callback = callback
+            self.add_item(button)
+        for action, label in [('manage', 'Управление книгой'), ('meetings', 'Встречи')]:
+            button = discord.ui.Button(label=label, custom_id=f'bc:book:{book["id"]}:{action}', row=1)
+            async def manage_callback(interaction, selected=action):
+                if interaction.guild_id != book['guild_id']:
+                    raise ClubError('Откройте карточку на сервере клуба.')
+                if selected == 'manage':
+                    from .book_controls import open_book_controls
+                    await open_book_controls(cog, interaction, book['id'])
+                else:
+                    from .meeting_controls import open_book_meetings
+                    await open_book_meetings(cog, interaction, book['id'])
+            button.callback = manage_callback
             self.add_item(button)
 
 
@@ -131,12 +156,20 @@ class MeetingView(GuardedView):
             button.callback = callback
             self.add_item(button)
         book = cog.store.book(meeting['guild_id'], meeting['book_id'])
-        for action, label in [('write', 'Добавить своё эссе'), ('list', 'Эссе участников')]:
+        for action, label in [('write', 'Добавить своё эссе'), ('own', 'Открыть моё эссе'), ('list', 'Эссе участников')]:
             button = discord.ui.Button(label=label, custom_id=f'bc:{meeting["id"]}:essay:{action}', row=2)
             async def essay_callback(interaction, selected=action):
                 await cog.book_essay_action(interaction, book, selected)
             button.callback = essay_callback
             self.add_item(button)
+        manage = discord.ui.Button(label='Управление встречей', custom_id=f'bc:{meeting["id"]}:manage', row=3)
+        async def manage_callback(interaction):
+            if interaction.guild_id != meeting['guild_id']:
+                raise ClubError('Откройте карточку на сервере клуба.')
+            from .meeting_controls import open_meeting_controls
+            await open_meeting_controls(cog, interaction, meeting['id'])
+        manage.callback = manage_callback
+        self.add_item(manage)
 
     async def act(self, interaction, action):
         if interaction.guild_id != self.meeting['guild_id']:
@@ -320,9 +353,22 @@ class Club(commands.Cog):
         if action == 'write':
             essay = await self.service.create_essay_space(interaction.guild, book['id'], interaction.user.id)
             view = discord.ui.View(timeout=180)
-            view.add_item(discord.ui.Button(label='Открыть мой пост', url=essay['url']))
-            await reply(interaction, 'Ваш пост для эссе готов. Откройте его и напишите текст, отправьте файл или ссылку '
-                        'обычным сообщением от своего имени. Повторное нажатие открывает этот же пост.', view=view)
+            view.add_item(discord.ui.Button(label='Открыть моё эссе', url=essay['url']))
+            text = ('Ваше эссе уже опубликовано. Кнопка открывает существующий пост.' if essay['submitted'] else
+                    'Ваш пост для эссе готов. Откройте его и напишите текст, отправьте файл или ссылку '
+                    'обычным сообщением от своего имени. Повторное нажатие открывает этот же пост.')
+            await reply(interaction, text, view=view)
+        elif action == 'own':
+            essays = await self.service.own_essays(interaction.guild, book['id'], interaction.user.id)
+            if not essays:
+                await reply(interaction, 'У вас пока нет поста для эссе по этой книге. Нажмите «Добавить своё эссе», чтобы создать его.')
+                return
+            for offset in range(0, len(essays), 25):
+                view = discord.ui.View(timeout=180)
+                for index, essay in enumerate(essays[offset:offset + 25], offset + 1):
+                    label = 'Открыть моё эссе' if len(essays) == 1 else f'{index}. {essay["title"]}'
+                    view.add_item(discord.ui.Button(label=label[:80], url=essay['url']))
+                await reply(interaction, 'Ваши эссе и черновики по этой книге:', view=view)
         else:
             _, current, _ = await self.service.essay_access(interaction.guild, book['id'], interaction.user.id)
             for page in pages([f'**{safe(current["title"])}**', *essay_lines(self.store, current)]):
@@ -379,13 +425,21 @@ class Club(commands.Cog):
     @club.command(name='book_edit', description='Изменить книгу, очередь и срок эссе')
     async def book_edit(self, ctx, book: str, status: Optional[Literal['Предложено', 'В очереди', 'Читаем', 'Прочитано']] = None,
                         position: Optional[int] = None, deadline: Optional[str] = None, title: Optional[str] = None,
-                        author: Optional[str] = None, materials: Optional[str] = None):
+                        author: Optional[str] = None, materials: Optional[str] = None, reading_meetings: Optional[str] = None):
         async with self.service.locks[ctx.guild.id]:
             await self.organizer(ctx)
             b = self.resolve_book(ctx.guild.id, book)
             fields = {k: v for k, v in dict(position=position, title=title, author=author, materials=materials).items() if v is not None}
             if status:
                 fields['status'] = next(k for k, v in STATUSES.items() if v == status)
+            if reading_meetings is not None:
+                value = reading_meetings.strip()
+                if value == '-':
+                    fields['reading_meetings'] = None
+                elif value.isdecimal() and len(value) <= 3:
+                    fields['reading_meetings'] = int(value)
+                else:
+                    raise ClubError('План: целое число встреч по книге от 1 до 100; «-» убирает план. Разбор эссе добавляется отдельно: +1.')
             if deadline is not None:
                 fields['deadline'] = None if deadline == '-' else parse_time(deadline, self.store.settings(ctx.guild.id)['timezone'])
             self.store.update_book(ctx.guild.id, b['id'], **fields)
@@ -413,22 +467,11 @@ class Club(commands.Cog):
 
     @club.command(name='meeting_add', description='Создать встречу книги и событие Discord')
     async def meeting_add(self, ctx, book: str, name: str, date: str, part: str, chapter: str, minutes: int = 90):
-        async with self.service.locks[ctx.guild.id]:
-            await self.organizer(ctx)
-            b = self.resolve_book(ctx.guild.id, book)
-            start = parse_time(date, self.store.settings(ctx.guild.id)['timezone'])
-            if not 1 <= minutes <= 1440 or start <= self.store.clock():
-                raise ClubError('Нужны будущая дата и длительность от 1 до 1440 минут.')
-            request = str(ctx.interaction.id if ctx.interaction else ctx.message.id)
-            existing = self.store.one('SELECT * FROM bc_meetings WHERE guild_id=? AND request_key=?', (ctx.guild.id, request))
-            if existing:
-                await self.service.reconcile(ctx.guild)
-                if not self.store.meeting(ctx.guild.id, existing['id'])['event_id']:
-                    raise ClubError('Предыдущая попытка не подтверждена. Используйте /club recover_event.')
-            else:
-                meeting = self.store.draft_meeting(ctx.guild.id, b['id'], name, part, chapter, request)
-                await self.service.create_event(ctx.guild, meeting, start, start + minutes * 60)
-            await self.service.refresh(ctx.guild)
+        from .meeting_actions import create_meeting
+        b = self.resolve_book(ctx.guild.id, book)
+        request = str(ctx.interaction.id if ctx.interaction else ctx.message.id)
+        await create_meeting(self.service, ctx.guild, ctx.author.id, b['id'], name=name, date=date,
+                             part=part, chapter=chapter, minutes=minutes, request_key=request)
         await self.say(ctx, 'Встреча создана. Время теперь берётся из события Discord; ведущего выбирают в /club meeting.')
 
     @club.command(name='meeting_attach', description='Связать существующее событие с книгой')
@@ -470,48 +513,23 @@ class Club(commands.Cog):
 
     @club.command(name='boundary', description='Уточнить часть и последнюю главу встречи')
     async def boundary(self, ctx, meeting: str, part: str, chapter: str):
-        from .store import checked_text
-        part = checked_text(part, 'Часть', 200)
-        chapter = checked_text(chapter, 'Последняя глава', 250)
-        async with self.service.locks[ctx.guild.id]:
-            await self.organizer(ctx)
-            m = self.resolve_meeting(ctx.guild.id, meeting)
-            if m['event_id']:
-                e = await ctx.guild.fetch_scheduled_event(m['event_id'])
-                await e.edit(description=f'{part}; до главы {chapter} включительно.\n[bookclub:{m["id"]}]')
-            with self.store.tx() as db:
-                db.execute('UPDATE bc_meetings SET part=?,chapter=? WHERE id=?', (part, chapter, m['id']))
-                db.execute('UPDATE bc_plans SET ready=0,version=version+1 WHERE meeting_id=? AND generation=?', (m['id'], m['plan_generation']))
-            await self.service.refresh(ctx.guild)
+        from .meeting_actions import edit_meeting
+        m = self.resolve_meeting(ctx.guild.id, meeting)
+        await edit_meeting(self.service, ctx.guild, ctx.author.id, m['id'], part=part, chapter=chapter)
         await self.say(ctx, 'Граница чтения уточнена. Ведущему нужно проверить план и вновь отметить готовность.')
 
     @club.command(name='move', description='Перенести встречу в событии Discord')
     async def move(self, ctx, meeting: str, date: str, minutes: int = 90):
-        async with self.service.locks[ctx.guild.id]:
-            await self.organizer(ctx)
-            m = self.resolve_meeting(ctx.guild.id, meeting)
-            start = parse_time(date, self.store.settings(ctx.guild.id)['timezone'])
-            if start <= self.store.clock() or not 1 <= minutes <= 1440:
-                raise ClubError('Нужны будущая дата и длительность от 1 до 1440 минут.')
-            e = await ctx.guild.fetch_scheduled_event(m['event_id'])
-            if e.status != discord.EventStatus.scheduled:
-                raise ClubError('Можно переносить только ещё не начавшуюся встречу.')
-            e = await e.edit(start_time=datetime.fromtimestamp(start, timezone.utc), end_time=datetime.fromtimestamp(start + minutes * 60, timezone.utc))
-            self.service.sync(ctx.guild, m, e)
-            await self.service.refresh(ctx.guild)
+        from .meeting_actions import move_meeting
+        m = self.resolve_meeting(ctx.guild.id, meeting)
+        await move_meeting(self.service, ctx.guild, ctx.author.id, m['id'], date=date, minutes=minutes)
         await self.say(ctx, 'Событие перенесено. Ведущему требуется подтвердить новые условия.')
 
     @club.command(name='cancel', description='Отменить будущую встречу и её напоминания')
     async def cancel(self, ctx, meeting: str):
-        async with self.service.locks[ctx.guild.id]:
-            await self.organizer(ctx)
-            m = self.resolve_meeting(ctx.guild.id, meeting)
-            e = await ctx.guild.fetch_scheduled_event(m['event_id'])
-            if e.status != discord.EventStatus.scheduled:
-                raise ClubError('Отменять можно только ещё не начавшуюся встречу.')
-            e = await e.cancel()
-            self.service.sync(ctx.guild, m, e)
-            await self.service.refresh(ctx.guild)
+        from .meeting_actions import cancel_meeting
+        m = self.resolve_meeting(ctx.guild.id, meeting)
+        await cancel_meeting(self.service, ctx.guild, ctx.author.id, m['id'])
         await self.say(ctx, 'Встреча отменена; история сохранена.')
 
     @club.command(name='offer', description='Предложить участнику провести встречу')
@@ -644,7 +662,9 @@ class Club(commands.Cog):
     @club.group(name='import', description='Временный импорт архива через Codex', invoke_without_command=True)
     async def archive(self, ctx):
         await self.import_context(ctx)
-        await self.say(ctx, 'Временный импорт: login → scan → review → apply. Настройки и лимиты меняются на машине бота с перезапуском.')
+        await self.say(ctx, 'Временный импорт: preview → login → scan → review → apply. preview не вызывает Codex. '
+                           'restore восстанавливает failed/unknown по проверенному JSON без нового анализа. '
+                           'Настройки и лимиты меняются на машине бота с перезапуском.')
 
     @archive.command(name='login', description='Войти в отдельный профиль Codex по одноразовому коду')
     async def import_login(self, ctx):
@@ -665,6 +685,12 @@ class Club(commands.Cog):
                           before: Optional[str] = None, thread: Optional[discord.Thread] = None,
                           after: Optional[str] = None):
         await self.import_context(ctx)
+        source, range_options = self.import_range(ctx, source, before, thread, after)
+        run = await self.importer.scan(ctx.guild, ctx.author.id, source.id, str(ctx.interaction.id), **range_options)
+        await self.show_import(ctx, run)
+
+    @staticmethod
+    def import_range(ctx, source, before, thread, after):
         source = source or (thread.parent if thread else ctx.channel)
         if isinstance(source, discord.Thread):
             thread, source = source, source.parent
@@ -674,10 +700,44 @@ class Club(commands.Cog):
             return int(value) if value else None
         if source is None:
             raise ClubError('Не удалось определить исходный канал.')
-        run = await self.importer.scan(ctx.guild, ctx.author.id, source.id, str(ctx.interaction.id),
-                                       before_id=message_id(before), thread_id=thread.id if thread else None,
-                                       after_id=message_id(after))
-        await self.show_import(ctx, run)
+        return source, {'before_id': message_id(before), 'thread_id': thread.id if thread else None,
+                        'after_id': message_id(after)}
+
+    @archive.command(name='preview', description='Проверить выбранный фрагмент архива без расхода Codex')
+    async def import_preview(self, ctx, source: Optional[discord.TextChannel | discord.ForumChannel] = None,
+                             before: Optional[str] = None, thread: Optional[discord.Thread] = None,
+                             after: Optional[str] = None):
+        await self.import_context(ctx)
+        source, range_options = self.import_range(ctx, source, before, thread, after)
+        snapshot = await self.importer.preview(ctx.guild, ctx.author.id, source.id, **range_options)
+        data = json.dumps(snapshot, ensure_ascii=False).encode()
+        lines = [f'**Предпросмотр архива**: {len(snapshot["messages"])} сообщений, '
+                 f'{len(snapshot["books"])} книг, {len(data)}/{self.importer.config.max_input_bytes} байт.',
+                 'Codex не вызван; квота запусков и токенов не изменена. '
+                 'Для анализа используйте /club import scan с теми же source/thread/after/before.']
+        lines.extend(snapshot['warnings'])
+        for page in pages(lines):
+            await self.say(ctx, page)
+        await self.say(ctx, 'Снимок выбранного фрагмента для проверки:',
+                       file=discord.File(io.BytesIO(data), filename='import-preview.json'))
+
+    @archive.command(name='restore', description='Восстановить неудачный анализ по проверенному JSON без Codex')
+    async def import_restore(self, ctx, run: str, file: discord.Attachment, confirm: bool = False):
+        await self.import_context(ctx)
+        if not confirm:
+            raise ClubError('Сначала проверьте JSON плана, затем укажите confirm:true. '
+                            'Файл содержит только {"essays":[{"book_ref":"…","message_ids":["…"]}]}.')
+        if file.size > 65_536:
+            raise ClubError('План JSON должен быть не больше 64 КиБ.')
+        data = await asyncio.wait_for(file.read(), timeout=30)
+        if len(data) > 65_536:
+            raise ClubError('План JSON должен быть не больше 64 КиБ.')
+        try:
+            output = json.loads(data.decode('utf-8-sig'))
+        except (UnicodeError, ValueError, RecursionError) as exc:
+            raise ClubError('Не удалось прочитать план: нужен JSON в UTF-8.') from exc
+        restored = await self.importer.restore_plan(ctx.guild, ctx.author.id, run, output, confirm=True)
+        await self.show_import(ctx, restored)
 
     @archive.command(name='review', description='Показать сохранённый план без нового запроса к Codex')
     async def import_review(self, ctx, run: str):
@@ -688,6 +748,12 @@ class Club(commands.Cog):
     async def import_apply(self, ctx, run: str, confirm: bool = False):
         await self.import_context(ctx)
         for page in pages(await self.importer.apply(ctx.guild, ctx.author.id, run, confirm=confirm)):
+            await self.say(ctx, page)
+
+    @archive.command(name='restyle', description='Исправить оформление перенесённых эссе без нового анализа')
+    async def import_restyle(self, ctx, run: str, confirm: bool = False):
+        await self.import_context(ctx)
+        for page in pages(await self.importer.restyle(ctx.guild, ctx.author.id, run, confirm=confirm)):
             await self.say(ctx, page)
 
     @club.command(name='diagnose', description='Проверить настройку без отправок и создания каналов')

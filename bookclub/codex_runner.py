@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -37,8 +38,36 @@ DISABLED_FEATURES = (
     'skill_mcp_dependency_install', 'skill_search', 'workspace_dependencies',
     'unbounded_connection_retries',
 )
-REQUIRED_FLAGS = ('--ignore-user-config', '--ephemeral', '--output-schema',
+REQUIRED_FLAGS = ('--ignore-user-config', '--ephemeral', '--output-schema', '--output-last-message',
                   '--skip-git-repo-check', '--json', '--sandbox')
+LOG = logging.getLogger(__name__)
+EVENT_TYPES = frozenset({'thread.started', 'turn.started', 'turn.completed', 'turn.failed',
+                         'item.started', 'item.updated', 'item.completed', 'error'})
+PASSIVE_ITEMS = frozenset({'agent_message', 'reasoning', 'plan_update', 'todo_list'})
+ITEM_TYPES = PASSIVE_ITEMS | {'command_execution', 'file_change', 'mcp_tool_call', 'web_search'}
+
+
+class CodexOutputError(ClubError):
+    """Only bounded, allowlisted metadata may leave the private CLI response."""
+
+    def __init__(self, diagnostic: dict, message: str):
+        self.diagnostic = diagnostic
+        super().__init__(f'{message} Код диагностики: {diagnostic["code"]}.')
+
+
+def _strict_json(value):
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError('duplicate_key')
+            result[key] = item
+        return result
+
+    def invalid_constant(_):
+        raise ValueError('nonfinite_number')
+
+    return json.loads(value, object_pairs_hook=unique_object, parse_constant=invalid_constant)
 
 
 class CodexRunner:
@@ -187,35 +216,119 @@ class CodexRunner:
         self._probed = True
 
     @staticmethod
-    def parse_result(data: bytes) -> dict:
+    def parse_result(data: bytes, *, final_message: bytes | None = None) -> dict:
+        """Read the exec JSONL protocol, never search arbitrary output for JSON.
+
+        The documented --output-last-message file is the canonical final message.
+        JSONL still has to confirm a successful, tool-free turn with valid usage.
+        A missing file falls back to the documented completed agent-message item.
+        Neither raw response text nor untrusted type/field names enter diagnostics.
+        """
         final, usage, completed = None, None, False
+        diagnostic = {'stdout_bytes': len(data), 'line': 0, 'events': {}, 'items': {},
+                      'final_source': 'file' if final_message is not None else 'stream',
+                      'final_bytes': len(final_message) if final_message is not None else 0}
+
+        def fail(code, message='Codex вернул некорректный ответ; ничего не перенесено.'):
+            diagnostic['code'] = code
+            LOG.warning('Codex output rejected: %s', json.dumps(diagnostic, sort_keys=True))
+            raise CodexOutputError(diagnostic, message) from None
+
+        def count(group, value, allowed):
+            label = value if isinstance(value, str) and value in allowed else 'unknown'
+            diagnostic[group][label] = diagnostic[group].get(label, 0) + 1
+
+        if len(data) > STDOUT_LIMIT:
+            fail('stdout_limit')
         try:
-            for line in data.splitlines():
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                if event.get('type') in {'error', 'turn.failed'}:
-                    raise ClubError('Codex не завершил анализ. Проверьте вход и доступный лимит аккаунта.')
-                if event.get('type') == 'item.completed':
-                    item = event.get('item', {})
-                    if item.get('type') == 'agent_message':
-                        final = item.get('text')
-                    elif item.get('type') not in {'reasoning', 'plan_update'}:
-                        raise ClubError('Codex попытался использовать инструмент вместо анализа; результат отклонён.')
-                if event.get('type') == 'turn.completed':
-                    completed = True
-                    value = event.get('usage', {})
-                    if all(type(value.get(key)) is int and value[key] >= 0
-                           for key in ('input_tokens', 'output_tokens')):
-                        usage = value['input_tokens'] + value['output_tokens']
-            if not completed or not isinstance(final, str) or len(final.encode('utf-8')) > FINAL_LIMIT:
-                raise ValueError
-            output = json.loads(final)
-            if not isinstance(output, dict):
-                raise ValueError
-            return {'output': output, 'usage_tokens': usage}
-        except (ValueError, TypeError, AttributeError):
-            raise ClubError('Codex вернул некорректный ответ; ничего не перенесено.') from None
+            text = data.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            fail('stream_encoding')
+        # Only actual line separators delimit JSONL. str.splitlines() would also
+        # split a valid JSON string containing U+2028/U+2029 from an essay.
+        for line_number, line in enumerate(text.split('\n'), 1):
+            diagnostic['line'] = line_number
+            if not line.strip():
+                continue
+            try:
+                event = _strict_json(line)
+            except (ValueError, TypeError, RecursionError):
+                fail('stream_json')
+            if not isinstance(event, dict):
+                fail('event_shape')
+            kind = event.get('type')
+            count('events', kind, EVENT_TYPES)
+            if not isinstance(kind, str) or kind not in EVENT_TYPES:
+                fail('event_type')
+            if completed:
+                fail('event_after_completion')
+            if kind in {'error', 'turn.failed'}:
+                fail('turn_failed', 'Codex не завершил анализ. Проверьте вход и доступный лимит аккаунта.')
+            if kind in {'thread.started', 'turn.started'} and diagnostic['events'][kind] > 1:
+                fail('multiple_turns')
+            if kind.startswith('item.'):
+                item = event.get('item')
+                if not isinstance(item, dict):
+                    fail('item_shape')
+                item_kind = item.get('type')
+                count('items', item_kind, ITEM_TYPES)
+                # Inspect starts/updates too: an unfinished tool call must not
+                # disappear just because it has no item.completed event.
+                if not isinstance(item_kind, str) or item_kind not in PASSIVE_ITEMS:
+                    fail('tool_or_unknown_item', 'Codex попытался использовать инструмент или вернул неизвестный тип данных; результат отклонён.')
+                if kind == 'item.completed' and item_kind == 'agent_message':
+                    if not isinstance(item.get('text'), str):
+                        fail('agent_message_shape')
+                    final = item['text']
+            if kind == 'turn.completed':
+                value = event.get('usage')
+                if not isinstance(value, dict) or not all(
+                        type(value.get(key)) is int and 0 <= value[key] < 2**63
+                        for key in ('input_tokens', 'output_tokens')):
+                    fail('usage_shape')
+                for key in ('cached_input_tokens', 'reasoning_output_tokens'):
+                    if key in value and (type(value[key]) is not int or not 0 <= value[key] < 2**63):
+                        fail('usage_shape')
+                usage = value['input_tokens'] + value['output_tokens']
+                if usage >= 2**63:
+                    fail('usage_shape')
+                completed = True
+        if not completed:
+            fail('missing_completion')
+        if final_message is not None:
+            if len(final_message) > FINAL_LIMIT:
+                fail('final_limit')
+            try:
+                final = final_message.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                fail('final_encoding')
+        if not isinstance(final, str) or not final.strip():
+            fail('missing_final')
+        try:
+            diagnostic['final_bytes'] = len(final.encode('utf-8'))
+        except UnicodeEncodeError:
+            fail('final_encoding')
+        if diagnostic['final_bytes'] > FINAL_LIMIT:
+            fail('final_limit')
+        try:
+            output = _strict_json(final)
+        except (ValueError, TypeError, RecursionError):
+            fail('final_json')
+        if not isinstance(output, dict):
+            fail('final_shape')
+        return {'output': output, 'usage_tokens': usage}
+
+    @staticmethod
+    def _read_final_message(path: Path) -> bytes | None:
+        try:
+            if not path.exists():
+                return None
+            if path.is_symlink():
+                raise OSError
+            with path.open('rb') as handle:
+                return handle.read(FINAL_LIMIT + 1)
+        except OSError:
+            raise ClubError('Не удалось прочитать итоговый ответ Codex; ничего не перенесено.') from None
 
     async def analyze(self, prompt: str, schema: dict) -> dict:
         if self.login_task and not self.login_task.done():
@@ -229,18 +342,24 @@ class CodexRunner:
                 try:
                     await self._probe(cwd)
                     schema_path = cwd / 'result.schema.json'
+                    final_path = cwd / 'result.final.json'
                     schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding='utf-8')
                     args = ['exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check',
                             '--sandbox', 'read-only', '--json', '--color', 'never',
-                            '--output-schema', str(schema_path), *self._overrides()]
+                            '--output-schema', str(schema_path),
+                            '--output-last-message', str(final_path), *self._overrides()]
                     if self.model:
                         args.extend(['--model', self.model])
                     args.append('-')
-                    code, stdout, _ = await self._capture(args, cwd=cwd, stdin=prompt.encode('utf-8'),
-                                                        timeout=self.timeout_seconds)
+                    code, stdout, stderr = await self._capture(args, cwd=cwd, stdin=prompt.encode('utf-8'),
+                                                             timeout=self.timeout_seconds)
                     if code:
-                        raise ClubError('Codex не завершил анализ. Проверьте вход и доступный лимит аккаунта.')
-                    return self.parse_result(stdout)
+                        diagnostic = {'code': 'process_exit', 'exit_code': code,
+                                      'stdout_bytes': len(stdout), 'stderr_bytes': len(stderr)}
+                        LOG.warning('Codex process failed: %s', json.dumps(diagnostic, sort_keys=True))
+                        raise CodexOutputError(diagnostic,
+                            'Codex не завершил анализ. Проверьте вход и доступный лимит аккаунта.')
+                    return self.parse_result(stdout, final_message=self._read_final_message(final_path))
                 except asyncio.TimeoutError:
                     raise ClubError('Время анализа Codex истекло; процесс остановлен. Лимит запуска уже израсходован.') from None
 
