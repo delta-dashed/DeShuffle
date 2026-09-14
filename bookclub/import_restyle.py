@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import discord
 
-from .import_publication import archive_chunks, archive_header
+from .import_publication import archive_chunks, archive_header, matches_clean_content
 from .store import ClubError
 
 
@@ -109,10 +109,11 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
                         if copy['message_id']:
                             message = await thread.fetch_message(copy['message_id'])
                             if (not service.owns_starter(message, copy['webhook_id'])
-                                    or message.content not in (text, text + '\n-# bc:' + copy_key)
+                                    or (not matches_clean_content(message.content, text)
+                                        and message.content != text + '\n-# bc:' + copy_key)
                                     or sorted((a.filename, a.size) for a in message.attachments) != expected_files):
                                 raise ClubError('Новая копия эссе изменена. Автоматическое исправление остановлено.')
-                            if message.content != text:
+                            if not matches_clean_content(message.content, text):
                                 cleanup_count += 1
                     attachments = []
                     if index == 0 and not copy:

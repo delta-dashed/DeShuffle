@@ -24,6 +24,11 @@ def archive_chunks(snapshot, *, legacy=False):
     return [body[index:index + 1500] for index in range(0, len(body), 1500)] or ['']
 
 
+def matches_clean_content(actual, expected):
+    # Discord strips trailing spaces when a webhook message is edited.
+    return actual == expected or actual == expected.rstrip(' \t')
+
+
 class ImportPublisher:
     def __init__(self, service):
         self.service, self.store = service, service.store
@@ -120,7 +125,8 @@ class ImportPublisher:
         def verify(value, *, clean=False):
             if (not self.service.owns_starter(value, hook.id if hook else None)
                     or value.channel.id != thread.id
-                    or value.content not in ((content,) if clean else (content, content + marker))):
+                    or (not matches_clean_content(value.content, content)
+                        and (clean or value.content != content + marker))):
                 raise ClubError('Копия эссе не совпадает с сохранённым текстом и отправителем. Прежние сообщения сохранены.')
             if expected_attachments is not None:
                 actual = sorted((a.filename, a.size) for a in value.attachments)
@@ -133,7 +139,7 @@ class ImportPublisher:
         # a crash before it can still find the original send by its marker.
         digest = hashlib.sha256(content.encode()).hexdigest()
         self.store.save_publication(key, thread.id, message.id, digest)
-        if message.content != content:
+        if not matches_clean_content(message.content, content):
             if thread.archived:
                 thread = await thread.edit(archived=False)
             if hook:

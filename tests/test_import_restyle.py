@@ -10,6 +10,7 @@ import discord
 
 from bookclub.archive_import import ArchiveImporter, validate_plan
 from bookclub.import_config import ImportConfig
+from bookclub.import_publication import matches_clean_content
 from bookclub.service import Service
 from bookclub.store import ClubError, Store
 from test_archive_import import ArchiveHarness
@@ -18,6 +19,11 @@ from test_bookclub_discord import not_found
 
 
 class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
+    def test_discord_trailing_space_normalization(self):
+        self.assertTrue(matches_clean_content('essay', 'essay '))
+        self.assertFalse(matches_clean_content('essa', 'essay '))
+        self.assertFalse(matches_clean_content('essay', 'essay\n'))
+
     def setUp(self):
         super().setUp()
         self.h = ArchiveHarness()
