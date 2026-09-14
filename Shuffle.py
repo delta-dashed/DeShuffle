@@ -12,6 +12,7 @@ import traceback
 from itertools import combinations
 from typing import Any, Optional, Union
 from dotenv import load_dotenv
+from contextlib import contextmanager
 
 load_dotenv()
 
@@ -142,11 +143,16 @@ def is_trackable_voice_channel(channel) -> bool:
     return isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
 
 
-def get_voice_db_connection() -> sqlite3.Connection:
+@contextmanager
+def get_voice_db_connection():
     """Create a SQLite connection for voice activity data."""
     connection = sqlite3.connect(VOICE_STATS_DB_FILE)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def init_voice_tracking_db() -> None:
@@ -2005,7 +2011,7 @@ async def on_app_command_error(
 
 
 @bot.event
-async def on_guild_scheduled_event_update(before, after):
+async def on_scheduled_event_update(before, after):
     """Auto-trigger shuffle when a voice scheduled event becomes active."""
     before_key = event_occurrence_key(before.id, before.start_time)
     after_key = event_occurrence_key(after.id, after.start_time)
@@ -2023,6 +2029,13 @@ async def on_guild_scheduled_event_update(before, after):
         planned_event_messages.pop(after_key, None)
         return
 
+    if after.status in (discord.EventStatus.cancelled, discord.EventStatus.completed):
+        task = scheduled_event_tasks.pop(after_key, None)
+        if task is not None:
+            task.cancel()
+        planned_event_messages.pop(after_key, None)
+        return
+
     if after.status is discord.EventStatus.active and before.status is not discord.EventStatus.active:
         await trigger_shuffle_for_event(after)
 
@@ -2031,11 +2044,11 @@ async def on_guild_scheduled_event_update(before, after):
         and after.start_time is not None
         and after.status is discord.EventStatus.scheduled
     ):
-        await schedule_event_lifecycle_for_event(after)
+        await schedule_event_lifecycle_for_event(after, replace_existing=True)
 
 
 @bot.event
-async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
+async def on_scheduled_event_create(event: discord.ScheduledEvent):
     """Schedule auto-shuffle handling for newly created voice events."""
     if is_frozen_event(event):
         return
@@ -2046,6 +2059,13 @@ async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
 
     if event.status is discord.EventStatus.scheduled:
         await schedule_event_lifecycle_for_event(event)
+
+
+@bot.event
+async def on_scheduled_event_delete(event: discord.ScheduledEvent):
+    for key in [key for key in scheduled_event_tasks if key[0] == event.id]:
+        scheduled_event_tasks.pop(key).cancel()
+        planned_event_messages.pop(key, None)
 
 
 # -------- Shuffle helpers --------
