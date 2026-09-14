@@ -1,7 +1,6 @@
 """Hybrid commands and Discord forms. Private drafts only use ephemeral replies."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import asyncio
 import io
 import json
@@ -23,6 +22,7 @@ log = logging.getLogger(__name__)
 HELP = '''**Архивариус · книжный клуб**
 Участнику: `/club books`, `/club book_add`, `/club join`, `/club essay`.
 В каталоге и `/club books`: «Добавить книгу» создаёт книгу и её тему. Организатору: «Загрузить список» или `/club library import` с файлом TXT, CSV, JSON.
+В карточке книги: «Управление книгой» — статус, данные и план N + 1; «Встречи» — конкретные даты и переносы.
 Ведущему: откройте `/club meeting`, нажмите «Провести встречу» и подтвердите. Кнопка «Мой план» открывает личный черновик.
 Организатору: `/club book_edit`, `/club participant`, `/club meeting_add`, `/club meeting_attach`, `/club move`, `/club cancel`, `/club offer`, `/club replace`, `/club handover`.
 Настройка сервера: `/club setup` создаёт недостающие каналы и проверяет существующие; `check_only=True` — только проверка.
@@ -81,6 +81,19 @@ class BookView(GuardedView):
             async def callback(interaction, selected=action):
                 await cog.book_essay_action(interaction, book, selected)
             button.callback = callback
+            self.add_item(button)
+        for action, label in [('manage', 'Управление книгой'), ('meetings', 'Встречи')]:
+            button = discord.ui.Button(label=label, custom_id=f'bc:book:{book["id"]}:{action}', row=1)
+            async def manage_callback(interaction, selected=action):
+                if interaction.guild_id != book['guild_id']:
+                    raise ClubError('Откройте карточку на сервере клуба.')
+                if selected == 'manage':
+                    from .book_controls import open_book_controls
+                    await open_book_controls(cog, interaction, book['id'])
+                else:
+                    from .meeting_controls import open_book_meetings
+                    await open_book_meetings(cog, interaction, book['id'])
+            button.callback = manage_callback
             self.add_item(button)
 
 
@@ -149,6 +162,14 @@ class MeetingView(GuardedView):
                 await cog.book_essay_action(interaction, book, selected)
             button.callback = essay_callback
             self.add_item(button)
+        manage = discord.ui.Button(label='Управление встречей', custom_id=f'bc:{meeting["id"]}:manage', row=3)
+        async def manage_callback(interaction):
+            if interaction.guild_id != meeting['guild_id']:
+                raise ClubError('Откройте карточку на сервере клуба.')
+            from .meeting_controls import open_meeting_controls
+            await open_meeting_controls(cog, interaction, meeting['id'])
+        manage.callback = manage_callback
+        self.add_item(manage)
 
     async def act(self, interaction, action):
         if interaction.guild_id != self.meeting['guild_id']:
@@ -404,13 +425,21 @@ class Club(commands.Cog):
     @club.command(name='book_edit', description='Изменить книгу, очередь и срок эссе')
     async def book_edit(self, ctx, book: str, status: Optional[Literal['Предложено', 'В очереди', 'Читаем', 'Прочитано']] = None,
                         position: Optional[int] = None, deadline: Optional[str] = None, title: Optional[str] = None,
-                        author: Optional[str] = None, materials: Optional[str] = None):
+                        author: Optional[str] = None, materials: Optional[str] = None, reading_meetings: Optional[str] = None):
         async with self.service.locks[ctx.guild.id]:
             await self.organizer(ctx)
             b = self.resolve_book(ctx.guild.id, book)
             fields = {k: v for k, v in dict(position=position, title=title, author=author, materials=materials).items() if v is not None}
             if status:
                 fields['status'] = next(k for k, v in STATUSES.items() if v == status)
+            if reading_meetings is not None:
+                value = reading_meetings.strip()
+                if value == '-':
+                    fields['reading_meetings'] = None
+                elif value.isdecimal() and len(value) <= 3:
+                    fields['reading_meetings'] = int(value)
+                else:
+                    raise ClubError('План: целое число встреч по книге от 1 до 100; «-» убирает план. Разбор эссе добавляется отдельно: +1.')
             if deadline is not None:
                 fields['deadline'] = None if deadline == '-' else parse_time(deadline, self.store.settings(ctx.guild.id)['timezone'])
             self.store.update_book(ctx.guild.id, b['id'], **fields)
@@ -438,22 +467,11 @@ class Club(commands.Cog):
 
     @club.command(name='meeting_add', description='Создать встречу книги и событие Discord')
     async def meeting_add(self, ctx, book: str, name: str, date: str, part: str, chapter: str, minutes: int = 90):
-        async with self.service.locks[ctx.guild.id]:
-            await self.organizer(ctx)
-            b = self.resolve_book(ctx.guild.id, book)
-            start = parse_time(date, self.store.settings(ctx.guild.id)['timezone'])
-            if not 1 <= minutes <= 1440 or start <= self.store.clock():
-                raise ClubError('Нужны будущая дата и длительность от 1 до 1440 минут.')
-            request = str(ctx.interaction.id if ctx.interaction else ctx.message.id)
-            existing = self.store.one('SELECT * FROM bc_meetings WHERE guild_id=? AND request_key=?', (ctx.guild.id, request))
-            if existing:
-                await self.service.reconcile(ctx.guild)
-                if not self.store.meeting(ctx.guild.id, existing['id'])['event_id']:
-                    raise ClubError('Предыдущая попытка не подтверждена. Используйте /club recover_event.')
-            else:
-                meeting = self.store.draft_meeting(ctx.guild.id, b['id'], name, part, chapter, request)
-                await self.service.create_event(ctx.guild, meeting, start, start + minutes * 60)
-            await self.service.refresh(ctx.guild)
+        from .meeting_actions import create_meeting
+        b = self.resolve_book(ctx.guild.id, book)
+        request = str(ctx.interaction.id if ctx.interaction else ctx.message.id)
+        await create_meeting(self.service, ctx.guild, ctx.author.id, b['id'], name=name, date=date,
+                             part=part, chapter=chapter, minutes=minutes, request_key=request)
         await self.say(ctx, 'Встреча создана. Время теперь берётся из события Discord; ведущего выбирают в /club meeting.')
 
     @club.command(name='meeting_attach', description='Связать существующее событие с книгой')
@@ -495,48 +513,23 @@ class Club(commands.Cog):
 
     @club.command(name='boundary', description='Уточнить часть и последнюю главу встречи')
     async def boundary(self, ctx, meeting: str, part: str, chapter: str):
-        from .store import checked_text
-        part = checked_text(part, 'Часть', 200)
-        chapter = checked_text(chapter, 'Последняя глава', 250)
-        async with self.service.locks[ctx.guild.id]:
-            await self.organizer(ctx)
-            m = self.resolve_meeting(ctx.guild.id, meeting)
-            if m['event_id']:
-                e = await ctx.guild.fetch_scheduled_event(m['event_id'])
-                await e.edit(description=f'{part}; до главы {chapter} включительно.\n[bookclub:{m["id"]}]')
-            with self.store.tx() as db:
-                db.execute('UPDATE bc_meetings SET part=?,chapter=? WHERE id=?', (part, chapter, m['id']))
-                db.execute('UPDATE bc_plans SET ready=0,version=version+1 WHERE meeting_id=? AND generation=?', (m['id'], m['plan_generation']))
-            await self.service.refresh(ctx.guild)
+        from .meeting_actions import edit_meeting
+        m = self.resolve_meeting(ctx.guild.id, meeting)
+        await edit_meeting(self.service, ctx.guild, ctx.author.id, m['id'], part=part, chapter=chapter)
         await self.say(ctx, 'Граница чтения уточнена. Ведущему нужно проверить план и вновь отметить готовность.')
 
     @club.command(name='move', description='Перенести встречу в событии Discord')
     async def move(self, ctx, meeting: str, date: str, minutes: int = 90):
-        async with self.service.locks[ctx.guild.id]:
-            await self.organizer(ctx)
-            m = self.resolve_meeting(ctx.guild.id, meeting)
-            start = parse_time(date, self.store.settings(ctx.guild.id)['timezone'])
-            if start <= self.store.clock() or not 1 <= minutes <= 1440:
-                raise ClubError('Нужны будущая дата и длительность от 1 до 1440 минут.')
-            e = await ctx.guild.fetch_scheduled_event(m['event_id'])
-            if e.status != discord.EventStatus.scheduled:
-                raise ClubError('Можно переносить только ещё не начавшуюся встречу.')
-            e = await e.edit(start_time=datetime.fromtimestamp(start, timezone.utc), end_time=datetime.fromtimestamp(start + minutes * 60, timezone.utc))
-            self.service.sync(ctx.guild, m, e)
-            await self.service.refresh(ctx.guild)
+        from .meeting_actions import move_meeting
+        m = self.resolve_meeting(ctx.guild.id, meeting)
+        await move_meeting(self.service, ctx.guild, ctx.author.id, m['id'], date=date, minutes=minutes)
         await self.say(ctx, 'Событие перенесено. Ведущему требуется подтвердить новые условия.')
 
     @club.command(name='cancel', description='Отменить будущую встречу и её напоминания')
     async def cancel(self, ctx, meeting: str):
-        async with self.service.locks[ctx.guild.id]:
-            await self.organizer(ctx)
-            m = self.resolve_meeting(ctx.guild.id, meeting)
-            e = await ctx.guild.fetch_scheduled_event(m['event_id'])
-            if e.status != discord.EventStatus.scheduled:
-                raise ClubError('Отменять можно только ещё не начавшуюся встречу.')
-            e = await e.cancel()
-            self.service.sync(ctx.guild, m, e)
-            await self.service.refresh(ctx.guild)
+        from .meeting_actions import cancel_meeting
+        m = self.resolve_meeting(ctx.guild.id, meeting)
+        await cancel_meeting(self.service, ctx.guild, ctx.author.id, m['id'])
         await self.say(ctx, 'Встреча отменена; история сохранена.')
 
     @club.command(name='offer', description='Предложить участнику провести встречу')

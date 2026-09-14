@@ -175,6 +175,12 @@ class Store:
                   guild_id INTEGER NOT NULL, run_id TEXT NOT NULL REFERENCES bc_import_runs(id),
                   thread_id INTEGER NOT NULL, PRIMARY KEY(guild_id,run_id,thread_id))""")
                 db.execute("INSERT INTO bc_migrations(version) VALUES(7)")
+            if not db.execute("SELECT 1 FROM bc_migrations WHERE version=8").fetchone():
+                columns = {row["name"] for row in db.execute("PRAGMA table_info(bc_books)")}
+                if "reading_meetings" not in columns:
+                    db.execute("""ALTER TABLE bc_books ADD COLUMN reading_meetings INTEGER
+                      CHECK(reading_meetings IS NULL OR reading_meetings BETWEEN 1 AND 100)""")
+                db.execute("INSERT INTO bc_migrations(version) VALUES(8)")
 
     @contextmanager
     def tx(self):
@@ -394,17 +400,23 @@ class Store:
                 created.append(dict(db.execute("SELECT * FROM bc_books WHERE id=?", (ident,)).fetchone()))
         return created, skipped
 
-    def update_book(self, guild_id, book_id, **fields):
-        if not fields or not set(fields) <= {"status", "position", "deadline", "title", "author", "materials"}:
+    def update_book(self, guild_id, book_id, *, expected_revision=None, **fields):
+        if not fields or not set(fields) <= {"status", "position", "deadline", "title", "author", "materials", "reading_meetings"}:
             raise ClubError("Неизвестное изменение книги.")
         if "status" in fields and fields["status"] not in STATUSES:
             raise ClubError("Неизвестный статус книги.")
+        if "reading_meetings" in fields and fields["reading_meetings"] is not None:
+            value = fields["reading_meetings"]
+            if type(value) is not int or not 1 <= value <= 100:
+                raise ClubError("План: от 1 до 100 встреч по книге, плюс одна встреча для разбора эссе.")
         for name, limit in (("title", 180), ("author", 180), ("materials", 4000)):
             if name in fields:
                 fields[name] = checked_text(fields[name], name, limit, name != "materials")
         settings = self.settings(guild_id)
         with self.tx() as db:
-            self._get(db, "bc_books", guild_id, book_id)
+            book = self._get(db, "bc_books", guild_id, book_id)
+            if expected_revision is not None and book["revision"] != expected_revision:
+                raise ClubError("Книга изменилась. Откройте управление книгой заново.")
             try:
                 db.execute("UPDATE bc_books SET " + ",".join(f"{k}=?" for k in fields) + ",revision=revision+1 WHERE id=?", (*fields.values(), book_id))
             except sqlite3.IntegrityError as exc:

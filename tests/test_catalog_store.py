@@ -109,7 +109,7 @@ class CatalogStoreTests(unittest.TestCase):
         self.assertIsNone(migrated.setup_resource(1, "books")["name"])
         self.assertEqual(migrated.bindings(1, 13), [])
         self.assertEqual(Store(self.path).rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": i} for i in range(1, 8)])
+                         [{"version": i} for i in range(1, 9)])
 
     def test_tag_bindings_survive_restart_and_scope_to_forum(self):
         self.store.bind_tag(1, 13, "catalog", 100)
