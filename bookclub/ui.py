@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import io
+import json
 import logging
 import re
 from typing import Literal, Optional
@@ -13,6 +15,7 @@ from discord.ext import commands, tasks
 from .store import ClubError, STATUSES, parse_time
 from .render import pages, safe, meeting_lines, book_url, essay_lines
 from .service import NO_MENTIONS, ESSAY_WEBHOOK_NAME, Service
+from .archive_import import ArchiveImporter
 
 log = logging.getLogger(__name__)
 HELP = '''**Архивариус · книжный клуб**
@@ -231,14 +234,16 @@ class PlanView(GuardedView):
 
 
 class Club(commands.Cog):
-    def __init__(self, bot, store, guild_ids=None):
+    def __init__(self, bot, store, guild_ids=None, import_config=None):
         self.bot, self.store = bot, store
         self.service = Service(bot, store, guild_ids)
         self.service.view_factory = lambda meeting: MeetingView(self, meeting)
         self.service.book_view_factory = lambda book: BookView(self, book)
+        self.importer = ArchiveImporter(self.service, import_config)
 
     async def cog_load(self):
         self.store.recover_jobs()
+        self.importer.ledger.recover_runs()
         with self.store.tx() as db:
             db.execute('UPDATE bc_publications SET content_hash=NULL')
         for m in self.store.rows('SELECT * FROM bc_meetings WHERE event_id IS NOT NULL'):
@@ -249,6 +254,7 @@ class Club(commands.Cog):
 
     async def cog_unload(self):
         self.worker.cancel()
+        await self.importer.close()
 
     @tasks.loop(seconds=30)
     async def worker(self):
@@ -530,19 +536,27 @@ class Club(commands.Cog):
                 raise ClubError('Нужна ссылка на пост или сообщение этого сервера.')
             channel = await self.service.channel(ctx.guild, int(match[2]))
             source_id = int(match[3] or match[2])
+            verified_thread = False
             if isinstance(channel, discord.Thread) and channel.parent_id == self.store.settings(ctx.guild.id)['essays']:
-                await self.service.register_thread(channel, prompt=False)
+                verified_thread = await self.service.register_thread(channel, prompt=False)
             managed = self.store.one('SELECT * FROM bc_essays WHERE guild_id=? AND channel_id=? AND managed=1',
                                      (ctx.guild.id, channel.id))
+            imported = self.store.one('SELECT * FROM bc_import_sources WHERE guild_id=? AND thread_id=?',
+                                      (ctx.guild.id, channel.id)) if verified_thread else None
+            if imported and not managed:
+                managed = self.store.one('SELECT * FROM bc_essays WHERE guild_id=? AND source_id=?',
+                                          (ctx.guild.id, channel.id))
             if managed:
                 if not organizer and ctx.author.id != managed['author_id']:
                     raise ClubError('Регистрировать чужую работу может организатор.')
-                await self.service.register_thread(channel, book_id=b['id'], correct=correct, prompt=False)
+                if not await self.service.register_thread(channel, book_id=b['id'], correct=correct, prompt=False):
+                    raise ClubError('Не удалось подтвердить происхождение темы эссе; связь не изменена.')
                 if b['id'] != self.store.one('SELECT book_id FROM bc_essays WHERE guild_id=? AND source_id=?',
                                             (ctx.guild.id, channel.id))['book_id']:
                     raise ClubError('Работа уже связана с другой книгой; используйте correct=True.')
                 await self.service.refresh(ctx.guild)
-                await self.say(ctx, 'Связь поста с книгой сохранена. Эссе учитывается после собственного сообщения автора.')
+                await self.say(ctx, 'Связь архивного эссе с книгой сохранена. Оригиналы и авторство сохранены.' if imported else
+                                   'Связь поста с книгой сохранена. Эссе учитывается после собственного сообщения автора.')
                 return
             if isinstance(channel, discord.Thread) and source_id == channel.id:
                 message = await channel.fetch_message(channel.id)
@@ -578,6 +592,67 @@ class Club(commands.Cog):
         result = await self.service.setup_server(ctx.guild, ctx.author.id,
                                                  check_only=check_only, retry_missing=retry_missing, category=category)
         for page in pages(result):
+            await self.say(ctx, page)
+
+    async def import_context(self, ctx):
+        if ctx.interaction is None:
+            raise ClubError('Используйте slash-команды /club import: коды входа и планы видны только вам.')
+        await self.importer.guard(ctx.guild, ctx.author.id)
+
+    async def show_import(self, ctx, run):
+        for page in pages(self.importer.report(run)):
+            await self.say(ctx, page)
+        data = json.dumps({'run_id': run['id'], 'snapshot': run['snapshot'], 'plan': run['plan']}, ensure_ascii=False, indent=2).encode()
+        await self.say(ctx, 'Полный снимок и план для проверки:',
+                       file=discord.File(io.BytesIO(data), filename=f'import-{run["id"]}.json'))
+
+    @club.group(name='import', description='Временный импорт архива через Codex', invoke_without_command=True)
+    async def archive(self, ctx):
+        await self.import_context(ctx)
+        await self.say(ctx, 'Временный импорт: login → scan → review → apply. Настройки и лимиты меняются на машине бота с перезапуском.')
+
+    @archive.command(name='login', description='Войти в отдельный профиль Codex по одноразовому коду')
+    async def import_login(self, ctx):
+        await self.import_context(ctx)
+        login = await self.importer.login(ctx.guild, ctx.author.id)
+        await self.say(ctx, f'Откройте {login["verification_uri"]} и введите код **{login["user_code"]}**.\n'
+                       'Войдите в свой аккаунт на странице OpenAI. Пароль и токены боту не отправляйте. '
+                       'После подтверждения проверьте /club import status. Код временный.')
+
+    @archive.command(name='status', description='Проверить вход Codex и сохранённые лимиты импорта')
+    async def import_status(self, ctx):
+        await self.import_context(ctx)
+        for page in pages(await self.importer.status(ctx.guild, ctx.author.id)):
+            await self.say(ctx, page)
+
+    @archive.command(name='scan', description='Составить план переноса эссе из выбранного канала и тредов')
+    async def import_scan(self, ctx, source: Optional[discord.TextChannel | discord.ForumChannel] = None,
+                          before: Optional[str] = None, thread: Optional[discord.Thread] = None,
+                          after: Optional[str] = None):
+        await self.import_context(ctx)
+        source = source or (thread.parent if thread else ctx.channel)
+        if isinstance(source, discord.Thread):
+            thread, source = source, source.parent
+        def message_id(value):
+            if value is not None and (not value.isdecimal() or not 0 < int(value) < 2**63):
+                raise ClubError('before/after: укажите числовой ID сообщения Discord.')
+            return int(value) if value else None
+        if source is None:
+            raise ClubError('Не удалось определить исходный канал.')
+        run = await self.importer.scan(ctx.guild, ctx.author.id, source.id, str(ctx.interaction.id),
+                                       before_id=message_id(before), thread_id=thread.id if thread else None,
+                                       after_id=message_id(after))
+        await self.show_import(ctx, run)
+
+    @archive.command(name='review', description='Показать сохранённый план без нового запроса к Codex')
+    async def import_review(self, ctx, run: str):
+        await self.import_context(ctx)
+        await self.show_import(ctx, await self.importer.review(ctx.guild, ctx.author.id, run))
+
+    @archive.command(name='apply', description='Перенести архивные эссе по проверенному плану')
+    async def import_apply(self, ctx, run: str, confirm: bool = False):
+        await self.import_context(ctx)
+        for page in pages(await self.importer.apply(ctx.guild, ctx.author.id, run, confirm=confirm)):
             await self.say(ctx, page)
 
     @club.command(name='diagnose', description='Проверить настройку без отправок и создания каналов')

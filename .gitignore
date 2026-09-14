@@ -154,6 +154,8 @@ event_auto_shuffle_targets.json
 persistent_shuffle_exclusions.json
 shuffle_settings.json
 bookclub.json
+bookclub.import.json
+bookclub-codex-profile/
 shuffle_admin_audit.jsonl
 logs/
 *.log.*

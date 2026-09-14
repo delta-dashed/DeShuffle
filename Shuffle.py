@@ -32,6 +32,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 async def setup_hook():
     if os.getenv('BOOKCLUB_ENABLED', '').lower() in ('1', 'true', 'yes'):
         from bookclub.config import load_config
+        from bookclub.import_config import load_import_config
         from bookclub.store import Store
         from bookclub.ui import Club
 
@@ -43,7 +44,7 @@ async def setup_hook():
             for guild_id, settings in guild_settings.items():
                 store.import_config(guild_id, settings)
             guild_ids = set(guild_settings)
-        await bot.add_cog(Club(bot, store, guild_ids=guild_ids))
+        await bot.add_cog(Club(bot, store, guild_ids=guild_ids, import_config=load_import_config()))
 
 
 USE_GUILD_ONLY_APP_COMMANDS = True

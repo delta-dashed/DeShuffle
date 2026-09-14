@@ -1,0 +1,457 @@
+"""Archive scans and approved copies use real SQLite with simulated Discord I/O."""
+import asyncio
+from dataclasses import replace
+import io
+import json
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock
+
+import discord
+
+from bookclub.archive_import import ArchiveImporter, validate_plan
+from bookclub.import_config import ImportConfig
+from bookclub.service import Service
+from bookclub.store import ClubError, Store
+from test_bookclub import ClubFixture
+from test_bookclub_discord import iterate
+from test_webhook_discord import WebhookHarness
+
+
+class ArchiveHarness(WebhookHarness):
+    def __init__(self):
+        super().__init__()
+        self.guild.filesize_limit = 10_000_000
+        for member in self.members.values():
+            member.guild_permissions = discord.Permissions.none()
+        self.members[9999] = SimpleNamespace(id=9999, bot=True)
+        self.source = self.channel(41, discord.TextChannel, name='Старые эссе')
+        self.source.archived_threads.side_effect = lambda **_: iterate([
+            c for c in self.channels.values()
+            if isinstance(c, discord.Thread) and c.parent_id == 41 and c.archived])
+        self.old_thread = self.channel(51, parent_id=41, name='Обсуждение книги')
+        root = self.human_message(self.source, 51, '# Книга', 99)
+        root.thread = self.old_thread
+        root.flags.has_thread = True
+        self.first = self.human_message(self.old_thread, 61, 'Первая часть моего эссе. @everyone', 1)
+        self.second = self.human_message(self.old_thread, 62, 'Продолжение эссе: мои выводы.', 1)
+        self.discussion = self.human_message(self.old_thread, 63, 'Согласен!', 2)
+
+    def channel(self, ident, kind=discord.Thread, **kwargs):
+        result = super().channel(ident, kind, **kwargs)
+        if isinstance(result, discord.Thread):
+            result.is_private.return_value = False
+        def history(*, limit=100, before=None, after=None, oldest_first=False):
+            rows = sorted(result.messages.values(), key=lambda m: m.id, reverse=not oldest_first)
+            rows = [m for m in rows if (before is None or m.id < before.id)
+                    and (after is None or m.id > after.id)]
+            return iterate(rows[:limit] if limit is not None else rows)
+        result.history = history
+        return result
+
+    def message(self, channel, ident, content, **kwargs):
+        result = super().message(channel, ident, content, **kwargs)
+        result.thread = None
+        result.flags = SimpleNamespace(has_thread=False)
+        return result
+
+    def human_message(self, channel, ident, content, author=1):
+        result = self.message(channel, ident, content)
+        result.author = self.members[author]
+        return result
+
+
+class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.h = ArchiveHarness()
+        self.service = Service(self.h.bot, self.store)
+        self.config = ImportConfig(enabled=True, allowed_user_ids=(99,),
+                                   allowed_guild_ids=(1,), allowed_channel_ids=(41,),
+                                   max_runs=3, max_accounted_tokens=500_000)
+        self.runner = SimpleNamespace(login_status=AsyncMock(return_value=True),
+                                      begin_login=AsyncMock(), close=AsyncMock(),
+                                      analyze=AsyncMock(side_effect=self.classify))
+        self.importer = ArchiveImporter(self.service, self.config, self.runner)
+
+    async def asyncSetUp(self):
+        asyncio.get_running_loop().slow_callback_duration = 1.0
+
+    async def classify(self, prompt, schema):
+        payload = json.loads(prompt.split('\n', 1)[1])
+        first = next(m for m in payload['messages'] if m['id'] == '61')
+        return {'output': {'essays': [{'book_ref': first['context_ref'], 'message_ids': ['62', '61']}]},
+                'usage_tokens': 321}
+
+    async def scan(self, key='scan-1'):
+        return await self.importer.scan(self.h.guild, 99, 41, key)
+
+    async def apply(self, run):
+        return await self.importer.apply(self.h.guild, 99, run['id'], confirm=True)
+
+    def assert_no_discord_writes(self):
+        self.assertFalse(self.h.hooks)
+        for channel in self.h.channels.values():
+            channel.send.assert_not_awaited()
+            channel.edit.assert_not_awaited()
+            if isinstance(channel, discord.ForumChannel):
+                channel.create_thread.assert_not_awaited()
+                channel.create_webhook.assert_not_awaited()
+            for message in channel.messages.values():
+                message.edit.assert_not_awaited()
+        self.assertEqual(self.store.essays(self.book['id']), [])
+
+    async def test_disabled_switch_blocks_all_entrypoints_without_runner_or_scan(self):
+        self.importer.config = replace(self.config, enabled=False)
+        actions = [self.importer.scan(self.h.guild, 99, 41, 'blocked'),
+                   self.importer.login(self.h.guild, 99),
+                   self.importer.status(self.h.guild, 99),
+                   self.importer.review(self.h.guild, 99, 'missing'),
+                   self.importer.apply(self.h.guild, 99, 'missing', confirm=True)]
+        for action in actions:
+            with self.assertRaisesRegex(ClubError, 'отключён'):
+                await action
+        self.runner.login_status.assert_not_awaited()
+        self.runner.analyze.assert_not_awaited()
+        self.h.bot.fetch_channel.assert_not_awaited()
+
+    async def test_user_guild_channel_allowlists_and_live_admin_rights_precede_model(self):
+        cases = [dict(allowed_user_ids=(1,)), dict(allowed_guild_ids=(2,)),
+                 dict(allowed_channel_ids=(42,))]
+        for overrides in cases:
+            self.importer.config = replace(self.config, **overrides)
+            with self.assertRaises(ClubError):
+                await self.scan()
+        self.importer.config = replace(self.config, allowed_user_ids=(1,))
+        with self.assertRaisesRegex(ClubError, 'Manage Server'):
+            await self.importer.scan(self.h.guild, 1, 41, 'regular-member')
+        self.runner.analyze.assert_not_awaited()
+        self.runner.login_status.assert_not_awaited()
+        self.assertEqual(self.importer.ledger.budget(self.config.budget_id)['runs_used'], 0)
+
+    async def test_source_history_access_is_checked_before_model(self):
+        self.h.source.permissions_for.return_value.read_message_history = False
+        with self.assertRaisesRegex(ClubError, 'истории'):
+            await self.scan()
+        self.runner.analyze.assert_not_awaited()
+        self.assert_no_discord_writes()
+
+    async def test_scan_builds_review_plan_from_book_heading_without_discord_writes(self):
+        run = await self.scan()
+        self.assertEqual(run['state'], 'review')
+        self.assertEqual(run['plan']['essays'], [{'book_ref': 'book:' + self.book['id'],
+                                                'message_ids': ['61', '62'], 'author_id': 1}])
+        self.assertEqual(run['plan']['skipped_message_ids'], ['63'])
+        self.assertEqual({m['id'] for m in run['snapshot']['messages']}, {'61', '62', '63'})
+        self.assertEqual(len(self.store.books(1)), 1)
+        self.assert_no_discord_writes()
+        self.runner.analyze.assert_awaited_once()
+        report = '\n'.join(self.importer.report(run))
+        self.assertIn('Участник 1', report)
+        self.assertIn('confirm:true', report)
+
+    async def test_public_archived_threads_are_included_private_and_other_channels_excluded(self):
+        self.h.old_thread.archived = True
+        private = self.h.channel(71, parent_id=41)
+        private.is_private.return_value = True
+        self.h.human_message(private, 72, 'Секретный текст')
+        foreign = self.h.channel(81, parent_id=12)
+        self.h.human_message(foreign, 82, 'Пост в другом канале')
+        self.h.human_message(self.h.old_thread, 64, 'Вебхук').webhook_id = 999
+        self.h.message(self.h.old_thread, 65, 'Пост бота')
+        run = await self.scan()
+        self.assertEqual({m['id'] for m in run['snapshot']['messages']}, {'61', '62', '63'})
+
+    async def test_unknown_book_is_only_proposed_until_confirmation(self):
+        self.h.source.messages[51].content = '# Неизвестная книга'
+        run = await self.scan()
+        self.assertEqual(run['plan']['essays'][0]['book_ref'], 'source:51')
+        self.assertEqual(len(self.store.books(1)), 1)
+        self.assert_no_discord_writes()
+        await self.apply(run)
+        added = next(b for b in self.store.books(1) if b['title'] == 'Неизвестная книга')
+        essay, = self.store.essays(added['id'])
+        self.assertEqual(essay['author_id'], 1)
+
+    async def test_forum_uses_topic_name_as_book_and_preserves_starter_essay(self):
+        source = self.h.channel(42, discord.ForumChannel)
+        topic = self.h.channel(71, parent_id=42, name='Книга')
+        starter = self.h.human_message(topic, 71, 'Полное эссе начинается в стартовом посте.', 1)
+        self.h.human_message(topic, 72, 'Продолжение.', 1)
+        snapshot = await self.importer.capture(self.h.guild, self.h.members[99], source)
+        self.assertEqual({m['id'] for m in snapshot['messages']}, {'71', '72'})
+        self.assertTrue(all(m['context_ref'] == 'book:' + self.book['id'] for m in snapshot['messages']))
+        self.assertEqual(snapshot['messages'][0]['content'], starter.content)
+        self.assertEqual(len(snapshot['books']), 1)
+
+    async def test_explicit_thread_cursor_advances_past_already_imported_messages(self):
+        self.h.human_message(self.h.old_thread, 64, 'Ещё одно полноценное эссе.', 2)
+        # The thread fixture also contains a bot starter, which consumes one raw-history slot.
+        self.importer.config = replace(self.config, max_messages=3)
+        first = await self.scan()
+        self.assertEqual({m['id'] for m in first['snapshot']['messages']}, {'61', '62'})
+        self.assertTrue(any('after:62' in line for line in first['snapshot']['warnings']))
+        await self.apply(first)
+        self.h.old_thread.archived = True
+        self.h.source.archived_threads.side_effect = lambda **_: iterate([])
+        next_page = await self.importer.capture(self.h.guild, self.h.members[99], self.h.source,
+                                                thread_id=51, after_id=62)
+        self.assertEqual({m['id'] for m in next_page['messages']}, {'63', '64'})
+
+    async def test_model_cannot_invent_ids_authors_actions_or_mix_authors(self):
+        run = await self.scan()
+        ref = 'book:' + self.book['id']
+        invalid = [
+            {'essays': [{'book_ref': ref, 'message_ids': ['999']} ]},
+            {'essays': [{'book_ref': 'unknown', 'message_ids': ['61']}]},
+            {'essays': [{'book_ref': ref, 'message_ids': ['61', '63']}]},
+            {'essays': [{'book_ref': ref, 'message_ids': ['61', '61']}]},
+            {'essays': [{'book_ref': ref, 'message_ids': ['61'], 'author_id': 99}]},
+            {'essays': [], 'command': 'delete-channel'},
+            {'essays': [{'book_ref': ref, 'message_ids': ['61']},
+                        {'book_ref': ref, 'message_ids': ['61']}]},
+        ]
+        for output in invalid:
+            with self.subTest(output=output), self.assertRaises(ClubError):
+                validate_plan(run['snapshot'], output)
+        self.assert_no_discord_writes()
+
+    async def test_invalid_model_result_is_failed_and_budget_stays_charged(self):
+        self.runner.analyze.side_effect = None
+        self.runner.analyze.return_value = {'output': {'essays': [{'book_ref': 'outside', 'message_ids': ['61']}]},
+                                            'usage_tokens': 101}
+        with self.assertRaises(ClubError):
+            await self.scan()
+        run, = self.store.rows('SELECT state,usage_tokens FROM bc_import_runs')
+        self.assertEqual((run['state'], run['usage_tokens']), ('failed', 101))
+        budget = self.importer.ledger.budget(self.config.budget_id)
+        self.assertEqual(budget['runs_used'], 1)
+        self.assertGreater(budget['tokens_reserved'], 101)
+        self.assert_no_discord_writes()
+
+    async def test_runner_failure_is_not_retried_or_refunded(self):
+        self.runner.analyze.side_effect = OSError('provider internal detail')
+        with self.assertRaises(ClubError) as caught:
+            await self.scan()
+        self.assertNotIn('provider internal detail', str(caught.exception))
+        same = await self.scan()
+        self.assertEqual(same['state'], 'failed')
+        self.runner.analyze.assert_awaited_once()
+        self.assertEqual(self.importer.ledger.budget(self.config.budget_id)['runs_used'], 1)
+
+    async def test_cancelled_analysis_keeps_charge_and_is_not_automatically_restarted(self):
+        self.runner.analyze.side_effect = asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.scan()
+        replay = await self.scan()
+        self.assertEqual(replay['state'], 'unknown')
+        self.assertEqual(self.importer.ledger.budget(self.config.budget_id)['runs_used'], 1)
+        self.runner.analyze.assert_awaited_once()
+        self.assert_no_discord_writes()
+
+    async def test_same_request_and_restart_preserve_plan_and_max_run_cap(self):
+        self.importer.config = replace(self.config, max_runs=1)
+        run = await self.scan()
+        self.store = Store(self.path, clock=lambda: self.now)
+        self.service = Service(self.h.bot, self.store)
+        self.importer = ArchiveImporter(self.service, replace(self.config, max_runs=1), self.runner)
+        replay = await self.scan()
+        self.assertEqual(replay['id'], run['id'])
+        with self.assertRaisesRegex(ClubError, 'Лимит запусков'):
+            await self.scan('different-request')
+        self.runner.analyze.assert_awaited_once()
+
+    async def test_insufficient_token_reservation_never_calls_model(self):
+        self.importer.config = replace(self.config, max_accounted_tokens=1)
+        with self.assertRaisesRegex(ClubError, 'резерва'):
+            await self.scan()
+        self.runner.analyze.assert_not_awaited()
+        self.assertEqual(self.importer.ledger.budget(self.config.budget_id)['runs_used'], 0)
+
+    async def test_confirmation_is_required_before_any_copy(self):
+        run = await self.scan()
+        with self.assertRaisesRegex(ClubError, 'confirm:true'):
+            await self.importer.apply(self.h.guild, 99, run['id'])
+        self.assert_no_discord_writes()
+        self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'review')
+
+    async def test_any_changed_original_rejects_whole_plan_before_first_copy(self):
+        run = await self.scan()
+        self.h.second.content = 'Отредактированный текст'
+        with self.assertRaisesRegex(ClubError, 'изменено'):
+            await self.apply(run)
+        self.assert_no_discord_writes()
+        self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'review')
+
+    async def test_changed_attachment_rejects_reviewed_plan_without_download_or_copy(self):
+        attachment = SimpleNamespace(id=701, filename='essay.txt', size=13, to_file=AsyncMock())
+        self.h.first.attachments = [attachment]
+        run = await self.scan()
+        attachment.id = 702
+        with self.assertRaisesRegex(ClubError, 'изменено'):
+            await self.apply(run)
+        attachment.to_file.assert_not_awaited()
+        self.assert_no_discord_writes()
+
+    async def test_removed_allowlist_or_admin_permission_blocks_existing_plan(self):
+        run = await self.scan()
+        self.importer.config = replace(self.config, allowed_channel_ids=(42,))
+        with self.assertRaisesRegex(ClubError, 'не разрешён'):
+            await self.apply(run)
+        self.importer.config = self.config
+        self.h.guild.owner_id = 100
+        with self.assertRaisesRegex(ClubError, 'Manage Server'):
+            await self.apply(run)
+        self.assert_no_discord_writes()
+
+    async def test_review_refuses_to_reveal_snapshot_after_thread_access_revocation(self):
+        run = await self.scan()
+        self.h.old_thread.permissions_for.return_value.read_message_history = False
+        with self.assertRaisesRegex(ClubError, 'Доступ'):
+            await self.importer.review(self.h.guild, 99, run['id'])
+        self.runner.analyze.assert_awaited_once()
+        self.assert_no_discord_writes()
+
+    async def test_destination_change_after_review_refuses_old_plan(self):
+        run = await self.scan()
+        settings = self.store.settings(1)
+        self.store.configure(1, {**settings, 'essays': 44})
+        with self.assertRaisesRegex(ClubError, 'Форум назначения изменён'):
+            await self.apply(run)
+        self.assert_no_discord_writes()
+
+    async def test_approved_copy_preserves_text_files_author_and_original_links(self):
+        attachment = SimpleNamespace(id=701, filename='essay.txt', size=13,
+                                     to_file=AsyncMock(side_effect=lambda: discord.File(io.BytesIO(b'original-file'), filename='essay.txt')))
+        self.h.first.attachments = [attachment]
+        run = await self.scan()
+        await self.apply(run)
+        essay, = self.store.essays(self.book['id'])
+        self.assertEqual((essay['author_id'], essay['submitted'], essay['managed']), (1, 1, 0))
+        target = self.h.channels[essay['source_id']]
+        self.assertEqual(target.parent_id, 14)
+        starter = target.messages[target.id]
+        self.assertIn('<@1>', starter.content)
+        self.assertIn(self.h.first.jump_url, starter.content)
+        hook, = self.h.hooks.values()
+        self.assertEqual(hook.send.await_args.kwargs['username'], self.h.members[1].display_name)
+        self.assertEqual(hook.send.await_args.kwargs['avatar_url'], str(self.h.members[1].display_avatar.url))
+        self.assertEqual(target.send.await_count, 2)
+        contents = [call.args[0] for call in target.send.await_args_list]
+        self.assertIn(self.h.first.content, contents[0])
+        self.assertIn(self.h.second.content, contents[1])
+        self.assertIn(self.h.second.jump_url, contents[1])
+        self.assertEqual(target.send.await_args_list[0].kwargs['files'][0].filename, 'essay.txt')
+        attachment.to_file.assert_awaited_once()
+        for call in [hook.send.await_args, *target.send.await_args_list]:
+            self.assertFalse(call.kwargs['allowed_mentions'].everyone)
+            self.assertFalse(call.kwargs['allowed_mentions'].users)
+        self.h.first.edit.assert_not_awaited()
+        self.h.second.edit.assert_not_awaited()
+        self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'done')
+
+    async def test_oversize_attachments_use_original_link_without_download(self):
+        attachment = SimpleNamespace(id=701, filename='large.zip', size=20_000_000, to_file=AsyncMock())
+        self.h.first.attachments = [attachment]
+        run = await self.scan()
+        self.assertFalse(run['snapshot']['messages'][0]['attachments'][0]['copy'])
+        self.assertTrue(run['snapshot']['warnings'])
+        await self.apply(run)
+        attachment.to_file.assert_not_awaited()
+        essay, = self.store.essays(self.book['id'])
+        target = self.h.channels[essay['source_id']]
+        self.assertIn('large.zip', target.send.await_args_list[0].args[0])
+        self.assertIn(self.h.first.jump_url, target.send.await_args_list[0].args[0])
+
+    async def test_repeated_apply_and_scan_do_not_duplicate_or_recharge(self):
+        run = await self.scan()
+        await self.apply(run)
+        essay, = self.store.essays(self.book['id'])
+        target = self.h.channels[essay['source_id']]
+        before_sends = target.send.await_count
+        await self.apply(run)
+        await self.scan()
+        self.assertEqual(target.send.await_count, before_sends)
+        self.assertEqual(len(self.store.essays(self.book['id'])), 1)
+        hook, = self.h.hooks.values()
+        hook.send.assert_awaited_once()
+        self.runner.analyze.assert_awaited_once()
+
+    async def test_lost_body_send_ack_recovers_existing_message_without_duplicates(self):
+        run = await self.scan()
+        original_publish = self.service.publish_essay_starter
+        async def publish_and_interrupt(*args, **kwargs):
+            pub = await original_publish(*args, **kwargs)
+            thread = self.h.channels[pub['channel_id']]
+            original_send = thread.send.side_effect
+            async def send_then_lose_ack(content, **fields):
+                thread.send.side_effect = original_send
+                await original_send(content, **fields)
+                raise OSError('lost acknowledgement')
+            thread.send.side_effect = send_then_lose_ack
+            return pub
+        self.service.publish_essay_starter = publish_and_interrupt
+        with self.assertRaisesRegex(OSError, 'lost acknowledgement'):
+            await self.apply(run)
+        self.service.publish_essay_starter = original_publish
+        self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'review')
+        await self.apply(run)
+        essay, = self.store.essays(self.book['id'])
+        target = self.h.channels[essay['source_id']]
+        self.assertEqual(len(target.messages), 3)
+        self.assertEqual(target.send.await_count, 2)
+        hook, = self.h.hooks.values()
+        hook.send.assert_awaited_once()
+        self.runner.analyze.assert_awaited_once()
+
+    async def test_lost_starter_ack_recovers_same_webhook_thread_after_restart(self):
+        run = await self.scan()
+        hook = self.h.webhook(14)
+        self.store.save_webhook(1, 14, hook.id)
+        original_send = hook.send.side_effect
+        async def send_then_lose_ack(*args, **kwargs):
+            hook.send.side_effect = original_send
+            await original_send(*args, **kwargs)
+            raise OSError('lost starter acknowledgement')
+        hook.send.side_effect = send_then_lose_ack
+        with self.assertRaisesRegex(OSError, 'lost starter acknowledgement'):
+            await self.apply(run)
+        self.store = Store(self.path, clock=lambda: self.now)
+        self.service = Service(self.h.bot, self.store)
+        self.importer = ArchiveImporter(self.service, self.config, self.runner)
+        await self.apply(run)
+        hook.send.assert_awaited_once()
+        essay, = self.store.essays(self.book['id'])
+        target = self.h.channels[essay['source_id']]
+        self.assertEqual(len(target.messages), 3)
+        self.assertEqual(target.send.await_count, 2)
+        self.runner.analyze.assert_awaited_once()
+
+    async def test_partial_copy_deleted_before_retry_is_recreated_with_attachment(self):
+        attachment = SimpleNamespace(id=701, filename='essay.txt', size=13,
+                                     to_file=AsyncMock(side_effect=lambda: discord.File(io.BytesIO(b'original-file'), filename='essay.txt')))
+        self.h.first.attachments = [attachment]
+        run = await self.scan()
+        original_upsert = self.service.upsert
+        async def interrupt_second(guild, key, *args, **kwargs):
+            if ':message:62:' in key:
+                raise OSError('interrupted before second part')
+            return await original_upsert(guild, key, *args, **kwargs)
+        self.service.upsert = interrupt_second
+        with self.assertRaisesRegex(OSError, 'interrupted before second part'):
+            await self.apply(run)
+        first_copy = self.store.publication('essay-import:1:61:message:61:0')
+        target = self.h.channels[first_copy['channel_id']]
+        del target.messages[first_copy['message_id']]
+        self.service.upsert = original_upsert
+        await self.apply(run)
+        attachment.to_file.assert_awaited()
+        self.assertEqual(attachment.to_file.await_count, 2)
+        self.assertEqual(len(target.messages), 3)
+        self.assertEqual(target.send.await_args_list[1].kwargs['files'][0].filename, 'essay.txt')
+        self.assertEqual(len(self.store.essays(self.book['id'])), 1)
+        self.runner.analyze.assert_awaited_once()
+
+
+if __name__ == '__main__':
+    unittest.main()

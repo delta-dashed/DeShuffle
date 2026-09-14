@@ -129,6 +129,28 @@ class Store:
                 db.execute("""CREATE TABLE IF NOT EXISTS bc_config_imports(
                   guild_id INTEGER PRIMARY KEY, data TEXT NOT NULL)""")
                 db.execute("INSERT INTO bc_migrations(version) VALUES(4)")
+            if not db.execute("SELECT 1 FROM bc_migrations WHERE version=5").fetchone():
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_budgets(
+                  budget_id TEXT PRIMARY KEY, runs_used INTEGER NOT NULL DEFAULT 0,
+                  tokens_reserved INTEGER NOT NULL DEFAULT 0)""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_runs(
+                  id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, actor_id INTEGER NOT NULL,
+                  source_channel_id INTEGER NOT NULL, budget_id TEXT NOT NULL,
+                  request_key TEXT NOT NULL, reserved_tokens INTEGER NOT NULL,
+                  usage_tokens INTEGER, state TEXT NOT NULL DEFAULT 'running'
+                    CHECK(state IN ('running','review','applying','done','failed','unknown')),
+                  detail TEXT, snapshot TEXT NOT NULL, plan TEXT,
+                  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                  UNIQUE(guild_id,request_key))""")
+                db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS bc_import_one_running
+                  ON bc_import_runs(state) WHERE state='running'""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_sources(
+                  guild_id INTEGER NOT NULL, source_id INTEGER NOT NULL,
+                  run_id TEXT NOT NULL REFERENCES bc_import_runs(id), item_key TEXT NOT NULL,
+                  thread_id INTEGER, PRIMARY KEY(guild_id,source_id))""")
+                db.execute("""CREATE INDEX IF NOT EXISTS bc_import_source_items
+                  ON bc_import_sources(guild_id,item_key)""")
+                db.execute("INSERT INTO bc_migrations(version) VALUES(5)")
 
     @contextmanager
     def tx(self):

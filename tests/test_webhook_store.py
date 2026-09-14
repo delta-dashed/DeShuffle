@@ -62,7 +62,7 @@ class WebhookMigrationTests(unittest.TestCase):
         self.assertEqual(store.one("SELECT note FROM legacy_notes")["note"], "preserved")
         self.assertEqual(store.one("PRAGMA user_version")["user_version"], 7)
         self.assertEqual(store.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": 1}, {"version": 2}, {"version": 3}, {"version": 4}])
+                         [{"version": 1}, {"version": 2}, {"version": 3}, {"version": 4}, {"version": 5}])
         store.save_webhook(1, 14, 900)
 
         restored = Store(self.path)
@@ -85,7 +85,7 @@ class WebhookMigrationTests(unittest.TestCase):
         self.assertEqual(store.publication("book:old-book")["webhook_id"], 900)
         self.assertEqual(store.webhook_binding(1, 14)["webhook_id"], 900)
         self.assertEqual(store.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": 1}, {"version": 2}, {"version": 3}, {"version": 4}])
+                         [{"version": 1}, {"version": 2}, {"version": 3}, {"version": 4}, {"version": 5}])
 
 
 class WebhookStoreTests(unittest.TestCase):

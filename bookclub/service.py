@@ -240,7 +240,7 @@ class Service:
                     return channel, message
         return None
 
-    async def upsert(self, guild, key, channel_id, content, *, forum_name=None, view=None):
+    async def upsert(self, guild, key, channel_id, content, *, forum_name=None, view=None, files=None):
         marker = f'\n-# bc:{key}'
         content += marker
         if len(content) > 2000:
@@ -293,7 +293,8 @@ class Service:
             else:
                 if isinstance(channel, discord.Thread) and channel.archived:
                     channel = await channel.edit(archived=False)
-                message = await channel.send(content, view=view, allowed_mentions=NO_MENTIONS)
+                extra = {'files': files} if files else {}
+                message = await channel.send(content, view=view, allowed_mentions=NO_MENTIONS, **extra)
                 created_message = True
         if message.author.id != self.bot.user.id:
             raise ClubError('Сохранённая карточка принадлежит другому автору; бот её не редактирует.')
@@ -559,6 +560,34 @@ class Service:
             if old:
                 self.store.delete_essay(thread.guild.id, source_id=thread.id)
             return False
+        imported = self.store.rows(
+            'SELECT DISTINCT item_key FROM bc_import_sources WHERE guild_id=? AND thread_id=?',
+            (thread.guild.id, thread.id))
+        if imported:
+            # A completed copy retains the real author recorded at import time.
+            # Neither a displayed webhook name nor an unbound marker proves it.
+            if not old or len(imported) != 1:
+                return False
+            key = imported[0]['item_key']
+            pub = self.store.publication(key)
+            if (not key.startswith(f'essay-import:{thread.guild.id}:') or not pub
+                    or pub['guild_id'] != thread.guild.id or pub['channel_id'] != thread.id
+                    or pub['message_id'] != thread.id
+                    or '-# bc:' + key not in starter.content.splitlines()
+                    or not self.owns_starter(starter, pub['webhook_id'])):
+                return False
+            target_book = self.store.book(thread.guild.id, book_id if correct and book_id else old['book_id'])
+            if correct and target_book['id'] != old['book_id']:
+                # Keep the original attribution and source link while correcting
+                # the heading. The source ledger remains bound to the same copy.
+                _, separator, remainder = starter.content.partition('\n')
+                content = f'**Архивное эссе по книге «{safe(target_book["title"])}»**'
+                content += separator + remainder
+                await self.edit_essay_starter(thread, starter, content, pub)
+            self.store.register_essay(thread.guild.id, target_book['id'], thread.id, thread.id,
+                                      old['author_id'], thread.name, thread.jump_url, correct=correct,
+                                      managed=old['managed'], submitted=old['submitted'])
+            return True
         managed_pub = self.store.one("SELECT * FROM bc_publications WHERE guild_id=? AND channel_id=? AND key LIKE 'essay-space:%'",
                                      (thread.guild.id, thread.id))
         if managed_pub is None:
