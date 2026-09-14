@@ -15,6 +15,16 @@ RUN pip install --user --no-cache-dir -r requirements.txt
 # Runtime stage
 FROM python:3.12-slim
 
+# Optional temporary archive importer. Authentication belongs in the /data volume.
+ARG INSTALL_CODEX=false
+ARG CODEX_VERSION=0.152.1
+RUN if [ "$INSTALL_CODEX" = "true" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+      && npm install --global "@openai/codex@${CODEX_VERSION}" \
+      && npm cache clean --force \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 WORKDIR /app
 
 # Create non-root user

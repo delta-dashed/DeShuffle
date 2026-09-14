@@ -87,9 +87,11 @@ class DiscordHarness:
         channel.created_at = datetime.fromtimestamp(2_000_000_001, timezone.utc)
         channel.archive_timestamp = None
         channel.flags = SimpleNamespace(pinned=False, require_tag=False)
+        channel.available_tags, channel.applied_tags = [], []
+        channel.parent = self.channels.get(parent_id)
         channel.jump_url = f'https://discord.com/channels/1/{ident}'
         channel.messages = {}
-        channel.permissions_for.return_value = SimpleNamespace(**dict.fromkeys(('view_channel','send_messages','read_message_history','send_messages_in_threads','manage_threads','manage_webhooks','connect','create_events','manage_events'), True))
+        channel.permissions_for.return_value = SimpleNamespace(**dict.fromkeys(('view_channel','send_messages','read_message_history','send_messages_in_threads','manage_threads','manage_webhooks','manage_channels','connect','create_events','manage_events'), True))
         async def fetch_message(message_id):
             if message_id not in channel.messages:
                 raise not_found()
@@ -113,6 +115,7 @@ class DiscordHarness:
             async def create_thread(name, content, **kwargs):
                 self.seq += 1
                 thread = self.channel(self.seq, parent_id=ident, name=name)
+                thread.applied_tags = kwargs.get('applied_tags', [])
                 message = self.message(thread, thread.id, content, **kwargs)
                 return SimpleNamespace(thread=thread, message=message)
             channel.create_thread = AsyncMock(side_effect=create_thread)
@@ -398,6 +401,7 @@ class DiscordIntegrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_real_sdk_registration_autocomplete_and_persistent_views(self):
         async with commands.Bot(command_prefix='!', intents=discord.Intents.default()) as bot:
+            bot.fetch_channel = self.h.bot.fetch_channel
             cog = Club(bot, self.store)
             await bot.add_cog(cog)
             payload = bot.tree.get_command('club').to_dict(bot.tree)

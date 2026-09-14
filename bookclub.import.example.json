@@ -1,0 +1,17 @@
+{
+  "enabled": false,
+  "allowed_user_ids": [111111111111111111],
+  "allowed_guild_ids": [222222222222222222],
+  "allowed_channel_ids": [333333333333333333],
+  "budget_id": "legacy-essays-v1",
+  "max_runs": 1,
+  "max_accounted_tokens": 100000,
+  "max_messages": 200,
+  "max_threads": 30,
+  "max_input_bytes": 48000,
+  "max_attachment_bytes": 20000000,
+  "timeout_seconds": 180,
+  "executable": "codex",
+  "codex_home": null,
+  "model": null
+}

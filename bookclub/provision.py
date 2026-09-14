@@ -18,6 +18,13 @@ SLOTS = {
     'voice': ('Ротонда', discord.VoiceChannel),
 }
 REASON = 'Настройка книжного клуба через /club setup'
+DESCRIPTIONS = {
+    'news': 'Организационные объявления: даты встреч, переносы, отмены и другие изменения. Объявления публикуются вручную; обычное расписание бот сюда не дублирует.',
+    'chat': 'Площадь — место для флуда, свободного общения и разговоров о книгах и обо всём остальном.',
+    'books': 'Каталог книг, встречи и обсуждения.',
+    'essays': 'Эссе участников и обсуждение работ.',
+}
+OLD_DESCRIPTIONS = {'news': 'Текущая книга и ближайшая встреча.', 'chat': 'Общение и предложения книжного клуба.'}
 
 
 def required_permissions(purpose, settings):
@@ -49,7 +56,7 @@ class Provisioner:
     async def check_publications(self, guild, *, repair=False):
         result = []
         for publication in self.store.rows("SELECT * FROM bc_publications WHERE guild_id=? AND state='ready'", (guild.id,)):
-            if not publication['key'].startswith(('book:', 'catalog:', 'meeting:', 'news:')):
+            if not publication['key'].startswith(('book:', 'catalog:', 'meeting:', 'news:', 'chat:')):
                 continue
             try:
                 destination = await self.service.channel(guild, publication['channel_id'])
@@ -93,22 +100,21 @@ class Provisioner:
             return resource, None, 'uncertain'
         return None, None, 'missing'
 
-    def overwrites(self, guild, bot_member, purpose, settings, category=None):
+    def overwrites(self, guild, bot_member, purpose, settings, category=None, *, defaults=False):
         # Nonempty overwrites must explicitly preserve the category's ACL.
         result = {target: discord.PermissionOverwrite.from_pair(*overwrite.pair())
                   for target, overwrite in category.overwrites.items()} if category is not None else {}
-        everyone = result.get(guild.default_role, discord.PermissionOverwrite())
         if purpose == 'category':
-            everyone.update(view_channel=True, read_message_history=True)
-        elif purpose == 'voice':
-            everyone.update(connect=True)
-        else:
-            everyone.update(send_messages=purpose != 'news', send_messages_in_threads=purpose != 'news')
-        result[guild.default_role] = everyone
+            result[guild.default_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True,
+                                                                     send_messages=True, send_messages_in_threads=True, connect=True)
+        elif defaults and purpose == 'news':
+            everyone = result.get(guild.default_role, discord.PermissionOverwrite())
+            everyone.update(send_messages=False, send_messages_in_threads=False)
+            result[guild.default_role] = everyone
         own = result.get(bot_member, discord.PermissionOverwrite())
         own.update(**dict.fromkeys(required_permissions(purpose, settings), True))
         result[bot_member] = own
-        if purpose == 'news':
+        if purpose == 'news' and defaults:
             for role_id in settings['organizer_roles']:
                 role = guild.get_role(role_id)
                 if role is not None:
@@ -123,15 +129,13 @@ class Provisioner:
                     result[member] = overwrite
         return result
 
-    async def create(self, guild, bot_member, purpose, settings, category, resource):
+    async def create(self, guild, bot_member, purpose, settings, category, resource, *, defaults=False):
         kwargs = dict(name=self.temporary_name(resource),
-                      overwrites=self.overwrites(guild, bot_member, purpose, settings, category), reason=REASON)
+                      overwrites=self.overwrites(guild, bot_member, purpose, settings, category, defaults=defaults), reason=REASON)
         if purpose != 'category':
             kwargs['category'] = category
         if purpose in ('news', 'chat', 'books', 'essays'):
-            descriptions = dict(news='Текущая книга и ближайшая встреча.', chat='Общение и предложения книжного клуба.',
-                                books='Каталог книг, встречи и обсуждения.', essays='Эссе участников и обсуждение работ.')
-            kwargs['topic'] = descriptions[purpose] + '\n' + self.marker(resource)
+            kwargs['topic'] = DESCRIPTIONS[purpose] + '\n' + self.marker(resource)
         if purpose == 'category':
             return await guild.create_category(**kwargs)
         if purpose == 'voice':
@@ -141,7 +145,7 @@ class Provisioner:
             return await guild.create_forum(**kwargs)
         return await guild.create_text_channel(**kwargs)
 
-    async def run(self, guild, actor_id, *, check_only=False, retry_missing=False, category=None):
+    async def run(self, guild, actor_id, *, check_only=False, retry_missing=False, category=None, repair_permissions=False):
         async with self.service.locks[guild.id]:
             actor = await self.service.setup_actor(guild, actor_id)
             bot_member = await guild.fetch_member(self.service.bot.user.id)
@@ -150,7 +154,7 @@ class Provisioner:
             report = ['**Проверка книжного клуба**' if check_only else '**Настройка книжного клуба**']
             try:
                 channels = await guild.fetch_channels()
-                plan, errors = {}, []
+                plan, errors, tag_permission_repairs = {}, [], set()
                 for purpose in SLOTS:
                     try:
                         if purpose == 'category' and category is not None:
@@ -214,11 +218,26 @@ class Provisioner:
                                    if not getattr(channel.permissions_for(bot_member), p, False)]
                         report.append(f'{SLOTS[purpose][0]}: <#{channel.id}> · ' +
                                       ('не хватает прав бота: ' + ', '.join(missing) if missing else 'OK'))
-                        needed = ['manage_roles', *missing] if missing else []
+                        needed = ['manage_roles', *missing] if missing and repair_permissions else []
+                        if missing and not repair_permissions:
+                            errors.append(f'{purpose}: настройте права бота вручную или явно вызовите '
+                                          '/club setup repair_permissions:true. Существующие разрешения не изменены.')
                         if resource and resource['state'] != 'ready' and channel.name == self.temporary_name(resource):
                             needed.append('manage_channels')
                         if purpose != 'category' and old_category_deleted and resource and resource['managed'] and channel.category_id is None:
                             needed.append('manage_channels')
+                        if purpose in ('books', 'essays'):
+                            try:
+                                tag_report = await self.service.forum_tags.ensure(guild, channel, purpose, check_only=True)
+                                report.extend(tag_report)
+                                tag_errors = [line for line in tag_report if 'не хватает' in line]
+                                if tag_errors and repair_permissions:
+                                    tag_permission_repairs.add(purpose)
+                                    needed.extend(['manage_roles', 'manage_channels'])
+                                else:
+                                    errors.extend(tag_errors)
+                            except ClubError as exc:
+                                errors.append(str(exc))
                     absent = [p for p in needed if not getattr(bot_member.guild_permissions, p, False)]
                     if absent:
                         errors.append(f'{purpose}: выдайте боту права на сервере: {", ".join(sorted(set(absent)))}.')
@@ -232,14 +251,23 @@ class Provisioner:
                     return report
 
                 category, resolved = None, {}
+                category_plan = plan.get('category')
+                initial_resource = category_plan[0] if category_plan else None
+                new_category = bool(not saved and initial_resource and initial_resource['state'] != 'ready'
+                                    and (initial_resource['managed'] or category_plan[2] == 'recovered'))
                 for purpose, (resource, channel, status) in plan.items():
+                    saved_name = resource.get('name') if resource else None
                     if channel is None:
                         if resource:
                             self.store.forget_setup_resource(guild.id, purpose)
                         self.store.reserve_setup_resource(guild.id, purpose)
                         resource = self.store.setup_resource(guild.id, purpose)
+                        if saved_name:
+                            self.store.remember_setup_name(guild.id, purpose, saved_name)
+                        if purpose == 'category':
+                            new_category = True
                         try:
-                            channel = await self.create(guild, bot_member, purpose, settings, category, resource)
+                            channel = await self.create(guild, bot_member, purpose, settings, category, resource, defaults=new_category)
                         except discord.HTTPException as exc:
                             if exc.status in (400, 401, 403):
                                 self.store.forget_setup_resource(guild.id, purpose)
@@ -256,13 +284,17 @@ class Provisioner:
                         self.store.bind_setup_resource(guild.id, purpose, channel.id, managed=False, state='created')
                         resource = self.store.setup_resource(guild.id, purpose)
                     if resource['managed'] and resource['state'] != 'ready' and channel.name == self.temporary_name(resource):
-                        channel = await channel.edit(name=SLOTS[purpose][0], reason=REASON)
+                        channel = await channel.edit(name=resource.get('name') or SLOTS[purpose][0], reason=REASON)
+                    self.store.remember_setup_name(guild.id, purpose, channel.name)
                     missing = [p for p in required_permissions(purpose, settings)
                                if not getattr(channel.permissions_for(bot_member), p, False)]
-                    if missing:
+                    if purpose in tag_permission_repairs:
+                        missing.append('manage_channels')
+                    if missing and repair_permissions:
                         own = channel.overwrites_for(bot_member)
                         own.update(**dict.fromkeys(missing, True))
                         await channel.set_permissions(bot_member, overwrite=own, reason=REASON)
+                        channel = await self.service.bot.fetch_channel(channel.id)
                         report.append(f'<#{channel.id}>: восстановлены права бота.')
                     if purpose == 'category':
                         category = channel
@@ -271,8 +303,12 @@ class Provisioner:
                             channel = await channel.edit(category=category, sync_permissions=False, reason=REASON)
                             report.append(f'<#{channel.id}>: возвращён в категорию с сохранением доступов.')
                         resolved[purpose] = channel.id
-                    if purpose in ('books', 'essays') and getattr(channel.flags, 'require_tag', False):
-                        report.append(f'<#{channel.id}>: обязательный тег мешает публикации; измените эту настройку форума вручную.')
+                    if purpose in ('books', 'essays'):
+                        report.extend(await self.service.forum_tags.ensure(guild, channel, purpose))
+                    if purpose in OLD_DESCRIPTIONS and resource['managed']:
+                        old_topic = OLD_DESCRIPTIONS[purpose] + '\n' + self.marker(resource)
+                        if channel.topic == old_topic:
+                            await channel.edit(topic=DESCRIPTIONS[purpose] + '\n' + self.marker(resource), reason=REASON)
 
                 # Keep the initiating administrator able to operate the new club; existing organizers remain unchanged.
                 self.store.configure(guild.id, {**settings, **resolved})

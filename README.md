@@ -5,6 +5,7 @@ Discord bot that shuffles members in a voice channel, keeps a live order as peop
 ## Features
 
 - Optional book club extension: books, participants, native Discord meetings, host rotation, private preparation plans, essays, and durable reminders. Book and meeting cards let each reader create an essay forum post with one button and browse all published essays. New posts use a shared webhook with the reader's server nickname and avatar; readers write and edit their own messages inside. An empty header does not count as an essay. The essay forum needs Manage Webhooks and Manage Threads; `essay_webhooks: false` keeps the original bot-header mode. See [Russian setup and command guide](docs/BOOK_CLUB.md).
+- Optional temporary essay archive import through a separately installed Codex CLI: allowlisted administrators request a bounded scan, review the proposed book/author associations, then explicitly copy selected essays into the club forum. Original messages remain available. The importer is disabled by default and has a persistent launch quota; ordinary chat messages never invoke Codex.
 - Shuffle members from your current voice channel with a hybrid command
 - Timed SDG breakout shuffle that physically moves members between rooms every 5 minutes
 - Live-updating list that reacts to joins/leaves
@@ -74,6 +75,8 @@ python Shuffle.py
 
 - `BOOKCLUB_ENABLED` (optional, default `false`) — load the book club extension. Run `/club setup` as the server owner or a member with Manage Server to create its category, two text channels, two forums, voice channel, essay webhook, and initial catalog. Repeating the command checks and repairs missing resources; `check_only:true` checks without changes. Enable Community manually first; the bot needs Manage Channels and its normal club permissions. Existing human access rules and channel names are preserved.
 - `BOOKCLUB_CONFIG_FILE` (optional) — leave empty for `/club setup`; channel IDs and settings persist in the existing SQLite database. Alternatively use `bookclub.example.json` to bind existing channels and restrict enabled servers. Unchanged file values do not undo channel repairs; explicit edits take effect on restart. `/club publish` remains available for manual configuration. See [setup and recovery](docs/BOOK_CLUB.md).
+- The catalog and `/club books` include **Добавить книгу** and **Загрузить список** buttons. Organizers can attach UTF-8 TXT/CSV/TSV/JSON to `/club library import` (64 KiB, 100 books) and confirm a preview; no model is called. `/club setup` creates forum tags while preserving renamed channels, topics and tags. Set granular role permissions directly in Discord: ordinary setup and restart preserve them; only explicit `repair_permissions:true` repairs the bot's own permissions. Вестник is for manual organizational announcements; Площадь is for casual chat. The bot posts a static description in each and keeps schedules in book cards and server events.
+- `BOOKCLUB_IMPORT_CONFIG_FILE` (optional) — path to a separate, startup-only importer configuration. Copy `bookclub.import.example.json` to `bookclub.import.json`, replace all user/server/source-channel IDs, and enable it for the migration window. Default `max_runs: 1` is shared across allowed servers and survives restarts. `/club import login` returns the official device-login URL and code; `/club import scan`, `review`, and `apply confirm:true` separate analysis from copying. Afterward set `enabled: false` and restart. Codex CLI 0.152.1 or newer must be installed on the bot host (inside the container for Docker). See [temporary import and limits](docs/BOOK_CLUB.md#временный-импорт-старых-эссе-через-codex).
 - `DISCORD_TOKEN` (required)
 - `RELIABLE_ROLE_ID` (optional) - numeric role ID; if unset, edit `RELIABLE_ROLE_NAME` in `Shuffle.py`
 - `TRUSTED_ROLE_ID` (optional) - numeric role ID; if unset, edit `TRUSTED_ROLE_NAME` in `Shuffle.py`
@@ -107,3 +110,11 @@ docker compose up --build -d
 ```
 
 The included `docker-compose.yml` mounts a named volume at `/data` and sets `RESHUFFLE_DATA_DIR=/data`, so `persistent_shuffle_exclusions.json`, `shuffle_settings.json`, scheduled-event auto-post targets, audit logs, `shuffle_counts.jsonl`, and the SQLite voice activity database survive container recreation.
+
+The default image does not install Codex. To use the temporary importer, build the optional CLI variant:
+
+```bash
+docker build --build-arg INSTALL_CODEX=true --build-arg CODEX_VERSION=0.152.1 -t reshuffle-codex .
+```
+
+Run that image with the same persistent `/data` volume and set `BOOKCLUB_IMPORT_CONFIG_FILE=/data/bookclub.import.json`. A Codex installation or login on the Docker host is not automatically available inside the container. The importer keeps its separate login under `/data/bookclub-codex-profile`; keep this volume private and persistent. Do not include authentication files in the image or repository. CLI timeouts and launch quotas limit importer activity; `max_accounted_tokens` is accounting protection, not a hard token ceiling for one response.

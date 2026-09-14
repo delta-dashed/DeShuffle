@@ -114,10 +114,10 @@ class SetupBootstrapTests(unittest.IsolatedAsyncioTestCase):
         cog = Club(Mock(), self.store)
         cog.service.setup_actor = AsyncMock()
         cog.service.actor = AsyncMock(side_effect=ClubError('not configured'))
-        ctx = self.context(cog, command=cog.publish)
+        ctx = self.context(cog, command=cog.books)
         with self.assertRaisesRegex(ClubError, 'not configured'):
             await cog.cog_before_invoke(ctx)
-        cog.service.actor.assert_awaited_once_with(ctx.guild, 99)
+        cog.service.actor.assert_awaited_once_with(ctx.guild, 99, require_access=True)
         cog.service.setup_actor.assert_not_awaited()
 
     async def test_setup_callback_forwards_flags_and_displays_report(self):
@@ -125,8 +125,8 @@ class SetupBootstrapTests(unittest.IsolatedAsyncioTestCase):
         cog.service.setup_server = AsyncMock(return_value=['Каналы проверены.', 'Настройка сохранена.'])
         cog.say = AsyncMock()
         ctx = self.context(cog)
-        await cog.setup.callback(cog, ctx, check_only=True, retry_missing=True)
-        cog.service.setup_server.assert_awaited_once_with(ctx.guild, 99, check_only=True, retry_missing=True, category=None)
+        await cog.setup.callback(cog, ctx, check_only=True, retry_missing=True, repair_permissions=True)
+        cog.service.setup_server.assert_awaited_once_with(ctx.guild, 99, check_only=True, retry_missing=True, category=None, repair_permissions=True)
         cog.say.assert_awaited_once_with(ctx, 'Каналы проверены.\nНастройка сохранена.')
 
     async def test_setup_default_flags_do_not_retry_unknown_creations(self):
@@ -135,7 +135,7 @@ class SetupBootstrapTests(unittest.IsolatedAsyncioTestCase):
         cog.say = AsyncMock()
         ctx = self.context(cog)
         await cog.setup.callback(cog, ctx)
-        cog.service.setup_server.assert_awaited_once_with(ctx.guild, 99, check_only=False, retry_missing=False, category=None)
+        cog.service.setup_server.assert_awaited_once_with(ctx.guild, 99, check_only=False, retry_missing=False, category=None, repair_permissions=False)
 
     async def test_setup_registration_fits_discord_limit_and_preserves_autocomplete(self):
         async with commands.Bot(command_prefix='!', intents=discord.Intents.default()) as bot:
@@ -144,7 +144,7 @@ class SetupBootstrapTests(unittest.IsolatedAsyncioTestCase):
             payload = bot.tree.get_command('club').to_dict(bot.tree)
             self.assertLessEqual(len(payload['options']), 25)
             setup = next(option for option in payload['options'] if option['name'] == 'setup')
-            self.assertEqual({option['name'] for option in setup['options']}, {'check_only', 'retry_missing', 'category'})
+            self.assertEqual({option['name'] for option in setup['options']}, {'check_only', 'retry_missing', 'category', 'repair_permissions'})
             for parameter in setup['options']:
                 expected = discord.AppCommandOptionType.channel if parameter['name'] == 'category' else discord.AppCommandOptionType.boolean
                 self.assertEqual(parameter['type'], expected.value)

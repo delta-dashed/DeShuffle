@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 .git/
 .gitignore
+bookclub.json
+bookclub.import.json
+bookclub-codex-profile/
+**/bookclub-codex-profile/
+*.sqlite3
+*.sqlite3-*
