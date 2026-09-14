@@ -27,7 +27,8 @@ class OrganizerView(discord.ui.View):
         self.cog, self.guild_id, self.actor_id = cog, guild_id, actor_id
 
     def bound(self, interaction):
-        if interaction.guild_id != self.guild_id or interaction.guild is None:
+        if (interaction.guild_id != self.guild_id or interaction.guild is None
+                or interaction.guild.id != self.guild_id):
             raise ClubError('Откройте управление на сервере этой книги.')
         if interaction.user.id != self.actor_id:
             raise ClubError('Это управление открыто другим организатором.')
@@ -160,6 +161,30 @@ class MeetingControls(BackToMeetings):
             await _reply(interaction, text, view=CancelConfirmation(cog, current, interaction.user.id))
         cancel.callback = ask_cancel
         self.add_item(cancel)
+        self.plan_kind = discord.ui.Select(placeholder='Роль встречи в плане N+1', row=3, options=[
+            discord.SelectOption(label='Встреча по книге', value='reading',
+                                 default=meeting.get('plan_kind') == 'reading'),
+            discord.SelectOption(label='Обсуждение эссе', value='essay',
+                                 default=meeting.get('plan_kind') == 'essay'),
+        ])
+        self.plan_kind.callback = self.change_plan_kind
+        self.add_item(self.plan_kind)
+
+    async def change_plan_kind(self, interaction):
+        self.bound(interaction)
+        await interaction.response.defer(ephemeral=True)
+        if len(self.plan_kind.values) != 1 or self.plan_kind.values[0] not in ('reading', 'essay'):
+            raise ClubError('Выберите роль встречи: по книге или по эссе.')
+        async with self.cog.service.locks[self.guild_id]:
+            await _organizer(self.cog.service, interaction.guild, interaction.user.id)
+            current = self.cog.store.set_meeting_plan_kind(
+                self.guild_id, self.meeting['id'], self.plan_kind.values[0],
+                expected_revision=self.meeting['revision'], actor_id=self.actor_id)
+            label = 'встреча по книге' if current['plan_kind'] == 'reading' else 'обсуждение эссе'
+            text = (f'Роль в плане: **{label}**. Изменение роли само по себе не меняет статус книги.\n\n' +
+                    '\n'.join(meeting_lines(self.cog.store, current, self.cog.store.settings(self.guild_id))))
+            await _reply(interaction, text, view=MeetingControls(self.cog, current, self.actor_id))
+        self.stop()
 
 
 class BookMeetings(OrganizerView):
@@ -173,7 +198,10 @@ class BookMeetings(OrganizerView):
             labels = {'scheduled': 'Запланирована', 'active': 'Идёт', 'completed': 'Завершена',
                       'cancelled': 'Отменена', 'draft': 'Не подтверждена', 'unsupported': 'Требует проверки'}
             for meeting in meetings[self.page * 25:(self.page + 1) * 25]:
-                description = f'{labels.get(meeting["status"], meeting["status"])} · {time_label(meeting["start"], cog.store.settings(self.guild_id)["timezone"])}'
+                label = labels.get(meeting['status'], meeting['status'])
+                if meeting['status'] == 'cancelled' and not meeting.get('event_status_confirmed', 1):
+                    label = 'Недоступна · отмена не подтверждена'
+                description = f'{label} · {time_label(meeting["start"], cog.store.settings(self.guild_id)["timezone"])}'
                 options.append(discord.SelectOption(label=meeting['name'][:100], value=meeting['id'], description=description[:100]))
             select = discord.ui.Select(placeholder='Выберите встречу для изменения', options=options, row=0)
             async def selected(interaction):
@@ -216,6 +244,8 @@ async def open_book_meetings(cog, interaction, book_id, *, page=0):
                                   (interaction.guild_id, book_id))
         view = BookMeetings(cog, book, interaction.user.id, meetings, page)
     count = {state: sum(m['status'] == state for m in meetings) for state in ('scheduled', 'active', 'completed', 'cancelled', 'draft')}
+    unavailable = sum(m['status'] == 'cancelled' and not m.get('event_status_confirmed', 1) for m in meetings)
+    count['cancelled'] -= unavailable
     plan = (f'План: {book["reading_meetings"]} встреч по книге + 1 обсуждение эссе.\n' if book.get('reading_meetings') is not None
             else 'Количество встреч ещё не задано в плане книги.\n')
     text = (f'**Встречи · {safe(book["title"])}**\n' + plan +
@@ -224,6 +254,9 @@ async def open_book_meetings(cog, interaction, book_id, *, page=0):
             f'Время: {cog.store.settings(interaction.guild_id)["timezone"]}. Страница {view.page + 1}/{view.page_count}.')
     if count['draft']:
         text += f'\nНеподтверждённых созданий: {count["draft"]}. Перед повтором проверьте /club recover_event.'
+    if unavailable:
+        text += (f'\nНедоступных событий: {unavailable}; их отмена не подтверждена. '
+                 'Они требуют проверки и не исключены из правила автостатуса.')
     await _reply(interaction, text, view=view)
 
 

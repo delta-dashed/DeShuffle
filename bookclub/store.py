@@ -199,6 +199,46 @@ class Store:
                   id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, source_id INTEGER NOT NULL,
                   payload TEXT NOT NULL, created_at INTEGER NOT NULL)""")
                 db.execute("INSERT INTO bc_migrations(version) VALUES(9)")
+            if not db.execute("SELECT 1 FROM bc_migrations WHERE version=10").fetchone():
+                columns = {row["name"] for row in db.execute("PRAGMA table_info(bc_books)")}
+                # Existing clubs are never reclassified on deployment. Newly
+                # created books explicitly opt in below, after this migration.
+                for name in ("status_automation", "status_automation_pending"):
+                    if name not in columns:
+                        db.execute(f"ALTER TABLE bc_books ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0 CHECK({name} IN (0,1))")
+                columns = {row["name"] for row in db.execute("PRAGMA table_info(bc_meetings)")}
+                if "plan_kind" not in columns:
+                    db.execute("""ALTER TABLE bc_meetings ADD COLUMN plan_kind TEXT
+                      CHECK(plan_kind IS NULL OR plan_kind IN ('reading','essay'))""")
+                if "event_status_confirmed" not in columns:
+                    db.execute("""ALTER TABLE bc_meetings ADD COLUMN event_status_confirmed INTEGER
+                      NOT NULL DEFAULT 1 CHECK(event_status_confirmed IN (0,1))""")
+                    # Before this migration, both real cancellation and a REST
+                    # 404 were cached as cancelled. Preserve the visible state,
+                    # but require evidence before excluding it from an N+1 plan.
+                    db.execute("UPDATE bc_meetings SET event_status_confirmed=0 WHERE status='cancelled'")
+                if "last_confirmed_status" not in columns:
+                    db.execute("ALTER TABLE bc_meetings ADD COLUMN last_confirmed_status TEXT DEFAULT 'draft'")
+                    db.execute("""UPDATE bc_meetings SET last_confirmed_status=
+                      CASE WHEN event_status_confirmed=1 THEN status ELSE NULL END""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_book_status_audit(
+                  id INTEGER PRIMARY KEY, book_id TEXT NOT NULL REFERENCES bc_books(id),
+                  guild_id INTEGER NOT NULL, action TEXT NOT NULL, old_status TEXT NOT NULL,
+                  new_status TEXT NOT NULL, actor_id INTEGER, meeting_id TEXT, created_at INTEGER NOT NULL)""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_meeting_plan_audit(
+                  id INTEGER PRIMARY KEY, meeting_id TEXT NOT NULL REFERENCES bc_meetings(id),
+                  guild_id INTEGER NOT NULL, actor_id INTEGER, old_kind TEXT, new_kind TEXT NOT NULL,
+                  created_at INTEGER NOT NULL)""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_import_chunk_plans(
+                  guild_id INTEGER NOT NULL, item_key TEXT NOT NULL, source_id INTEGER NOT NULL,
+                  body_hash TEXT NOT NULL, scheme TEXT NOT NULL, chunks TEXT NOT NULL,
+                  created_at INTEGER NOT NULL, PRIMARY KEY(guild_id,item_key,source_id))""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_publication_intents(
+                  key TEXT PRIMARY KEY REFERENCES bc_publications(key) ON DELETE CASCADE ON UPDATE CASCADE,
+                  guild_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, webhook_id INTEGER,
+                  after_id INTEGER NOT NULL, content TEXT NOT NULL, attachments TEXT NOT NULL,
+                  components TEXT NOT NULL, forum_name TEXT, created_at INTEGER NOT NULL, nonce TEXT)""")
+                db.execute("INSERT INTO bc_migrations(version) VALUES(10)")
 
     @contextmanager
     def tx(self):
@@ -385,8 +425,8 @@ class Store:
         author = checked_text(author, "Автор", 180)
         materials = checked_text(materials, "Материалы", 4000, False)
         with self.tx() as db:
-            db.execute("""INSERT OR IGNORE INTO bc_books(id,guild_id,title,author,materials,position,request_key)
-                       VALUES(?,?,?,?,?,(SELECT COALESCE(MAX(position),0)+1 FROM bc_books WHERE guild_id=?),?)""",
+            db.execute("""INSERT OR IGNORE INTO bc_books(id,guild_id,title,author,materials,position,request_key,status_automation)
+                       VALUES(?,?,?,?,?,(SELECT COALESCE(MAX(position),0)+1 FROM bc_books WHERE guild_id=?),?,1)""",
                        (uuid.uuid4().hex, guild_id, title, author, materials, guild_id, str(request_key)))
             return dict(db.execute("SELECT * FROM bc_books WHERE guild_id=? AND request_key=?", (guild_id, str(request_key))).fetchone())
 
@@ -410,15 +450,15 @@ class Store:
                     continue
                 position += 1
                 ident = uuid.uuid4().hex
-                db.execute("""INSERT INTO bc_books(id,guild_id,title,author,materials,position,request_key)
-                  VALUES(?,?,?,?,?,?,?)""", (ident, guild_id, book["title"], book["author"],
+                db.execute("""INSERT INTO bc_books(id,guild_id,title,author,materials,position,request_key,status_automation)
+                  VALUES(?,?,?,?,?,?,?,1)""", (ident, guild_id, book["title"], book["author"],
                                              book["materials"], position, key))
                 identities.add(identity)
                 requests.add(key)
                 created.append(dict(db.execute("SELECT * FROM bc_books WHERE id=?", (ident,)).fetchone()))
         return created, skipped
 
-    def update_book(self, guild_id, book_id, *, expected_revision=None, **fields):
+    def update_book(self, guild_id, book_id, *, expected_revision=None, status_actor_id=None, **fields):
         if not fields or not set(fields) <= {"status", "position", "deadline", "title", "author", "materials", "reading_meetings"}:
             raise ClubError("Неизвестное изменение книги.")
         if "status" in fields and fields["status"] not in STATUSES:
@@ -439,7 +479,74 @@ class Store:
                 db.execute("UPDATE bc_books SET " + ",".join(f"{k}=?" for k in fields) + ",revision=revision+1 WHERE id=?", (*fields.values(), book_id))
             except sqlite3.IntegrityError as exc:
                 raise ClubError("Сначала завершите или верните в очередь текущее чтение.") from exc
+            if "status" in fields:
+                db.execute("UPDATE bc_books SET status_automation=0,status_automation_pending=0 WHERE id=?", (book_id,))
+                self._status_audit(db, book, "manual", fields["status"], actor_id=status_actor_id)
             self._essay_schedule(db, book_id, settings)
+
+    def _status_audit(self, db, book, action, new_status, *, actor_id=None, meeting_id=None):
+        db.execute("""INSERT INTO bc_book_status_audit(
+          book_id,guild_id,action,old_status,new_status,actor_id,meeting_id,created_at)
+          VALUES(?,?,?,?,?,?,?,?)""", (book["id"], book["guild_id"], action, book["status"],
+                                       new_status, actor_id, meeting_id, self.clock()))
+
+    def set_book_status_automation(self, guild_id, book_id, enabled, *, expected_revision=None, actor_id=None):
+        if type(enabled) is not bool:
+            raise ClubError("Автоматический статус: нужно включить или выключить правило.")
+        settings = self.settings(guild_id)
+        with self.tx() as db:
+            book = self._get(db, "bc_books", guild_id, book_id)
+            if expected_revision is not None and book["revision"] != expected_revision:
+                raise ClubError("Книга изменилась. Откройте управление книгой заново.")
+            if bool(book["status_automation"]) != enabled:
+                # A human opt-in waits for a NEW active/completed observation.
+                # Replaying a pre-existing event after a restart is not opt-in
+                # to changing historical books retroactively.
+                db.execute("""UPDATE bc_books SET status_automation=?,status_automation_pending=?,
+                  revision=revision+1 WHERE id=?""", (int(enabled), int(enabled), book_id))
+                self._status_audit(db, book, "enable" if enabled else "disable", book["status"], actor_id=actor_id)
+                self._essay_schedule(db, book_id, settings)
+            return self._get(db, "bc_books", guild_id, book_id)
+
+    def _auto_book_status(self, db, book_id, settings, *, meeting_id=None):
+        from .book_status import desired_book_status
+
+        book = dict(db.execute("SELECT * FROM bc_books WHERE id=?", (book_id,)).fetchone())
+        if not book["status_automation"] or book["status_automation_pending"] or book["status"] == "read":
+            return False
+        meetings = [dict(row) for row in db.execute("SELECT * FROM bc_meetings WHERE book_id=?", (book_id,))]
+        target = desired_book_status(book, meetings)
+        if target is None:
+            return False
+        # The one-current-book invariant also applies to automatic transitions.
+        # Keep the observed meeting state, then retry after the current reading
+        # finishes; never silently move another book out of an organizer's way.
+        if target == "reading" and db.execute(
+                "SELECT 1 FROM bc_books WHERE guild_id=? AND status='reading' AND id<>?",
+                (book["guild_id"], book_id)).fetchone():
+            return False
+        db.execute("UPDATE bc_books SET status=?,revision=revision+1 WHERE id=?", (target, book_id))
+        self._status_audit(db, book, "automatic", target, meeting_id=meeting_id)
+        self._essay_schedule(db, book_id, settings)
+        return True
+
+    def reconcile_book_statuses(self, guild_id):
+        """Recheck eligible cached facts after Discord reconciliation/restart."""
+        from .book_status import desired_book_status
+
+        settings = self.settings(guild_id)
+        changed = False
+        with self.tx() as db:
+            books = [dict(row) for row in db.execute("""SELECT * FROM bc_books WHERE guild_id=?
+              AND status_automation=1 AND status_automation_pending=0 ORDER BY position,id""", (guild_id,))]
+            # Free a completed current book before considering a newly started
+            # book; iteration order must not introduce a full tick of delay.
+            for target in ("read", "reading"):
+                for book in books:
+                    meetings = [dict(row) for row in db.execute("SELECT * FROM bc_meetings WHERE book_id=?", (book["id"],))]
+                    if desired_book_status(book, meetings) == target:
+                        changed = self._auto_book_status(db, book["id"], settings) or changed
+        return changed
 
     def participant(self, guild_id, book_id, user_id, *, joined=True, willing=False):
         settings = self.settings(guild_id)
@@ -481,24 +588,58 @@ class Store:
           WHERE m.id=? AND p.present=1 AND NOT EXISTS(
           SELECT 1 FROM bc_absences a WHERE a.meeting_id=m.id AND a.user_id=p.user_id) ORDER BY p.user_id""", (meeting_id,))
 
-    def draft_meeting(self, guild_id, book_id, name, part, chapter, request_key):
+    def draft_meeting(self, guild_id, book_id, name, part, chapter, request_key, *, plan_kind="reading"):
+        from .book_status import PLAN_KINDS
+
+        if not isinstance(plan_kind, str) or plan_kind not in PLAN_KINDS:
+            raise ClubError("Тип встречи: по книге или обсуждение эссе.")
         name = checked_text(name, "Название встречи", 100)
         part = checked_text(part, "Часть", 200)
         chapter = checked_text(chapter, "Последняя глава", 250)
         with self.tx() as db:
             self._get(db, "bc_books", guild_id, book_id)
-            db.execute("INSERT OR IGNORE INTO bc_meetings(id,guild_id,book_id,name,part,chapter,request_key) VALUES(?,?,?,?,?,?,?)", (uuid.uuid4().hex, guild_id, book_id, name, part, chapter, str(request_key)))
+            db.execute("INSERT OR IGNORE INTO bc_meetings(id,guild_id,book_id,name,part,chapter,request_key,plan_kind) VALUES(?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, guild_id, book_id, name, part, chapter, str(request_key), plan_kind))
             return dict(db.execute("SELECT * FROM bc_meetings WHERE guild_id=? AND request_key=?", (guild_id, str(request_key))).fetchone())
 
-    def sync_event(self, guild_id, meeting_id, *, event_id, name, start, end, voice_id, status):
+    def set_meeting_plan_kind(self, guild_id, meeting_id, kind, *, expected_revision=None, actor_id=None):
+        from .book_status import PLAN_KINDS
+
+        if not isinstance(kind, str) or kind not in PLAN_KINDS:
+            raise ClubError("Тип встречи: по книге или обсуждение эссе.")
+        settings = self.settings(guild_id)
+        with self.tx() as db:
+            meeting = self._get(db, "bc_meetings", guild_id, meeting_id)
+            if expected_revision is not None and meeting["revision"] != expected_revision:
+                raise ClubError("Встреча изменилась. Откройте управление встречей заново.")
+            if meeting["plan_kind"] != kind:
+                db.execute("UPDATE bc_meetings SET plan_kind=?,revision=revision+1 WHERE id=?", (kind, meeting_id))
+                db.execute("""INSERT INTO bc_meeting_plan_audit(
+                  meeting_id,guild_id,actor_id,old_kind,new_kind,created_at) VALUES(?,?,?,?,?,?)""",
+                           (meeting_id, guild_id, actor_id, meeting["plan_kind"], kind, self.clock()))
+                self._schedule(db, meeting_id, settings)
+            return self._get(db, "bc_meetings", guild_id, meeting_id)
+
+    def sync_event(self, guild_id, meeting_id, *, event_id, name, start, end, voice_id, status, status_confirmed=True):
+        if type(status_confirmed) is not bool or (not status_confirmed and status != "cancelled"):
+            raise ClubError("Неподтверждённый статус допустим только для недоступного события.")
         settings = self.settings(guild_id)
         with self.tx() as db:
             m = self._get(db, "bc_meetings", guild_id, meeting_id)
             if m["event_id"] is not None and m["event_id"] != event_id:
                 raise ClubError("Встреча уже связана с другим событием.")
-            values = dict(event_id=event_id, name=name, start=start, end=end, voice_id=voice_id, status=status)
-            if all(m[k] == v for k, v in values.items()):
+            # Discord scheduled-event lifecycle is monotonic. Delayed gateway
+            # updates must not resurrect a completed/cancelled meeting or turn
+            # an active meeting back into a merely scheduled one.
+            confirmed_status = m["last_confirmed_status"]
+            if ((confirmed_status in ("completed", "cancelled")
+                 and (status != confirmed_status or not status_confirmed))
+                    or (confirmed_status == "active" and status == "scheduled")):
                 return False
+            values = dict(event_id=event_id, name=name, start=start, end=end, voice_id=voice_id, status=status,
+                          event_status_confirmed=int(status_confirmed),
+                          last_confirmed_status=status if status_confirmed else confirmed_status)
+            if all(m[k] == v for k, v in values.items()):
+                return self._auto_book_status(db, m["book_id"], settings, meeting_id=meeting_id)
             moved = m["start"] is not None and any(m[k] != values[k] for k in ("start", "end", "voice_id"))
             db.execute("UPDATE bc_meetings SET " + ",".join(f"{k}=?" for k in values) + ",revision=revision+1 WHERE id=?", (*values.values(), meeting_id))
             if moved and m["host_id"] and status == "scheduled" and start > self.clock():
@@ -509,6 +650,11 @@ class Store:
                 self._job(db, fresh, "rescheduled", m["host_id"], self.clock())
             if status == "completed" and m["status"] == "active" and m["host_state"] == "confirmed":
                 db.execute("INSERT OR IGNORE INTO bc_host_history VALUES(?,?,?,?)", (meeting_id, guild_id, m["host_id"], self.clock()))
+            if (status_confirmed and status in ("active", "completed") and status != confirmed_status
+                    and voice_id and m["plan_kind"] in ("reading", "essay")):
+                db.execute("""UPDATE bc_books SET status_automation_pending=0
+                  WHERE id=? AND status_automation=1""", (m["book_id"],))
+            self._auto_book_status(db, m["book_id"], settings, meeting_id=meeting_id)
             self._schedule(db, meeting_id, settings)
             return True
 

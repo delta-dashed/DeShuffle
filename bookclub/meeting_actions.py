@@ -97,12 +97,15 @@ async def _change_event(service, guild, meeting, change, confirmed):
     return event
 
 
-async def create_meeting(service, guild, actor_id, book_id, *, name, date, minutes, part, chapter, request_key):
+async def create_meeting(service, guild, actor_id, book_id, *, name, date, minutes, part, chapter, request_key,
+                         plan_kind='reading'):
     if guild is None:
         raise ClubError('Управление встречами доступно только на сервере.')
     async with service.locks[guild.id]:
         await _organizer(service, guild, actor_id)
         service.store.book(guild.id, book_id)
+        if plan_kind not in {'reading', 'essay'}:
+            raise ClubError('Выберите тип встречи: по книге или обсуждение эссе.')
         name = checked_text(name, 'Название встречи', 100)
         part = checked_text(part, 'Часть', 200)
         chapter = checked_text(chapter, 'Последняя глава', 250)
@@ -118,7 +121,7 @@ async def create_meeting(service, guild, actor_id, book_id, *, name, date, minut
             else:
                 result = await _recover_draft(service, guild, existing)
         else:
-            draft = service.store.draft_meeting(guild.id, book_id, name, part, chapter, request_key)
+            draft = service.store.draft_meeting(guild.id, book_id, name, part, chapter, request_key, plan_kind=plan_kind)
             try:
                 await service.create_event(guild, draft, start, end)
             except (discord.HTTPException, OSError, asyncio.TimeoutError) as exc:

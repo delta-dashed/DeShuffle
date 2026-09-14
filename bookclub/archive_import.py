@@ -16,6 +16,7 @@ from .import_capture import capture_prepared
 from .render import safe
 from .store import ClubError
 from .import_publication import ImportPublisher, archive_chunks, archive_header
+from .import_chunks import publication_chunks
 
 
 def fingerprint(message):
@@ -338,7 +339,7 @@ class ArchiveImporter:
                         thread = await self.service.channel(guild, pub['channel_id'], discord.Thread)
                     for ident in ids:
                         message, old = originals[ident], snapshots[ident]
-                        chunks = archive_chunks(old)
+                        chunks = publication_chunks(self.store, guild.id, key, old, persist=True)
                         for index, chunk in enumerate(chunks):
                             legacy_key = f'{key}:message:{ident}:{index}'
                             copy_key = legacy_key + ':v2'

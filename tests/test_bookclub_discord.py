@@ -97,7 +97,11 @@ class DiscordHarness:
                 raise not_found()
             return channel.messages[message_id]
         channel.fetch_message = AsyncMock(side_effect=fetch_message)
-        channel.history = lambda **_: iterate(list(channel.messages.values()))
+        def history(*, limit=100, before=None, after=None, oldest_first=False):
+            rows = sorted(channel.messages.values(), key=lambda m: m.id, reverse=not oldest_first)
+            rows = [m for m in rows if (before is None or m.id < before.id) and (after is None or m.id > after.id)]
+            return iterate(rows[:limit] if limit is not None else rows)
+        channel.history = history
         async def send(content, **kwargs):
             self.seq += 1
             return self.message(channel, self.seq, content, **kwargs)
@@ -130,10 +134,16 @@ class DiscordHarness:
         message.id, message.channel, message.content = ident, channel, content
         message.author = self.bot.user
         message.guild, message.webhook_id, message.attachments = self.guild, None, []
+        message.nonce = kwargs.get('nonce')
+        view = kwargs.get('view')
+        message.components = [SimpleNamespace(to_dict=lambda value=value: value) for value in view.to_components()] if view else []
         message.jump_url = f'https://discord.com/channels/1/{channel.id}/{ident}'
         async def edit(**kwargs):
             if 'content' in kwargs:
                 message.content = kwargs['content']
+            if 'view' in kwargs:
+                view = kwargs['view']
+                message.components = [SimpleNamespace(to_dict=lambda value=value: value) for value in view.to_components()] if view else []
             return message
         message.edit = AsyncMock(side_effect=edit)
         async def delete():

@@ -442,7 +442,7 @@ class Club(commands.Cog):
                     raise ClubError('План: целое число встреч по книге от 1 до 100; «-» убирает план. Разбор эссе добавляется отдельно: +1.')
             if deadline is not None:
                 fields['deadline'] = None if deadline == '-' else parse_time(deadline, self.store.settings(ctx.guild.id)['timezone'])
-            self.store.update_book(ctx.guild.id, b['id'], **fields)
+            self.store.update_book(ctx.guild.id, b['id'], status_actor_id=ctx.author.id, **fields)
             await self.service.refresh(ctx.guild)
         await self.say(ctx, 'Книга обновлена; обсуждение и история сохранены.')
 
@@ -466,16 +466,18 @@ class Club(commands.Cog):
         await self.say(ctx, 'Участие обновлено. Готовность к ротации человек отмечает сам через /club join.')
 
     @club.command(name='meeting_add', description='Создать встречу книги и событие Discord')
-    async def meeting_add(self, ctx, book: str, name: str, date: str, part: str, chapter: str, minutes: int = 90):
+    async def meeting_add(self, ctx, book: str, name: str, date: str, part: str, chapter: str, minutes: int = 90,
+                          plan_kind: Literal['reading', 'essay'] = 'reading'):
         from .meeting_actions import create_meeting
         b = self.resolve_book(ctx.guild.id, book)
         request = str(ctx.interaction.id if ctx.interaction else ctx.message.id)
         await create_meeting(self.service, ctx.guild, ctx.author.id, b['id'], name=name, date=date,
-                             part=part, chapter=chapter, minutes=minutes, request_key=request)
+                             part=part, chapter=chapter, minutes=minutes, request_key=request, plan_kind=plan_kind)
         await self.say(ctx, 'Встреча создана. Время теперь берётся из события Discord; ведущего выбирают в /club meeting.')
 
     @club.command(name='meeting_attach', description='Связать существующее событие с книгой')
-    async def meeting_attach(self, ctx, book: str, event: str, part: str, chapter: str):
+    async def meeting_attach(self, ctx, book: str, event: str, part: str, chapter: str,
+                             plan_kind: Literal['reading', 'essay'] = 'reading'):
         async with self.service.locks[ctx.guild.id]:
             await self.organizer(ctx)
             b = self.resolve_book(ctx.guild.id, book)
@@ -487,7 +489,8 @@ class Club(commands.Cog):
             old = self.store.one('SELECT * FROM bc_meetings WHERE event_id=?', (e.id,))
             if old and old['book_id'] != b['id']:
                 raise ClubError('Событие уже связано с другой книгой.')
-            m = old or self.store.draft_meeting(ctx.guild.id, b['id'], e.name, part, chapter, f'attach:{e.id}')
+            m = old or self.store.draft_meeting(ctx.guild.id, b['id'], e.name, part, chapter, f'attach:{e.id}',
+                                               plan_kind=plan_kind)
             self.service.sync(ctx.guild, m, e)
             await self.service.refresh(ctx.guild)
         await self.say(ctx, 'Событие связано с книгой.')
@@ -898,7 +901,8 @@ class Club(commands.Cog):
                 raise ClubError('Сначала /club diagnose: проверьте, что перечисленные неподтверждённые публикации отсутствуют. Затем checked_absent=True. Существующие карточки не удаляются.')
             for pub in self.store.rows("SELECT * FROM bc_publications WHERE guild_id=? AND state='reserved'", (ctx.guild.id,)):
                 channel = await self.service.channel(ctx.guild, pub['channel_id'])
-                found = await self.service._find_marker(ctx.guild, channel, f'\n-# bc:{pub["key"]}', isinstance(channel, discord.ForumChannel), webhook_id=pub['webhook_id'])
+                found = await self.service.delivery.recover(ctx.guild, channel, pub['key'],
+                    forum=isinstance(channel, discord.ForumChannel), webhook_id=pub['webhook_id'])
                 if found:
                     self.store.save_publication(pub['key'], found[0].id, found[1].id)
                 else:

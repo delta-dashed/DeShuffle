@@ -9,12 +9,13 @@ from bookclub.catalog_ui import (AddBookModal, BookListModal, CatalogView,
                                   catalog_access, preview_book_file, preview_book_text)
 from bookclub.service import Service
 from bookclub.store import ClubError, Store
-from test_bookclub import CONFIG
+from test_bookclub import stub_delivery_transport, CONFIG
 from test_bookclub_discord import DiscordHarness
 
 
 class CatalogUITests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        stub_delivery_transport(self)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.store = Store(Path(temporary.name) / 'club.db')

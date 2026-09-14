@@ -508,6 +508,11 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         run = await self.scan()
         hook = self.h.webhook(14)
         self.store.save_webhook(1, 14, hook.id)
+        key = 'essay-import:1:61'
+        self.store.reserve_publication(key, 1, 14, webhook_id=hook.id)
+        old = await hook.send(archive_header(self.book, 1) + '\n-# bc:' + key,
+                              thread_name='Старый импорт', username='Автор', avatar_url='', wait=True, allowed_mentions=discord.AllowedMentions.none())
+        self.store.save_publication(key, old.channel.id, old.id)
         original_edit = hook.edit_message.side_effect
         observed_binding = []
         async def edit_then_lose_ack(message_id, **kwargs):

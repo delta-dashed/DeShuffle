@@ -15,6 +15,8 @@ import discord
 
 from .store import ClubError
 from .forum_tags import ForumTags
+from .publication_delivery import DeliveryJournal
+from .single_delivery import channel_send_once, create_thread_once, webhook_send_once
 from .render import book_pages, catalog_pages, news_content, meeting_lines, pages, safe, book_url
 
 log = logging.getLogger(__name__)
@@ -31,6 +33,7 @@ class Service:
         self.book_view_factory = None
         self.catalog_view_factory = None
         self.forum_tags = ForumTags(self)
+        self.delivery = DeliveryJournal(self)
         self.last_essay_scan = {}
 
     async def setup_actor(self, guild, user_id):
@@ -223,7 +226,7 @@ class Service:
                 return False
             return self.store.sync_event(guild.id, meeting['id'], event_id=meeting['event_id'],
                                          name=meeting['name'], start=meeting['start'], end=meeting['end'],
-                                         voice_id=meeting['voice_id'], status='cancelled')
+                                         voice_id=meeting['voice_id'], status='cancelled', status_confirmed=False)
         return self.sync(guild, meeting, event)
 
     async def reconcile(self, guild):
@@ -239,9 +242,9 @@ class Service:
                     log.error('Multiple Discord events for book club meeting %s; manual repair required', m['id'])
             elif m['event_id'] in by_id:
                 changed = self.sync(guild, m, by_id[m['event_id']]) or changed
-            elif m['status'] not in ('cancelled', 'completed'):
+            elif m['status'] not in ('cancelled', 'completed') or not m.get('event_status_confirmed', 1):
                 changed = await self.sync_one(guild, m) or changed
-        return changed
+        return self.store.reconcile_book_statuses(guild.id) or changed
 
     async def create_event(self, guild, meeting, start, end):
         if meeting['event_id']:
@@ -266,6 +269,7 @@ class Service:
         return actual is None and message.author.id == self.bot.user.id
 
     async def _find_marker(self, guild, channel, marker, forum=False, *, webhook_id=None):
+        matches = {}
         if forum:
             threads = [t for t in await guild.active_threads() if t.parent_id == channel.id]
             threads.extend([t async for t in channel.archived_threads(limit=None)])
@@ -277,20 +281,21 @@ class Service:
                 except discord.NotFound:
                     continue
                 if marker.strip('\n') in message.content.splitlines() and self.owns_starter(message, webhook_id):
-                    return thread, message
+                    matches[message.id] = (thread, message)
         else:
             async for message in channel.history(limit=None):
                 if marker.strip('\n') in message.content.splitlines() and self.owns_starter(message, webhook_id):
-                    return channel, message
-        return None
+                    matches[message.id] = (channel, message)
+        if len(matches) > 1:
+            raise ClubError('Найдено несколько прежних сообщений с одним маркером. '
+                            'Автоматическая привязка запрещена; организатору нужно проверить копии.')
+        return next(iter(matches.values()), None)
 
     async def upsert(self, guild, key, channel_id, content, *, forum_name=None, view=None, files=None):
-        marker = f'\n-# bc:{key}'
-        content += marker
         if len(content) > 2000:
             raise ClubError('Карточка слишком длинная; требуется разбивка на страницы.')
         managed_name = forum_name[:100] if forum_name and key.startswith(('book:', 'catalog:')) else None
-        signature = content + repr([(c.to_component_dict(), c.row) for c in view.children] if view else []) + repr(managed_name)
+        signature = 'clean-delivery-v1\n' + content + repr([(c.to_component_dict(), c.row) for c in view.children] if view else []) + repr(managed_name)
         digest = hashlib.sha256(signature.encode()).hexdigest()
         pub = self.store.publication(key)
         channel = None
@@ -328,14 +333,14 @@ class Service:
             if forum_name:
                 channel = await self.forum_tags.fresh(guild, channel)
                 tags = self.publication_tags(guild, channel, key)
-            fresh = self.store.reserve_publication(key, guild.id, channel_id)
+            fresh = await self.delivery.reserve(guild, channel, key, content, forum_name=forum_name, view=view, files=files)
             if not fresh:
-                found = await self._find_marker(guild, channel, marker, bool(forum_name))
+                found = await self.delivery.recover(guild, channel, key, forum=bool(forum_name))
                 if not found:
                     raise ClubError('Предыдущая отправка не подтверждена. Организатору: /club diagnose и /club repair.')
                 channel, message = found
             elif forum_name:
-                created = await channel.create_thread(name=forum_name[:100], content=content, view=view or discord.utils.MISSING,
+                created = await create_thread_once(channel, name=forum_name[:100], content=content, view=view or discord.utils.MISSING,
                                                       applied_tags=tags, allowed_mentions=NO_MENTIONS)
                 channel, message = created.thread, created.message
                 created_message = True
@@ -343,10 +348,14 @@ class Service:
                 if isinstance(channel, discord.Thread) and channel.archived:
                     channel = await channel.edit(archived=False)
                 extra = {'files': files} if files else {}
-                message = await channel.send(content, view=view, allowed_mentions=NO_MENTIONS, **extra)
+                message = await channel_send_once(channel, content, view=view, allowed_mentions=NO_MENTIONS,
+                                                  nonce=self.delivery.intent(key)['nonce'], **extra)
                 created_message = True
-        if message.author.id != self.bot.user.id:
+        if not self.owns_starter(message):
             raise ClubError('Сохранённая карточка принадлежит другому автору; бот её не редактирует.')
+        # The recovered ID must survive a second lost response while editing
+        # changed content; the old intent then no longer matches the message.
+        self.store.save_publication(key, channel.id, message.id)
         if managed_name and isinstance(channel, discord.Thread) and channel.owner_id == self.bot.user.id:
             # Only rename a title that still matches our last assignment. Native
             # Discord renames are a deliberate override, including after restart.
@@ -529,7 +538,7 @@ class Service:
         marker = f'\n-# bc:{key}'
         pub = self.store.publication(key)
         imported = key.startswith('essay-import:')
-        if imported and pub and pub['message_id']:
+        if pub and pub['message_id']:
             if pub['guild_id'] != guild.id:
                 raise ClubError('Сохранённая шапка импорта относится к другому серверу.')
             thread = await self.channel(guild, pub['channel_id'], discord.Thread)
@@ -539,7 +548,7 @@ class Service:
         elif pub:
             if imported and (pub['guild_id'] != guild.id or pub['channel_id'] != forum.id):
                 raise ClubError('Резервирование шапки импорта относится к другому форуму или серверу.')
-            found = await self._find_marker(guild, forum, marker, True, webhook_id=pub['webhook_id'])
+            found = await self.delivery.recover(guild, forum, key, forum=True, webhook_id=pub['webhook_id'])
             if not found:
                 raise ClubError('Предыдущая отправка не подтверждена. Организатору: /club diagnose и /club repair.')
             thread, message = found
@@ -554,8 +563,10 @@ class Service:
                 raise ClubError('Для работы с темами вебхука боту нужно право Manage Threads в форуме эссе.')
             tags = self.publication_tags(guild, forum, key)
             hook = await self.essay_webhook(guild, forum)
-            self.store.reserve_publication(key, guild.id, forum.id, webhook_id=hook.id)
-            message = await hook.send(content + marker, thread_name=name, username=member.display_name[:80],
+            fresh = await self.delivery.reserve(guild, forum, key, content, forum_name=name, webhook_id=hook.id)
+            if not fresh:
+                raise ClubError('Отправка шапки уже начата. Повторите проверку сохранённой отправки.')
+            message = await webhook_send_once(hook, content, thread_name=name, username=member.display_name[:80],
                                       avatar_url=str(member.display_avatar.url), wait=True,
                                       applied_tags=tags, allowed_mentions=NO_MENTIONS)
             thread = await self.channel(guild, message.channel.id, discord.Thread)
@@ -565,10 +576,12 @@ class Service:
         self.store.save_publication(key, thread.id, message.id)
         if imported:
             await self.finish_import_header(thread, message, content, self.store.publication(key))
+        elif message.content.endswith(marker):
+            await self.edit_essay_starter(thread, message, content, self.store.publication(key))
         return self.store.publication(key)
 
     async def finish_import_header(self, thread, starter, content, pub):
-        """Remove a transient recovery marker only after its Discord ID is durable."""
+        """Clean historical markers in place; new headers are sent clean."""
         key = pub['key']
         marker = f'\n-# bc:{key}'
         if (not key.startswith(f'essay-import:{thread.guild.id}:')
@@ -781,8 +794,9 @@ class Service:
             else:
                 key = managed_pub['key']
                 parts = key.split(':')
+                bound = managed_pub['channel_id'] == thread.id and managed_pub['message_id'] == starter.id
                 if (len(parts) not in (3, 4) or not parts[2].isdecimal()
-                        or '-# bc:' + key not in starter.content.splitlines()):
+                        or (not bound and '-# bc:' + key not in starter.content.splitlines())):
                     return False
                 book_id, author_id = parts[1], int(parts[2])
                 self.store.book(thread.guild.id, book_id)
@@ -802,7 +816,7 @@ class Service:
                     key = f'essay-space:{book_id}:{author_id}:{thread.id}'
                     with self.store.tx() as db:
                         db.execute('UPDATE bc_publications SET key=?,content_hash=NULL WHERE key=?', (key, pub['key']))
-                content = self.essay_starter(self.store.book(thread.guild.id, book_id), author_id) + '\n-# bc:' + key
+                content = self.essay_starter(self.store.book(thread.guild.id, book_id), author_id)
                 if content != starter.content:
                     await self.edit_essay_starter(thread, starter, content, pub)
             await self.forum_tags.sync_thread_tags(thread.guild, thread, ['essay' if submitted else 'draft'])
@@ -828,6 +842,12 @@ class Service:
     async def scan_essays(self, guild):
         settings = self.store.settings(guild.id)
         forum = await self.channel(guild, settings['essays'], discord.ForumChannel)
+        for pub in self.store.rows("SELECT * FROM bc_publications WHERE guild_id=? AND channel_id=? "
+                                   "AND state='reserved' AND key LIKE 'essay-space:%'", (guild.id, forum.id)):
+            found = await self.delivery.recover(guild, forum, pub['key'], forum=True, webhook_id=pub['webhook_id'])
+            if found:
+                thread, message = found
+                self.store.save_publication(pub['key'], thread.id, message.id)
         threads = [t for t in await guild.active_threads() if t.parent_id == forum.id]
         # Archived posts are sorted by archive time. Stop after the enable boundary.
         async for thread in forum.archived_threads(limit=None):

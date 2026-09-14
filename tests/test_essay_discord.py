@@ -61,7 +61,7 @@ class EssayDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual((essay['author_id'], essay['managed'], essay['submitted']), (1, 1, 0))
         self.assertIn('Автор: <@1>', starter.content)
         self.assertIn('Карточка книги и другие эссе', starter.content)
-        self.assertIn(f'-# bc:essay-space:{self.book["id"]}:1', starter.content)
+        self.assertNotIn('-# bc:essay-space:', starter.content)
         self.assertEqual(self.store.essays(self.book['id']), [])
         self.assertIn(1, {p['user_id'] for p in self.store.missing_essays(self.book['id'])})
         self.assertFalse(self.h.channels[14].create_thread.await_args.kwargs['allowed_mentions'].everyone)
@@ -188,7 +188,7 @@ class EssayDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(original_book_essay['book_id'], self.book['id'])
         self.assertNotEqual(original_book_essay['source_id'], essay['source_id'])
 
-    async def test_unacknowledged_creation_recovers_marker_after_restart(self):
+    async def test_unacknowledged_creation_recovers_clean_intent_after_restart(self):
         forum = self.h.channels[14]
         original = forum.create_thread.side_effect
 
@@ -258,7 +258,8 @@ class EssayDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.store.essays(second_book['id'])), 2)
         starter = self.h.channels[first['source_id']].messages[first['source_id']]
         self.assertIn('«Другая книга»', starter.content)
-        self.assertIn(f'-# bc:essay-space:{second_book["id"]}:1:{first["source_id"]}', starter.content)
+        self.assertNotIn('-# bc:essay-space:', starter.content)
+        self.assertIsNotNone(self.store.publication(f'essay-space:{second_book["id"]}:1:{first["source_id"]}'))
 
     async def test_long_book_and_display_name_fit_discord_forum_title(self):
         title = 'Очень длинное название книги ' * 6

@@ -200,6 +200,91 @@ class MeetingControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ClubError):
             await select.callback(self.h.interaction(99))
 
+    async def test_meeting_plan_role_is_explicit_and_does_not_change_event_or_book_status(self):
+        # This is an existing meeting migrated without an inferred role.
+        with self.store.tx() as db:
+            db.execute('UPDATE bc_meetings SET plan_kind=NULL WHERE id=?', (self.meeting['id'],))
+        view = MeetingControls(self.cog, self.store.meeting(1, self.meeting['id']), 99)
+        self.assertFalse(any(option.default for option in view.plan_kind.options))
+        before_book = self.store.book(1, self.book['id'])
+        view.plan_kind._values = ['essay']
+        interaction = self.h.interaction(99)
+        await view.plan_kind.callback(interaction)
+        current = self.store.meeting(1, self.meeting['id'])
+        self.assertEqual(current['plan_kind'], 'essay')
+        self.assertEqual(current['event_id'], self.meeting['event_id'])
+        self.assertEqual(current['name'], self.meeting['name'])
+        self.assertEqual(self.store.book(1, self.book['id'])['status'], before_book['status'])
+        self.h.guild.fetch_member.assert_awaited_once_with(99)
+        self.h.bot.fetch_channel.assert_awaited_once_with(13)
+        self.h.guild.fetch_scheduled_event.assert_not_awaited()
+        self.event.edit.assert_not_awaited()
+        self.h.guild.create_scheduled_event.assert_not_awaited()
+        sent = interaction.followup.send.await_args
+        self.assertTrue(sent.kwargs['ephemeral'])
+        self.assertIn('обсуждение эссе', sent.args[0])
+        updated_view = sent.kwargs['view']
+        self.assertEqual(updated_view.meeting['revision'], current['revision'])
+        self.assertEqual([option.value for option in updated_view.plan_kind.options if option.default], ['essay'])
+
+    async def test_plan_role_cannot_be_changed_by_stale_or_revoked_controls(self):
+        view = MeetingControls(self.cog, self.meeting, 99)
+        view.plan_kind._values = ['reading']
+        self.store.set_meeting_plan_kind(1, self.meeting['id'], 'essay')
+        before = self.store.meeting(1, self.meeting['id'])
+        with self.assertRaisesRegex(ClubError, 'изменилась'):
+            await view.plan_kind.callback(self.h.interaction(99))
+        self.assertEqual(self.store.meeting(1, self.meeting['id']), before)
+        view = MeetingControls(self.cog, before, 99)
+        view.plan_kind._values = ['reading']
+        self.h.guild.owner_id = 90
+        self.store.configure(1, {**CONFIG, 'organizers': [], 'organizer_roles': []})
+        before = self.store.meeting(1, self.meeting['id'])
+        with self.assertRaisesRegex(ClubError, 'организатор'):
+            await view.plan_kind.callback(self.h.interaction(99))
+        self.assertEqual(self.store.meeting(1, self.meeting['id']), before)
+
+    async def test_plan_role_rejects_invalid_choices_and_wrong_actor_or_guild(self):
+        view = MeetingControls(self.cog, self.meeting, 99)
+        before = self.store.meeting(1, self.meeting['id'])
+        for values in ([], ['reading', 'essay'], ['automatic']):
+            view.plan_kind._values = values
+            with self.assertRaises(ClubError):
+                await view.plan_kind.callback(self.h.interaction(99))
+        view.plan_kind._values = ['reading']
+        for user, guild_id in ((1, 1), (99, 2)):
+            interaction = self.h.interaction(user)
+            interaction.guild_id = guild_id
+            with self.assertRaises(ClubError):
+                await view.plan_kind.callback(interaction)
+            interaction.response.defer.assert_not_awaited()
+        self.assertEqual(self.store.meeting(1, self.meeting['id']), before)
+
+    async def test_old_closed_meeting_can_be_classified_without_fetching_removed_event(self):
+        self.event.status = discord.EventStatus.completed
+        self.cog.service.sync(self.h.guild, self.meeting, self.event)
+        current = self.store.meeting(1, self.meeting['id'])
+        del self.h.events[current['event_id']]
+        view = MeetingControls(self.cog, current, 99)
+        view.plan_kind._values = ['reading']
+        await view.plan_kind.callback(self.h.interaction(99))
+        result = self.store.meeting(1, self.meeting['id'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(result['plan_kind'], 'reading')
+        self.h.guild.fetch_scheduled_event.assert_not_awaited()
+
+    async def test_unavailable_event_is_not_presented_as_confirmed_cancellation(self):
+        del self.h.events[self.meeting['event_id']]
+        interaction = self.h.interaction(99)
+        await open_book_meetings(self.cog, interaction, self.book['id'])
+        sent = interaction.followup.send.await_args
+        self.assertIn('отменённых: 0', sent.args[0])
+        self.assertIn('Недоступных событий: 1', sent.args[0])
+        self.assertIn('их отмена не подтверждена', sent.args[0])
+        view = sent.kwargs['view']
+        select = next(child for child in view.children if isinstance(child, discord.ui.Select))
+        self.assertIn('Недоступна · отмена не подтверждена', select.options[0].description)
+
 
 if __name__ == '__main__':
     unittest.main()

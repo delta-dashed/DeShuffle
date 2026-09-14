@@ -50,11 +50,15 @@ def meeting_lines(store, meeting, settings):
     elif m['exhausted']:
         host += ' · нет доступных кандидатов; нужен организатор'
     status = {'draft': 'ещё не создана', 'scheduled': 'запланирована', 'active': 'идёт', 'completed': 'завершена', 'cancelled': 'отменена', 'unsupported': 'нужен голосовой канал в событии; напоминания приостановлены'}.get(m['status'], m['status'])
+    if m['status'] == 'cancelled' and not m.get('event_status_confirmed', 1):
+        status = 'недоступна · отмена не подтверждена'
     lines = [f'**{safe(m["name"])}** · {status}',
              f'Когда: {time_label(m["start"], settings["timezone"])}',
              f'Окончание: {time_label(m["end"], settings["timezone"])}',
              f'Читаем: {safe(m["part"])}; до главы {safe(m["chapter"])} включительно.',
              f'Ведущий: {host}']
+    kind = {'reading': 'по книге', 'essay': 'обсуждение эссе'}.get(m.get('plan_kind'), 'нужно выбрать организатору')
+    lines.append(f'Тип встречи в плане: {kind}.')
     if m['event_id']:
         lines.append(f'[Событие Discord](https://discord.com/events/{m["guild_id"]}/{m["event_id"]}) · <#{m["voice_id"]}>')
     participants = store.meeting_participants(m['id'])

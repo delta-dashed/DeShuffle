@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from bookclub.store import ClubError, Store, parse_time
 from bookclub.render import book_pages, catalog_pages, news_content
@@ -13,8 +14,27 @@ from bookclub.render import book_pages, catalog_pages, news_content
 CONFIG = dict(news=11, chat=12, books=13, essays=14, voice=15, organizers=[99], organizer_roles=[22])
 
 
+def stub_delivery_transport(test):
+    # Domain/adapter tests simulate Discord at the SDK call boundary.
+    # test_single_delivery separately exercises the real SDK HTTP retries.
+    async def forum_send(forum, **kwargs):
+        return await forum.create_thread(**kwargs)
+    async def webhook_send(hook, *args, **kwargs):
+        return await hook.send(*args, **kwargs)
+    async def channel_send(channel, *args, **kwargs):
+        return await channel.send(*args, **kwargs)
+    for target, effect in (('bookclub.service.create_thread_once', forum_send),
+                           ('bookclub.service.channel_send_once', channel_send),
+                           ('bookclub.service.webhook_send_once', webhook_send),
+                           ('bookclub.import_publication.webhook_send_once', webhook_send)):
+        transport = patch(target, side_effect=effect)
+        transport.start()
+        test.addCleanup(transport.stop)
+
+
 class ClubFixture:
     def setUp(self):
+        stub_delivery_transport(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / 'voice_activity.sqlite3'

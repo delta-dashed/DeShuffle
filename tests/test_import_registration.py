@@ -2,6 +2,7 @@
 import asyncio
 from types import SimpleNamespace
 import unittest
+import discord
 
 from bookclub.import_store import ImportStore
 from bookclub.store import ClubError, Store
@@ -162,6 +163,10 @@ class ImportRegistrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
             await original_edit(message_id, **kwargs)
             raise TimeoutError('Edit acknowledgement lost')
 
+        self.store.reserve_publication(key, 1, 14, webhook_id=hook.id)
+        old = await hook.send(content + '\n-# bc:' + key, thread_name='Импорт',
+                              username='Автор', avatar_url='', wait=True, allowed_mentions=discord.AllowedMentions.none())
+        self.store.save_publication(key, old.channel.id, old.id)
         hook.edit_message.side_effect = lost_ack
         with self.assertRaises(TimeoutError):
             await self.service.publish_essay_starter(
@@ -178,7 +183,7 @@ class ImportRegistrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         hook.send.assert_awaited_once()
         hook.edit_message.assert_awaited_once()
 
-    async def test_unacknowledged_header_send_uses_transient_marker_then_removes_it(self):
+    async def test_unacknowledged_header_send_recovers_clean_content_by_intent(self):
         hook = await self.service.essay_webhook(self.h.guild, self.h.channels[14])
         original_send = hook.send.side_effect
         key, content = 'essay-import:1:88001', '**Архивное эссе**\nАвтор: <@1>.'

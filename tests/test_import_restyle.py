@@ -10,7 +10,7 @@ import discord
 
 from bookclub.archive_import import ArchiveImporter, validate_plan
 from bookclub.import_config import ImportConfig
-from bookclub.import_publication import matches_clean_content
+from bookclub.import_publication import archive_chunks, matches_clean_content
 from bookclub.service import Service
 from bookclub.store import ClubError, Store
 from test_archive_import import ArchiveHarness, confirm_book_thread
@@ -22,7 +22,9 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     def test_discord_trailing_space_normalization(self):
         self.assertTrue(matches_clean_content('essay', 'essay '))
         self.assertFalse(matches_clean_content('essa', 'essay '))
-        self.assertFalse(matches_clean_content('essay', 'essay\n'))
+        self.assertTrue(matches_clean_content('essay', 'essay\n'))
+        self.assertTrue(matches_clean_content('essay', '\t essay\r\n'))
+        self.assertFalse(matches_clean_content('first\nsecond', 'first\n\nsecond'))
 
     def setUp(self):
         super().setUp()
@@ -86,6 +88,8 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
                 content = chunk + f'\n[Оригинал сообщения]({original.jump_url})'
                 copy = await self.service.upsert(self.h.guild, key, self.thread.id, content)
                 message = self.thread.messages[copy['message_id']]
+                if not message.content.endswith('\n-# bc:' + key):
+                    message.content += '\n-# bc:' + key
                 if original.attachments and snapshot['attachments'][0]['copy'] and index == 0:
                     message.attachments = [self.attachment(ident=900)]
                 async def delete(*, target=message, **kwargs):
@@ -216,6 +220,32 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.hook.send.assert_not_awaited()
         self.hook.edit_message.assert_not_awaited()
         self.assertEqual(self.store.rows('SELECT * FROM bc_import_restyle_audit ORDER BY id'), audit)
+        self.assert_bookkeeping_unchanged()
+
+    async def test_historical_v2_long_parts_keep_exact_boundaries_ids_and_attachments(self):
+        await self.legacy_import(attachment=True, long_body=True)
+        await self.restyle()
+        # Simulate a released v2 import, which predates persisted chunk plans.
+        with self.store.tx() as db:
+            db.execute('DELETE FROM bc_import_chunk_plans')
+        before = self.store.rows('SELECT * FROM bc_publications ORDER BY key')
+        bodies = {copy.id: (copy.content, [(a.filename, a.size) for a in copy.attachments])
+                  for copy in self.new_copies()}
+        old = next(row for row in self.snapshot['messages'] if row['id'] == '61')
+        self.assertNotEqual(archive_chunks(old), archive_chunks(old, fixed=True))
+        self.store = Store(self.path, clock=lambda: self.now)
+        self.service = Service(self.h.bot, self.store)
+        self.importer = ArchiveImporter(self.service, self.config, self.runner)
+        self.reset_discord_writes()
+        await self.restyle(confirm=False)
+        self.assertEqual(self.store.rows('SELECT * FROM bc_import_chunk_plans'), [])
+        await self.restyle()
+        self.assert_no_discord_writes()
+        self.assertEqual(self.store.rows('SELECT * FROM bc_publications ORDER BY key'), before)
+        self.assertEqual({copy.id: (copy.content, [(a.filename, a.size) for a in copy.attachments])
+                          for copy in self.new_copies()}, bodies)
+        self.assertTrue(all(row['scheme'] == 'fixed-v2'
+                            for row in self.store.rows('SELECT * FROM bc_import_chunk_plans')))
         self.assert_bookkeeping_unchanged()
 
     async def test_cleans_existing_v2_markers_in_place_without_resending_body_or_files(self):
