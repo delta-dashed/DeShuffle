@@ -3,6 +3,8 @@
 Discord bot that shuffles members in a voice channel, keeps a live order as people join/leave, and can auto-run via scheduled events.
 
 ## Features
+
+- Optional book club extension: books, participants, native Discord meetings, host rotation, private preparation plans, essays, and durable reminders. Book and meeting cards let each reader create an essay forum post with one button and browse all published essays. New posts use a shared webhook with the reader's server nickname and avatar; readers write and edit their own messages inside. An empty header does not count as an essay. The essay forum needs Manage Webhooks and Manage Threads; `essay_webhooks: false` keeps the original bot-header mode. See [Russian setup and command guide](docs/BOOK_CLUB.md).
 - Shuffle members from your current voice channel with a hybrid command
 - Timed SDG breakout shuffle that physically moves members between rooms every 5 minutes
 - Live-updating list that reacts to joins/leaves
@@ -56,7 +58,6 @@ python Shuffle.py
 - `/schedule_event_menu` - open a modal to schedule an event
 - `/attach_event <event_id>` - attach shuffled-list automation to an existing scheduled event; the bot will not move members between voice rooms
 - `/detach_event <event_id>` - detach/disable shuffled-list automation for one scheduled event occurrence
-- `/event_shuffle_target_add <voice_channel> <target_channel>` - auto-post shuffled lists for scheduled events in a voice channel to a text channel or voice-channel chat; only `Товарищ`
 - `/event_shuffle_target_add <voice_channel> [target_channel]` - auto-post shuffled lists for scheduled events in a voice channel; target defaults to that voice-channel chat; only `Товарищ`
 - `/event_shuffle_target_remove <voice_channel>` - remove an auto-post target for a voice channel; only `Товарищ`
 - `/event_shuffle_target_list` - list configured scheduled-event auto-post targets; only `Товарищ`
@@ -70,6 +71,9 @@ python Shuffle.py
 - `!sync` - sync application commands to the current guild
 
 ## Configuration
+
+- `BOOKCLUB_ENABLED` (optional, default `false`) — load the book club extension. Run `/club setup` as the server owner or a member with Manage Server to create its category, two text channels, two forums, voice channel, essay webhook, and initial catalog. Repeating the command checks and repairs missing resources; `check_only:true` checks without changes. Enable Community manually first; the bot needs Manage Channels and its normal club permissions. Existing human access rules and channel names are preserved.
+- `BOOKCLUB_CONFIG_FILE` (optional) — leave empty for `/club setup`; channel IDs and settings persist in the existing SQLite database. Alternatively use `bookclub.example.json` to bind existing channels and restrict enabled servers. Unchanged file values do not undo channel repairs; explicit edits take effect on restart. `/club publish` remains available for manual configuration. See [setup and recovery](docs/BOOK_CLUB.md).
 - `DISCORD_TOKEN` (required)
 - `RELIABLE_ROLE_ID` (optional) - numeric role ID; if unset, edit `RELIABLE_ROLE_NAME` in `Shuffle.py`
 - `TRUSTED_ROLE_ID` (optional) - numeric role ID; if unset, edit `TRUSTED_ROLE_NAME` in `Shuffle.py`

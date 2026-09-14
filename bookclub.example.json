@@ -1,0 +1,21 @@
+{
+  "guilds": {
+    "111111111111111111": {
+      "news": 222222222222222222,
+      "chat": 333333333333333333,
+      "books": 444444444444444444,
+      "essays": 555555555555555555,
+      "voice": 666666666666666666,
+      "organizer_roles": [777777777777777777],
+      "organizers": [],
+      "reminder_role": null,
+      "essay_webhooks": true,
+      "timezone": "Europe/Moscow",
+      "participant_minutes": 30,
+      "preparation_hours": 24,
+      "escalation_hours": 3,
+      "offer_hours": 24,
+      "essay_hours": 24
+    }
+  }
+}
