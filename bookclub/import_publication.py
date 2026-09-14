@@ -25,8 +25,10 @@ def archive_chunks(snapshot, *, legacy=False):
 
 
 def matches_clean_content(actual, expected):
-    # Discord strips trailing spaces when a webhook message is edited.
-    return actual == expected or actual == expected.rstrip(' \t')
+    # Discord strips edge spaces from webhook messages, including a leading
+    # space when a fixed-size archive chunk starts in the middle of a word gap.
+    return actual in {expected, expected.rstrip(' \t'), expected.lstrip(' \t'),
+                      expected.strip(' \t')}
 
 
 class ImportPublisher:
@@ -126,7 +128,7 @@ class ImportPublisher:
             if (not self.service.owns_starter(value, hook.id if hook else None)
                     or value.channel.id != thread.id
                     or (not matches_clean_content(value.content, content)
-                        and (clean or value.content != content + marker))):
+                        and (clean or not matches_clean_content(value.content, content + marker)))):
                 raise ClubError('Копия эссе не совпадает с сохранённым текстом и отправителем. Прежние сообщения сохранены.')
             if expected_attachments is not None:
                 actual = sorted((a.filename, a.size) for a in value.attachments)

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
-from bookclub.import_publication import ImportPublisher
+from bookclub.import_publication import ImportPublisher, matches_clean_content
 from bookclub.import_store import ImportStore
 from bookclub.service import Service
 from bookclub.store import ClubError
@@ -15,6 +15,11 @@ from test_bookclub import ClubFixture
 
 
 class ImportPublicationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
+    def test_discord_edge_space_normalization_preserves_internal_text(self):
+        self.assertTrue(matches_clean_content('текст', ' текст'))
+        self.assertTrue(matches_clean_content('текст', 'текст '))
+        self.assertFalse(matches_clean_content('текст', 'те кст'))
+
     def setUp(self):
         super().setUp()
         self.h = ArchiveHarness()

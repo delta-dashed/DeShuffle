@@ -220,13 +220,35 @@ class ArchiveImporter:
             self.ledger.restore_plan(guild.id, run_id, actor_id, plan)
             return await self.review(guild, actor_id, run_id)
 
+    async def stage_reviewed_plan(self, guild, actor_id, source_id, request_key,
+                                  snapshot, output):
+        """Record an explicitly approved, complete manual plan for normal apply."""
+        actor = await self.guard(guild, actor_id, source_id)
+        async with self.lock:
+            source = await self.source(guild, actor, source_id)
+            await self.target_access(guild, actor, snapshot.get('target_forum_id'))
+            if (snapshot.get('source_id') != source_id
+                    or not snapshot.get('preparation_confirmed')
+                    or not snapshot.get('coverage', {}).get('complete')
+                    or snapshot.get('preparation_revision') != self.preparation.store.revision(guild.id, source_id)):
+                raise ClubError('Ручной план требует полного подтверждённого снимка текущей подготовки.')
+            if not snapshot.get('messages') or not snapshot.get('books'):
+                raise ClubError('Ручной план не содержит книг или сообщений.')
+            plan = validate_plan(snapshot, output)
+            if plan['skipped_message_ids']:
+                raise ClubError('В утверждённом полном плане есть пропущенные сообщения.')
+            return self.ledger.stage_reviewed_plan(guild.id, actor_id, source_id,
+                self.config.budget_id, request_key, snapshot, plan)
+
     @staticmethod
     def report(run):
         lines = [f'**План импорта** `{run["id"]}` · {run["state"]}',
                  f'Источник: <#{run["source_channel_id"]}> → форум <#{run["snapshot"]["target_forum_id"]}>.']
         if run.get('restoration'):
             audit = run['restoration']
-            lines.append(f'План восстановлен участником <@{audit["actor_id"]}> из {audit["old_state"]}; '
+            verb = ('План утверждён человеком' if audit['old_state'] == 'human-approved'
+                    else f'План восстановлен из {audit["old_state"]}')
+            lines.append(f'{verb} участником <@{audit["actor_id"]}>; '
                          f'SHA-256 `{audit["plan_sha256"]}`. Нового вызова Codex и сброса бюджета не было.')
         if not run['plan']:
             return lines + [run['detail'] or 'План ещё не получен.']
