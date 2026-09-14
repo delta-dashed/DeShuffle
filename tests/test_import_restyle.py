@@ -65,6 +65,8 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
                                                        'Книга · Эссе · Участник 1', header, self.h.members[1])
         self.thread = self.h.channels[pub['channel_id']]
         self.header = self.thread.messages[pub['message_id']]
+        if not self.header.content.endswith('\n-# bc:' + self.key):
+            self.header.content += '\n-# bc:' + self.key
         self.old_messages, self.old_keys = [], []
         for original in (self.h.first, self.h.second):
             body = original.content
@@ -150,6 +152,16 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.rows('SELECT * FROM bc_import_restyle_audit'), [])
         self.assert_bookkeeping_unchanged()
 
+    async def test_resumed_old_apply_can_finish_with_legacy_header_already_cleaned(self):
+        await self.legacy_import()
+        # A pre-upgrade apply can resume and remove only its recovery marker
+        # while leaving the older generated source footer for restyle.
+        self.header.content = self.header.content.removesuffix('\n-# bc:' + self.key)
+        await self.restyle()
+        self.assertNotIn('Первое исходное сообщение', self.header.content)
+        self.assertNotIn('-# bc:', self.header.content)
+        self.assert_bookkeeping_unchanged()
+
     async def test_replaces_body_with_author_identity_in_same_thread_and_removes_generated_links(self):
         await self.legacy_import()
         thread_ids = set(self.h.channels)
@@ -163,8 +175,10 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
             self.assertIn(original.content, new.content)
             self.assertNotIn('[Оригинал сообщения]', new.content)
             self.assertNotIn(original.jump_url, new.content)
+            self.assertNotIn('bc:essay-import:', new.content)
         self.assertNotIn('[Первое исходное сообщение]', self.header.content)
         self.assertNotIn(self.h.first.jump_url, self.header.content)
+        self.assertNotIn('bc:essay-import:', self.header.content)
         for key, old in zip(self.old_keys, self.old_messages):
             self.assertNotIn(old.id, self.thread.messages)
             self.assertIsNone(self.store.publication(key))
@@ -193,7 +207,70 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         await self.restyle()
         self.assertEqual(set(self.thread.messages), first_ids)
         self.hook.send.assert_not_awaited()
+        self.hook.edit_message.assert_not_awaited()
         self.assertEqual(self.store.rows('SELECT * FROM bc_import_restyle_audit ORDER BY id'), audit)
+        self.assert_bookkeeping_unchanged()
+
+    async def test_cleans_existing_v2_markers_in_place_without_resending_body_or_files(self):
+        await self.legacy_import(attachment=True)
+        await self.restyle()
+        copies = self.new_copies()
+        for key, copy in zip(self.old_keys, copies):
+            copy.content += '\n-# bc:' + key + ':v2'
+        self.header.content += '\n-# bc:' + self.key
+        message_ids = set(self.thread.messages)
+        bindings = self.store.rows('SELECT key,channel_id,message_id,webhook_id FROM bc_publications ORDER BY key')
+        expected_files = [(a.filename, a.size) for a in copies[0].attachments]
+        self.reset_discord_writes()
+
+        await self.restyle(confirm=False)
+        self.assert_no_discord_writes()
+        await self.restyle()
+
+        self.assertEqual(set(self.thread.messages), message_ids)
+        self.assertEqual(self.store.rows('SELECT key,channel_id,message_id,webhook_id FROM bc_publications ORDER BY key'), bindings)
+        self.hook.send.assert_not_awaited()
+        self.assertEqual(self.hook.edit_message.await_count, 3)
+        for copy, original in zip(copies, (self.h.first, self.h.second)):
+            self.assertNotIn('bc:essay-import:', copy.content)
+            self.assertIn(original.content, copy.content)
+            copy.delete.assert_not_awaited()
+        self.assertEqual([(a.filename, a.size) for a in copies[0].attachments], expected_files)
+        copies[0].attachments[0].to_file.assert_not_awaited()
+        self.assertNotIn('bc:essay-import:', self.header.content)
+        self.assertTrue(await self.service.register_thread(self.thread, prompt=False))
+        self.assertEqual(self.store.essays(self.book['id'])[0]['author_id'], 1)
+        self.reply.edit.assert_not_awaited()
+        self.reply.delete.assert_not_awaited()
+        self.assert_bookkeeping_unchanged()
+
+        self.reset_discord_writes()
+        await self.restyle()
+        self.hook.send.assert_not_awaited()
+        self.hook.edit_message.assert_not_awaited()
+        self.assertEqual(set(self.thread.messages), message_ids)
+        self.assert_bookkeeping_unchanged()
+
+    async def test_modified_v2_text_is_protected_before_any_marker_is_removed(self):
+        await self.legacy_import()
+        await self.restyle()
+        copies = self.new_copies()
+        for key, copy in zip(self.old_keys, copies):
+            copy.content += '\n-# bc:' + key + ':v2'
+        copies[-1].content = 'Правка участника\n' + copies[-1].content
+        self.header.content += '\n-# bc:' + self.key
+        self.reset_discord_writes()
+        with self.assertRaises(ClubError):
+            await self.restyle()
+        self.assert_no_discord_writes()
+        self.assertIn('Правка участника', copies[-1].content)
+        self.assert_bookkeeping_unchanged()
+
+    async def test_only_generated_suffix_is_removed_and_original_marker_like_text_survives(self):
+        self.h.first.content += '\n-# bc:essay-import:1:61:message:61:0:v2\nПродолжение эссе.'
+        await self.legacy_import()
+        await self.restyle()
+        self.assertEqual(self.new_copies()[0].content, self.h.first.content)
         self.assert_bookkeeping_unchanged()
 
     async def test_attachments_are_copied_from_existing_copy_even_if_original_message_disappeared(self):
@@ -249,6 +326,23 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ClubError):
             await self.restyle()
         self.assert_no_discord_writes()
+        self.assert_bookkeeping_unchanged()
+
+    async def test_manual_header_edit_is_not_overwritten_even_with_matching_marker(self):
+        await self.legacy_import()
+        self.header.content = 'Ручное уточнение\n' + self.header.content
+        with self.assertRaises(ClubError):
+            await self.restyle()
+        self.assert_no_discord_writes()
+        self.assertIn('Ручное уточнение', self.header.content)
+        self.assert_bookkeeping_unchanged()
+
+    async def test_book_rename_keeps_original_snapshot_header_eligible_for_cleanup(self):
+        await self.legacy_import()
+        self.store.update_book(1, self.book['id'], title='Исправленное название')
+        await self.restyle()
+        self.assertEqual(self.header.content, '**Архивное эссе по книге «Исправленное название»**\nАвтор: <@1>.')
+        self.assertTrue(await self.service.register_thread(self.thread, prompt=False))
         self.assert_bookkeeping_unchanged()
 
     async def test_changed_essay_author_is_not_overwritten_by_saved_import_plan(self):

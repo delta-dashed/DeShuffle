@@ -462,7 +462,11 @@ class ArchiveImporter:
                         thread = await self.service.channel(guild, pub['channel_id'], discord.Thread)
                         if thread.parent_id != forum.id:
                             raise ClubError('Сохранённая тема импорта находится в другом форуме.')
-                        await thread.fetch_message(pub['message_id'])
+                        starter = await thread.fetch_message(pub['message_id'])
+                        # Finish a previously acknowledged header even if the
+                        # process stopped before removing its recovery marker.
+                        await self.service.finish_import_header(thread, starter,
+                            starter.content.removesuffix('\n-# bc:' + key), pub)
                     else:
                         pub = await self.service.publish_essay_starter(guild, forum, key, name, header, member)
                         thread = await self.service.channel(guild, pub['channel_id'], discord.Thread)

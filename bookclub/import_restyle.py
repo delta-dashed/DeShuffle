@@ -26,8 +26,9 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
         plan = validate_plan(run['snapshot'], {'essays': [
             {'book_ref': item['book_ref'], 'message_ids': item['message_ids']}
             for item in run['plan']['essays']]})
+        snapshot_books = {book['ref']: book for book in run['snapshot']['books']}
         snapshots = {m['id']: m for m in run['snapshot']['messages']}
-        prepared, byte_count, replacement_count = [], 0, 0
+        prepared, byte_count, replacement_count, cleanup_count = [], 0, 0, 0
         for item in plan['essays']:
             ids = item['message_ids']
             key = f'essay-import:{guild.id}:{min(ids, key=int)}'
@@ -47,10 +48,20 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
             if not service.can_read(thread, actor):
                 raise ClubError('Нет доступа к теме эссе.')
             starter = await thread.fetch_message(thread.id)
-            if not service.owns_starter(starter, pub['webhook_id']) or '-# bc:' + key not in starter.content.splitlines():
-                raise ClubError('Шапка эссе не принадлежит сохранённому импорту.')
             book = store.book(guild.id, essay['book_id'])
-            header = archive_header(book, item['author_id']) + '\n-# bc:' + key
+            header = archive_header(book, item['author_id'])
+            marker = '\n-# bc:' + key
+            known_headers = set()
+            for known_book in (book, snapshot_books[item['book_ref']]):
+                known_header = archive_header(known_book, item['author_id'])
+                legacy_header = (known_header + '\nПеренесено из старого обсуждения по подтверждённому плану.\n'
+                                 f'[Первое исходное сообщение]({snapshots[ids[0]]["url"]})')
+                known_headers.update((known_header, known_header + marker, legacy_header, legacy_header + marker))
+            if (not service.owns_starter(starter, pub['webhook_id'])
+                    or starter.content not in known_headers):
+                raise ClubError('Шапка эссе не принадлежит сохранённому импорту.')
+            if starter.content != header:
+                cleanup_count += 1
             if starter.content != header and pub['webhook_id'] is not None:
                 try:
                     hook = await service.bot.fetch_webhook(pub['webhook_id'])
@@ -98,9 +109,11 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
                         if copy['message_id']:
                             message = await thread.fetch_message(copy['message_id'])
                             if (not service.owns_starter(message, copy['webhook_id'])
-                                    or message.content != text + '\n-# bc:' + copy_key
+                                    or message.content not in (text, text + '\n-# bc:' + copy_key)
                                     or sorted((a.filename, a.size) for a in message.attachments) != expected_files):
                                 raise ClubError('Новая копия эссе изменена. Автоматическое исправление остановлено.')
+                            if message.content != text:
+                                cleanup_count += 1
                     attachments = []
                     if index == 0 and not copy:
                         original = old_copies.get(0)
@@ -121,8 +134,10 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
             prepared.append((thread, starter, pub, book, item['author_id'], member, parts, obsolete))
         report = [f'**Исправление оформления импорта** `{run_id}`',
                   f'Тем: {len(prepared)}. Частей для отправки или восстановления: {replacement_count}.',
-                  'Темы и ответы участников сохраняются. Служебные ссылки на исходные сообщения убираются; '
-                  'текст и файлы публикуются с ником и аватаркой автора. Новые сообщения появятся в конце существующих тем.',
+                  f'Существующих сообщений для очистки: {cleanup_count}.',
+                  'Темы и ответы участников сохраняются. Служебные ссылки и метки импорта убираются; '
+                  'текст и файлы публикуются с ником и аватаркой автора. Существующие авторские копии редактируются на месте. '
+                  'Если нужны новые копии, они появятся в конце существующих тем.',
                   'Codex не вызывается; квота и состояние завершённого импорта сохраняются.']
         report.extend(f'<#{thread.id}> · частей эссе: {len(parts)}' for thread, _, _, _, _, _, parts, _ in prepared)
         if not confirm:
@@ -151,13 +166,15 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
                     finally:
                         for file in files:
                             file.close()
-                header = archive_header(book, author_id) + '\n-# bc:' + pub['key']
+                header = archive_header(book, author_id)
                 if starter.content != header:
                     await service.edit_essay_starter(thread, starter, header, pub)
                     current = await thread.fetch_message(starter.id)
                     if not service.owns_starter(current, pub['webhook_id']) or current.content != header:
                         raise ClubError('Обновление шапки не подтверждено. Прежние сообщения сохранены.')
                     importer.publisher.audit(guild.id, run_id, actor_id, 'header-updated', thread.id, starter.id, starter.id)
+                current = await thread.fetch_message(starter.id)
+                await service.finish_import_header(thread, current, header, pub)
                 # All replacements are durably acknowledged before retiring
                 # any old body; other participants' messages are never selected.
                 for legacy_key, expected, ident, index in obsolete:

@@ -11,6 +11,7 @@ import discord
 
 from bookclub.archive_import import ArchiveImporter, validate_plan
 from bookclub.import_config import ImportConfig
+from bookclub.import_publication import archive_chunks, archive_header
 from bookclub.service import Service
 from bookclub.store import ClubError, Store
 from test_bookclub import ClubFixture
@@ -339,6 +340,14 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
             self.assertEqual(message.webhook_id, hook.id)
             self.assertEqual(message.author.display_name, self.h.members[1].display_name)
             self.assertEqual(message.author.display_avatar.url, str(self.h.members[1].display_avatar.url))
+            self.assertNotIn('bc:essay-import:', message.content)
+        self.assertEqual(starter.content, archive_header(self.book, 1))
+        for snapshot in run['snapshot']['messages']:
+            if snapshot['id'] not in ('61', '62'):
+                continue
+            for index, chunk in enumerate(archive_chunks(snapshot)):
+                pub = self.store.publication(f'essay-import:1:61:message:{snapshot["id"]}:{index}:v2')
+                self.assertEqual(target.messages[pub['message_id']].content, chunk)
         target.send.assert_not_awaited()
         body_calls = [call for call in hook.send.await_args_list if call.kwargs.get('thread') is not None]
         contents = [call.args[0] for call in body_calls]
@@ -359,6 +368,28 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.h.first.edit.assert_not_awaited()
         self.h.second.edit.assert_not_awaited()
         self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'done')
+
+    async def test_all_long_body_chunks_are_clean_and_preserve_author_bc_text(self):
+        author_text = 'Автор обсуждает bc:essay-import:example.\n-# bc:author-note\n'
+        self.h.first.content = author_text + 'Размышления о книге. ' * 170
+        run = await self.scan()
+        await self.apply(run)
+        essay, = self.store.essays(self.book['id'])
+        target = self.h.channels[essay['source_id']]
+        first_snapshot = next(item for item in run['snapshot']['messages'] if item['id'] == '61')
+        chunks = archive_chunks(first_snapshot)
+        self.assertGreater(len(chunks), 1)
+        actual = []
+        for index, expected in enumerate(chunks):
+            key = f'essay-import:1:61:message:61:{index}:v2'
+            pub = self.store.publication(key)
+            message = target.messages[pub['message_id']]
+            self.assertEqual(message.content, expected)
+            self.assertNotIn('\n-# bc:' + key, message.content)
+            actual.append(message.content)
+        self.assertEqual(''.join(actual), self.h.first.content)
+        self.assertIn(author_text, actual[0])
+        self.assertEqual(target.messages[target.id].content, archive_header(self.book, 1))
 
     async def test_oversize_attachments_explain_limit_without_source_link_or_download(self):
         attachment = SimpleNamespace(id=701, filename='large.zip', size=20_000_000, to_file=AsyncMock())
@@ -410,6 +441,7 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         essay, = self.store.essays(self.book['id'])
         target = self.h.channels[essay['source_id']]
         self.assertEqual(len(target.messages), 3)
+        self.assertTrue(all('bc:essay-import:' not in message.content for message in target.messages.values()))
         target.send.assert_not_awaited()
         self.assertEqual(hook.send.await_count, 3)
         self.runner.analyze.assert_awaited_once()
@@ -434,7 +466,40 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         essay, = self.store.essays(self.book['id'])
         target = self.h.channels[essay['source_id']]
         self.assertEqual(len(target.messages), 3)
+        self.assertTrue(all('bc:essay-import:' not in message.content for message in target.messages.values()))
         target.send.assert_not_awaited()
+        self.runner.analyze.assert_awaited_once()
+
+    async def test_lost_starter_cleanup_ack_reuses_known_clean_thread_after_restart(self):
+        run = await self.scan()
+        hook = self.h.webhook(14)
+        self.store.save_webhook(1, 14, hook.id)
+        original_edit = hook.edit_message.side_effect
+        observed_binding = []
+        async def edit_then_lose_ack(message_id, **kwargs):
+            if kwargs['content'] == archive_header(self.book, 1):
+                observed_binding.append(self.store.publication('essay-import:1:61')['message_id'])
+                hook.edit_message.side_effect = original_edit
+                await original_edit(message_id, **kwargs)
+                raise OSError('lost starter cleanup acknowledgement')
+            return await original_edit(message_id, **kwargs)
+        hook.edit_message.side_effect = edit_then_lose_ack
+        with self.assertRaisesRegex(OSError, 'lost starter cleanup acknowledgement'):
+            await self.apply(run)
+        pub = self.store.publication('essay-import:1:61')
+        self.assertEqual(observed_binding, [pub['message_id']])
+        thread_id = pub['channel_id']
+        self.assertEqual(self.h.channels[thread_id].messages[thread_id].content, archive_header(self.book, 1))
+        self.store = Store(self.path, clock=lambda: self.now)
+        self.service = Service(self.h.bot, self.store)
+        self.importer = ArchiveImporter(self.service, self.config, self.runner)
+        await self.apply(run)
+        essay, = self.store.essays(self.book['id'])
+        self.assertEqual(essay['source_id'], thread_id)
+        self.assertEqual(len(self.h.channels[thread_id].messages), 3)
+        self.assertTrue(all('bc:essay-import:' not in message.content
+                            for message in self.h.channels[thread_id].messages.values()))
+        self.assertEqual(hook.send.await_count, 3)
         self.runner.analyze.assert_awaited_once()
 
     async def test_partial_copy_deleted_before_retry_is_recreated_with_attachment(self):
