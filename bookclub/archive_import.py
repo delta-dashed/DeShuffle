@@ -312,8 +312,10 @@ class ArchiveImporter:
             if settings['essays'] != run['snapshot']['target_forum_id']:
                 raise ClubError('Форум назначения изменён после создания плана. Этот план не применяется.')
             forum = await self.service.channel(guild, settings['essays'], discord.ForumChannel)
-            if not forum.permissions_for(actor).view_channel or getattr(forum.flags, 'require_tag', False):
-                raise ClubError('Проверьте доступ к форуму назначения и отключите обязательные теги.')
+            if not forum.permissions_for(actor).view_channel:
+                raise ClubError('Проверьте доступ к форуму назначения.')
+            forum = await self.service.forum_tags.fresh(guild, forum)
+            self.service.forum_tags.creation_tags(guild.id, forum, 'imported')
             snapshots = {m['id']: m for m in run['snapshot']['messages']}
             books = {b['ref']: b for b in run['snapshot']['books']}
             originals = {}

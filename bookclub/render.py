@@ -92,7 +92,9 @@ def book_pages(store, book, settings):
 
 
 def catalog_pages(store, guild_id):
-    lines = ['**Каталог книжного клуба**', 'Порядок чтения задаёт организатор; ответы в обсуждениях его не меняют.']
+    lines = ['**Каталог книжного клуба**', 'Порядок чтения задаёт организатор; ответы в обсуждениях его не меняют.',
+             '«Добавить книгу» создаст карточку и отдельный пост для обсуждения. «Загрузить список» — вставить несколько книг; '
+             'для файла используйте `/club library import`.']
     for b in store.books(guild_id):
         url = book_url(store, b)
         title = f'{safe(b["title"])} · {safe(b["author"])}'
@@ -101,15 +103,8 @@ def catalog_pages(store, guild_id):
 
 
 def news_content(store, guild_id, settings):
-    current = next((b for b in store.books(guild_id) if b['status'] == 'reading'), None)
-    if not current:
-        return '**Вестник клуба**\nТекущее чтение ещё не выбрано.'
-    lines = ['**Вестник клуба**', f'{safe(current["title"])} · {safe(current["author"])}']
-    meeting = store.one("SELECT * FROM bc_meetings WHERE book_id=? AND status IN ('scheduled','active') AND (start>? OR status='active') ORDER BY start,id LIMIT 1", (current['id'], store.clock()))
-    lines.extend(meeting_lines(store, meeting, settings) if meeting else ['Ближайшая встреча ещё не назначена.'])
-    lines.append(f'Срок эссе: {time_label(current["deadline"], settings["timezone"])}')
-    url = book_url(store, current)
-    if url and not meeting:
-        lines.append(f'[Книга и эссе участников]({url})')
-    lines.append(f'Эссе: <#{settings["essays"]}> · Голосовой канал: <#{settings["voice"]}>')
-    return '\n'.join(lines)
+    return ('**Вестник клуба**\nОрганизационные объявления: даты встреч, переносы, отмены и другие изменения. '
+            'Организаторы публикуют их здесь вручную.\n'
+            f'Актуальные даты и границы чтения — в карточках книг в <#{settings["books"]}> и событиях сервера. '
+            'Бот не дублирует сюда обычное расписание.\n'
+            f'Для флуда и общения — <#{settings["chat"]}>.')

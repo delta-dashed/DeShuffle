@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import asyncio
 import io
 import json
 import logging
@@ -16,15 +17,17 @@ from .store import ClubError, STATUSES, parse_time
 from .render import pages, safe, meeting_lines, book_url, essay_lines
 from .service import NO_MENTIONS, ESSAY_WEBHOOK_NAME, Service
 from .archive_import import ArchiveImporter
+from .catalog_ui import CatalogView, catalog_access, preview_book_file
 
 log = logging.getLogger(__name__)
 HELP = '''**Архивариус · книжный клуб**
 Участнику: `/club books`, `/club book_add`, `/club join`, `/club essay`.
+В каталоге и `/club books`: «Добавить книгу» создаёт книгу и её тему. Организатору: «Загрузить список» или `/club library import` с файлом TXT, CSV, JSON.
 Ведущему: откройте `/club meeting`, нажмите «Провести встречу» и подтвердите. Кнопка «Мой план» открывает личный черновик.
 Организатору: `/club book_edit`, `/club participant`, `/club meeting_add`, `/club meeting_attach`, `/club move`, `/club cancel`, `/club offer`, `/club replace`, `/club handover`.
 Настройка сервера: `/club setup` создаёт недостающие каналы и проверяет существующие; `check_only=True` — только проверка.
 Организатору после настройки: `/club diagnose`, затем `/club publish`. Перечень и инструкция — в docs/BOOK_CLUB.md.
-Окна встреч: пн/ср 18:30, пт 17:00 Europe/Moscow. Дата и граница чтения всегда задаются явно.'''
+Вестник — организационные объявления вручную. Площадь — флуд и общение. Даты и границы чтения задаются в карточках и событиях.'''
 
 
 async def reply(interaction, content, **kwargs):
@@ -215,6 +218,7 @@ class PlanView(GuardedView):
                     raise ClubError('Этот план открыт другим участником.')
                 # No Discord HTTP before send_modal: acknowledge within the 3s deadline.
                 # This access check uses current domain state; REST authorization is repeated on submit.
+                self.cog.service.interaction_access(interaction)
                 organizer = self.cog.service.interaction_organizer(interaction)
                 current = self.cog.store.plan(interaction.guild_id, self.meeting['id'], interaction.user.id, organizer)
                 if (current['generation'], current['version']) != (self.plan['generation'], self.plan['version']):
@@ -239,6 +243,7 @@ class Club(commands.Cog):
         self.service = Service(bot, store, guild_ids)
         self.service.view_factory = lambda meeting: MeetingView(self, meeting)
         self.service.book_view_factory = lambda book: BookView(self, book)
+        self.service.catalog_view_factory = lambda guild_id: CatalogView(self.service, guild_id)
         self.importer = ArchiveImporter(self.service, import_config)
 
     async def cog_load(self):
@@ -250,6 +255,8 @@ class Club(commands.Cog):
             self.bot.add_view(MeetingView(self, m))
         for book in self.store.rows('SELECT * FROM bc_books'):
             self.bot.add_view(BookView(self, book))
+        for row in self.store.rows('SELECT guild_id FROM bc_settings'):
+            self.bot.add_view(CatalogView(self.service, row['guild_id']))
         self.worker.start()
 
     async def cog_unload(self):
@@ -278,7 +285,14 @@ class Club(commands.Cog):
         if ctx.command is self.setup or ctx.command.qualified_name == 'club setup':
             await self.service.setup_actor(ctx.guild, ctx.author.id)
         else:
-            await self.service.actor(ctx.guild, ctx.author.id)
+            maintenance = ctx.command.qualified_name in {'club diagnose', 'club publish', 'club repair'}
+            await self.service.actor(ctx.guild, ctx.author.id, require_access=not maintenance)
+            if not ctx.interaction and not maintenance:
+                settings = self.store.settings(ctx.guild.id)
+                club_channels = {settings[key] for key in ('news', 'chat', 'books', 'essays', 'voice')}
+                origin = ctx.channel.parent_id if isinstance(ctx.channel, discord.Thread) else ctx.channel.id
+                if origin not in club_channels:
+                    raise ClubError('Вне каналов клуба используйте slash-команду /club: ответ будет виден только вам.')
 
     async def cog_command_error(self, ctx, error):
         error = getattr(error, 'original', error)
@@ -294,7 +308,8 @@ class Club(commands.Cog):
             await ctx.send(content, allowed_mentions=NO_MENTIONS, **kwargs)
 
     async def organizer(self, ctx):
-        _, allowed = await self.service.actor(ctx.guild, ctx.author.id)
+        maintenance = getattr(getattr(ctx, 'command', None), 'qualified_name', '') in {'club diagnose', 'club publish', 'club repair'}
+        _, allowed = await self.service.actor(ctx.guild, ctx.author.id, require_access=not maintenance)
         if not allowed:
             raise ClubError('Это действие доступно организатору клуба.')
 
@@ -334,19 +349,32 @@ class Club(commands.Cog):
 
     @club.command(name='books', description='Книги и порядок чтения')
     async def books(self, ctx):
+        await catalog_access(self.service, ctx.guild, ctx.author.id, write=False)
         lines = []
         for b in self.store.books(ctx.guild.id):
             url = book_url(self.store, b)
             lines.append(f'{b["position"]}. {safe(b["title"])} · {safe(b["author"])} — {STATUSES[b["status"]]}' + (f'\n{url}' if url else ''))
-        for page in pages(lines):
-            await self.say(ctx, page)
+        for index, page in enumerate(pages(lines)):
+            await self.say(ctx, page, view=CatalogView(self.service, ctx.guild.id) if index == 0 else None)
 
     @club.command(name='book_add', description='Предложить книгу')
     async def book_add(self, ctx, title: str, author: str, materials: str = ''):
         async with self.service.locks[ctx.guild.id]:
+            await catalog_access(self.service, ctx.guild, ctx.author.id)
             b = self.store.create_book(ctx.guild.id, title, author, materials, ctx.interaction.id if ctx.interaction else ctx.message.id)
             await self.service.refresh(ctx.guild)
         await self.say(ctx, f'Книга «{safe(b["title"])}» добавлена как предложение.')
+
+    @club.group(name='library', description='Загрузка списка книг', invoke_without_command=True)
+    async def library(self, ctx):
+        await self.say(ctx, 'Нажмите «Загрузить список» в каталоге или прикрепите файл к /club library import. '
+                       'Формат TXT: Название | Автор, по одной книге в строке. Также поддерживаются CSV и JSON.')
+
+    @library.command(name='import', description='Разобрать файл со списком книг и показать предпросмотр')
+    async def library_import(self, ctx, file: discord.Attachment):
+        if ctx.interaction is None:
+            raise ClubError('Прикрепите файл к slash-команде /club library import: предпросмотр виден только вам.')
+        await preview_book_file(ctx.interaction, self.service, file)
 
     @club.command(name='book_edit', description='Изменить книгу, очередь и срок эссе')
     async def book_edit(self, ctx, book: str, status: Optional[Literal['Предложено', 'В очереди', 'Читаем', 'Прочитано']] = None,
@@ -376,7 +404,7 @@ class Club(commands.Cog):
     async def participant(self, ctx, book: str, member: discord.Member, remove: bool = False):
         async with self.service.locks[ctx.guild.id]:
             await self.organizer(ctx)
-            await self.service.actor(ctx.guild, member.id)
+            await self.service.actor(ctx.guild, member.id, require_access=not remove)
             b = self.resolve_book(ctx.guild.id, book)
             old = next((p for p in self.store.participants(b['id']) if p['user_id'] == member.id), None)
             self.store.participant(ctx.guild.id, b['id'], member.id, joined=not remove, willing=bool(old and old['willing']))
@@ -529,12 +557,17 @@ class Club(commands.Cog):
     @club.command(name='essay', description='Зарегистрировать эссе или исправить связь с книгой')
     async def essay(self, ctx, book: str, link: str, correct: bool = False):
         async with self.service.locks[ctx.guild.id]:
-            _, organizer = await self.service.actor(ctx.guild, ctx.author.id)
+            member, organizer = await self.service.actor(ctx.guild, ctx.author.id)
             b = self.resolve_book(ctx.guild.id, book)
+            await self.service.forum_access(ctx.guild, member, 'essays')
             match = re.fullmatch(r'https://(?:(?:www|canary|ptb)\.)?discord(?:app)?\.com/channels/(\d+)/(\d+)(?:/(\d+))?/?', link.strip())
             if not match or int(match[1]) != ctx.guild.id:
                 raise ClubError('Нужна ссылка на пост или сообщение этого сервера.')
-            channel = await self.service.channel(ctx.guild, int(match[2]))
+            channel = await self.bot.fetch_channel(int(match[2]))
+            if getattr(channel, 'guild', None) is None or channel.guild.id != ctx.guild.id:
+                raise ClubError('Канал принадлежит другому серверу.')
+            if not self.service.can_read(channel, member):
+                raise ClubError('Нет доступа к исходному сообщению или истории его канала.')
             source_id = int(match[3] or match[2])
             verified_thread = False
             if isinstance(channel, discord.Thread) and channel.parent_id == self.store.settings(ctx.guild.id)['essays']:
@@ -579,6 +612,7 @@ class Club(commands.Cog):
     @club.command(name='essays', description='Работы участников и кому ещё нужно эссе')
     async def essays(self, ctx, book: str):
         b = self.resolve_book(ctx.guild.id, book)
+        await self.service.essay_access(ctx.guild, b['id'], ctx.author.id)
         missing = self.store.missing_essays(b['id'])
         label = 'Ещё нет зарегистрированного эссе' if not b['deadline'] or b['deadline'] > self.store.clock() else 'Срок наступил, эссе ещё не зарегистрировано'
         lines = [f'**{safe(b["title"])}**', label + ': ' + (', '.join(f'<@{p["user_id"]}>' for p in missing) or 'у всех участников есть работа')]
@@ -588,9 +622,10 @@ class Club(commands.Cog):
 
     @club.command(name='setup', description='Создать или проверить каналы книжного клуба')
     async def setup(self, ctx, check_only: bool = False, retry_missing: bool = False,
-                    category: Optional[discord.CategoryChannel] = None):
+                    category: Optional[discord.CategoryChannel] = None, repair_permissions: bool = False):
         result = await self.service.setup_server(ctx.guild, ctx.author.id,
-                                                 check_only=check_only, retry_missing=retry_missing, category=category)
+                                                 check_only=check_only, retry_missing=retry_missing, category=category,
+                                                 repair_permissions=repair_permissions)
         for page in pages(result):
             await self.say(ctx, page)
 
@@ -717,13 +752,33 @@ class Club(commands.Cog):
         await self.say(ctx, 'Связь восстановлена.')
 
     async def book_autocomplete(self, interaction, current):
+        try:
+            await asyncio.wait_for(self.service.actor(interaction.guild, interaction.user.id), timeout=2)
+        except (ClubError, discord.HTTPException, asyncio.TimeoutError):
+            return []
         return [app_commands.Choice(name=f'{b["title"]} · {b["author"]} (№{b["position"]})'[:100], value=b['id']) for b in self.store.books(interaction.guild_id) if current.casefold() in (b['title'] + ' ' + b['author']).casefold()][:25]
 
     async def meeting_autocomplete(self, interaction, current):
+        try:
+            await asyncio.wait_for(self.service.actor(interaction.guild, interaction.user.id), timeout=2)
+        except (ClubError, discord.HTTPException, asyncio.TimeoutError):
+            return []
         return [app_commands.Choice(name=f'{m["name"]} · {m["part"]} / {m["chapter"]}'[:100], value=m['id']) for m in self.store.rows('SELECT * FROM bc_meetings WHERE guild_id=? ORDER BY start DESC,id', (interaction.guild_id,)) if current.casefold() in m['name'].casefold()][:25]
 
     async def event_autocomplete(self, interaction, current):
-        return [app_commands.Choice(name=e.name[:100], value=str(e.id)) for e in interaction.guild.scheduled_events if current.casefold() in e.name.casefold() and e.entity_type == discord.EntityType.voice][:25]
+        async def accessible_channels():
+            member, _ = await self.service.actor(interaction.guild, interaction.user.id)
+            channels = {c.id: c for c in await interaction.guild.fetch_channels()}
+            return member, channels
+
+        try:
+            member, channels = await asyncio.wait_for(accessible_channels(), timeout=2)
+        except (ClubError, discord.HTTPException, asyncio.TimeoutError):
+            return []
+        return [app_commands.Choice(name=e.name[:100], value=str(e.id))
+                for e in interaction.guild.scheduled_events
+                if current.casefold() in e.name.casefold() and e.entity_type == discord.EntityType.voice
+                and e.channel_id in channels and channels[e.channel_id].permissions_for(member).view_channel][:25]
 
     @commands.Cog.listener()
     async def on_scheduled_event_update(self, before, after):

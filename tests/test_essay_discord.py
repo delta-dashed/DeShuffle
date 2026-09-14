@@ -342,12 +342,13 @@ class EssayDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(book_view.is_persistent())
         self.assertTrue(meeting_view.is_persistent())
         expected_ids = {child.custom_id for view in (book_view, meeting_view) for child in view.children}
+        expected_ids.update({'bc:catalog:1:add', 'bc:catalog:1:import'})
         self.assertTrue(all(len(custom_id) <= 100 for custom_id in expected_ids))
         restarted = Club(self.h.bot, Store(self.path, clock=lambda: self.now))
         with patch.object(restarted.worker, 'start'):
             await restarted.cog_load()
         restored_views = [call.args[0] for call in self.h.bot.add_view.call_args_list]
-        self.assertEqual(len(restored_views), 2)
+        self.assertEqual(len(restored_views), 3)
         self.assertEqual({child.custom_id for view in restored_views for child in view.children}, expected_ids)
         self.assertTrue(all(view.is_persistent() for view in restored_views))
 

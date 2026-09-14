@@ -255,7 +255,7 @@ class ImportStoreTests(unittest.TestCase):
                 DROP TABLE bc_import_sources;
                 DROP TABLE bc_import_runs;
                 DROP TABLE bc_import_budgets;
-                DELETE FROM bc_migrations WHERE version=5;
+                DELETE FROM bc_migrations WHERE version>=5;
                 PRAGMA user_version=7;
                 CREATE TABLE legacy_notes(note TEXT);
                 INSERT INTO legacy_notes VALUES('preserved');
@@ -267,7 +267,7 @@ class ImportStoreTests(unittest.TestCase):
         self.assertEqual(migrated.one("SELECT note FROM legacy_notes")["note"], "preserved")
         self.assertEqual(migrated.one("PRAGMA user_version")["user_version"], 7)
         self.assertEqual(migrated.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": version} for version in range(1, 6)])
+                         [{"version": version} for version in range(1, 7)])
         run = ImportStore(migrated).reserve_run(1, 10, 20, "budget", "key", 1, 100, 100, {})
         restored = ImportStore(Store(self.path))
         self.assertEqual(restored.run(1, run["id"]), run)

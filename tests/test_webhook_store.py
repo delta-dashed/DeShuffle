@@ -51,7 +51,7 @@ class WebhookMigrationTests(unittest.TestCase):
         store = Store(self.path)
         self.assertEqual(store.publication("book:old-book"), dict(
             key="book:old-book", guild_id=1, channel_id=13, message_id=500,
-            state="ready", content_hash="hash", webhook_id=None))
+            state="ready", content_hash="hash", webhook_id=None, managed_name=None))
         self.assertEqual(store.publication("essay:pending")["state"], "reserved")
         self.assertIsNone(store.publication("essay:pending")["webhook_id"])
         self.assertEqual(store.rows("SELECT source_id,deleted,managed,submitted FROM bc_essays ORDER BY source_id"), [
@@ -62,13 +62,13 @@ class WebhookMigrationTests(unittest.TestCase):
         self.assertEqual(store.one("SELECT note FROM legacy_notes")["note"], "preserved")
         self.assertEqual(store.one("PRAGMA user_version")["user_version"], 7)
         self.assertEqual(store.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": 1}, {"version": 2}, {"version": 3}, {"version": 4}, {"version": 5}])
+                         [{"version": version} for version in range(1, 7)])
         store.save_webhook(1, 14, 900)
 
         restored = Store(self.path)
         self.assertEqual(restored.publication("book:old-book"), store.publication("book:old-book"))
         self.assertEqual(restored.webhook_binding(1, 14)["webhook_id"], 900)
-        self.assertEqual(len(restored.rows("PRAGMA table_info(bc_publications)")), 7)
+        self.assertEqual(len(restored.rows("PRAGMA table_info(bc_publications)")), 8)
         self.assertEqual(restored.one("PRAGMA user_version")["user_version"], 7)
 
     def test_upgrade_accepts_already_added_column_and_webhook_table(self):
@@ -85,7 +85,7 @@ class WebhookMigrationTests(unittest.TestCase):
         self.assertEqual(store.publication("book:old-book")["webhook_id"], 900)
         self.assertEqual(store.webhook_binding(1, 14)["webhook_id"], 900)
         self.assertEqual(store.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": 1}, {"version": 2}, {"version": 3}, {"version": 4}, {"version": 5}])
+                         [{"version": version} for version in range(1, 7)])
 
 
 class WebhookStoreTests(unittest.TestCase):

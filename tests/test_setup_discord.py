@@ -157,6 +157,13 @@ class SetupHarness(DiscordHarness):
             for key in ('name', 'topic', 'nsfw'):
                 if key in changes:
                     setattr(channel, key, changes[key])
+            if 'available_tags' in changes:
+                tags = changes['available_tags']
+                for tag in tags:
+                    if not tag.id:
+                        self.seq += 1
+                        tag.id = self.seq
+                channel.available_tags = tags
             return channel
 
         channel.edit = AsyncMock(side_effect=edit)
@@ -341,7 +348,7 @@ class SetupDiscordTests(unittest.IsolatedAsyncioTestCase):
         }
         humans = {target: value.pair() for target, value in channel.overwrites.items()
                   if target is not self.h.bot_member}
-        await self.setup()
+        await self.setup(repair_permissions=True)
         self.assertEqual({target: value.pair() for target, value in channel.overwrites.items()
                           if target is not self.h.bot_member}, humans)
         self.assertTrue(channel.permissions_for(self.h.bot_member).view_channel)
@@ -371,7 +378,8 @@ class SetupDiscordTests(unittest.IsolatedAsyncioTestCase):
 
         cached.set_permissions.side_effect = set_permissions_without_gateway
         self.h.guild.fetch_channels.side_effect = fetch_current_channels
-        await self.setup()
+        self.h.bot.fetch_channel.side_effect = lambda ident: transport_channels[ident]
+        await self.setup(repair_permissions=True)
         cached.set_permissions.assert_awaited_once()
         self.assertFalse(cached.permissions_for(self.h.bot_member).manage_threads)
         self.assertTrue(fresh.permissions_for(self.h.bot_member).manage_threads)
@@ -413,7 +421,7 @@ class SetupDiscordTests(unittest.IsolatedAsyncioTestCase):
         self.existing_configuration(category)
         original_acl = self.acl_snapshot(category)
         del self.h.channels[CONFIG['books']]
-        await self.setup()
+        await self.setup(repair_permissions=True)
         settings = self.assert_ready()
         forum = self.h.channels[settings['books']]
         self.assertNotEqual(forum.id, CONFIG['books'])
@@ -558,6 +566,8 @@ class SetupDiscordTests(unittest.IsolatedAsyncioTestCase):
         self.assert_ready()
         self.assertEqual(self.h.guild.create_category.await_count, 1)
         self.assertEqual(self.store.setup_resource(1, 'category')['channel_id'], created.id)
+        news = self.h.channels[self.store.settings(1)['news']]
+        self.assertIs(news.overwrites[self.h.default_role].send_messages, False)
 
     async def test_uncertain_missing_create_waits_for_explicit_retry(self):
         self.store.reserve_setup_resource(1, 'category')
@@ -615,6 +625,8 @@ class SetupDiscordTests(unittest.IsolatedAsyncioTestCase):
         self.assert_ready()
         self.assertEqual(category.name, NAMES['category'])
         self.assertEqual(self.h.guild.create_category.await_count, 1)
+        news = self.h.channels[self.store.settings(1)['news']]
+        self.assertIs(news.overwrites[self.h.default_role].send_messages, False)
 
     async def test_complete_manual_configuration_is_adopted_without_channel_changes(self):
         self.existing_configuration()

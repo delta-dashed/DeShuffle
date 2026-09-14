@@ -79,7 +79,7 @@ class SetupStoreTests(StoreFixture, unittest.TestCase):
             db.executescript("""
                 DROP TABLE bc_setup_resources;
                 DROP TABLE bc_config_imports;
-                DELETE FROM bc_migrations WHERE version=4;
+                DELETE FROM bc_migrations WHERE version>=4;
                 PRAGMA user_version=7;
                 CREATE TABLE legacy_data(note TEXT);
                 INSERT INTO legacy_data VALUES('preserved');
@@ -97,7 +97,7 @@ class SetupStoreTests(StoreFixture, unittest.TestCase):
         restored = Store(self.path)
         self.assertEqual(restored.setup_resource(1, "news")["channel_id"], 11)
         self.assertEqual(restored.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": i} for i in (1, 2, 3, 4, 5)])
+                         [{"version": i} for i in range(1, 7)])
 
 
 class ConfigImportTests(StoreFixture, unittest.TestCase):

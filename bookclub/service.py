@@ -14,6 +14,7 @@ import logging
 import discord
 
 from .store import ClubError
+from .forum_tags import ForumTags
 from .render import book_pages, catalog_pages, news_content, meeting_lines, pages, safe, book_url
 
 log = logging.getLogger(__name__)
@@ -28,6 +29,8 @@ class Service:
         self.locks = defaultdict(asyncio.Lock)
         self.view_factory = None
         self.book_view_factory = None
+        self.catalog_view_factory = None
+        self.forum_tags = ForumTags(self)
         self.last_essay_scan = {}
 
     async def setup_actor(self, guild, user_id):
@@ -44,14 +47,16 @@ class Service:
             raise ClubError('Настройка каналов доступна владельцу сервера или участнику с правом Manage Server.')
         return member
 
-    async def setup_server(self, guild, actor_id, *, check_only=False, retry_missing=False, category=None):
+    async def setup_server(self, guild, actor_id, *, check_only=False, retry_missing=False, category=None,
+                           repair_permissions=False):
         if guild is None:
             raise ClubError('Настройка доступна только на сервере.')
         from .provision import Provisioner
         return await Provisioner(self).run(guild, actor_id, check_only=check_only,
-                                           retry_missing=retry_missing, category=category)
+                                           retry_missing=retry_missing, category=category,
+                                           repair_permissions=repair_permissions)
 
-    async def actor(self, guild, user_id):
+    async def actor(self, guild, user_id, *, require_access=True):
         if guild is None:
             raise ClubError('Команда доступна только на сервере.')
         if self.guild_ids is not None and guild.id not in self.guild_ids:
@@ -65,7 +70,40 @@ class Service:
             raise ClubError('Нужно выбрать участника, а не бота.')
         organizer = (member.id == guild.owner_id or member.id in settings['organizers']
                      or bool({r.id for r in member.roles} & set(settings['organizer_roles'])))
+        if require_access:
+            await self.forum_access(guild, member)
         return member, organizer
+
+    @staticmethod
+    def can_read(channel, member):
+        permissions = channel.permissions_for(member)
+        return bool(permissions.view_channel and permissions.read_message_history)
+
+    async def fresh_forum(self, guild, purpose='books'):
+        forum = await self.bot.fetch_channel(self.store.settings(guild.id)[purpose])
+        if not isinstance(forum, discord.ForumChannel) or forum.guild.id != guild.id:
+            raise ClubError('Форум клуба недоступен. Организатору: проверьте /club diagnose.')
+        return forum
+
+    async def forum_access(self, guild, member, purpose='books'):
+        forum = await self.fresh_forum(guild, purpose)
+        if not self.can_read(forum, member):
+            raise ClubError('Нет доступа к форуму клуба или его истории. Обратитесь к организатору.')
+        return forum
+
+    def interaction_access(self, interaction):
+        """Check the current interaction member before opening a prefilled modal.
+
+        Channel overwrites come from the gateway cache to meet Discord's modal
+        response deadline; every submission repeats authorization through REST.
+        """
+        if not interaction.guild or not isinstance(interaction.user, discord.Member) or interaction.user.bot:
+            raise ClubError('Откройте действие на сервере клуба.')
+        if self.guild_ids is not None and interaction.guild_id not in self.guild_ids:
+            raise ClubError('Клуб на этом сервере отключён в конфигурации.')
+        forum = interaction.guild.get_channel(self.store.settings(interaction.guild_id)['books'])
+        if not isinstance(forum, discord.ForumChannel) or not self.can_read(forum, interaction.user):
+            raise ClubError('Нет доступа к форуму клуба или его истории. Обратитесь к организатору.')
 
     def interaction_organizer(self, interaction):
         """The interaction carries a fresh Discord Member, without an extra HTTP wait."""
@@ -80,10 +118,11 @@ class Service:
         ids = self.store.rows('''SELECT DISTINCT p.user_id FROM bc_participants p
           JOIN bc_books b ON b.id=p.book_id WHERE b.guild_id=? AND p.present=1''', (guild.id,))
         live = set()
+        forum = await self.fresh_forum(guild) if ids else None
         for row in ids:
             try:
                 member = await guild.fetch_member(row['user_id'])
-                if not member.bot:
+                if not member.bot and self.can_read(forum, member):
                     live.add(member.id)
             except discord.NotFound:
                 for b in self.store.books(guild.id):
@@ -122,15 +161,20 @@ class Service:
                     required += ['send_messages', 'read_message_history']
                 if key in ('books', 'essays'):
                     required += ['send_messages_in_threads']
-                if key == 'books':
+                if key in ('books', 'essays'):
                     required += ['manage_threads']
                 if key == 'essays' and settings['essay_webhooks']:
-                    required += ['manage_webhooks', 'manage_threads']
+                    required += ['manage_webhooks']
                 if key == 'voice':
                     required += ['connect', 'create_events', 'manage_events']
                 missing = [p for p in required if not getattr(permissions, p, False)]
-                if key in ('books', 'essays') and getattr(channel.flags, 'require_tag', False):
-                    missing.append('отключите обязательный тег или настройте форум без обязательных тегов')
+                if key in ('books', 'essays'):
+                    try:
+                        kinds = ('catalog', 'proposed', 'queued', 'reading', 'read') if key == 'books' else ('draft', 'essay', 'imported')
+                        for kind in kinds:
+                            self.forum_tags.creation_tags(guild.id, channel, kind)
+                    except ClubError as exc:
+                        missing.append(str(exc))
                 result.append(f'{key}: ' + ('не хватает: ' + ', '.join(missing) if missing else 'OK'))
             except (discord.HTTPException, ClubError):
                 result.append(f'{key}: канал недоступен или имеет неверный тип')
@@ -280,6 +324,10 @@ class Service:
                 pub = None
         if message is None:
             channel = await self.channel(guild, channel_id, discord.ForumChannel if forum_name else None)
+            tags = []
+            if forum_name:
+                channel = await self.forum_tags.fresh(guild, channel)
+                tags = self.publication_tags(guild, channel, key)
             fresh = self.store.reserve_publication(key, guild.id, channel_id)
             if not fresh:
                 found = await self._find_marker(guild, channel, marker, bool(forum_name))
@@ -287,7 +335,8 @@ class Service:
                     raise ClubError('Предыдущая отправка не подтверждена. Организатору: /club diagnose и /club repair.')
                 channel, message = found
             elif forum_name:
-                created = await channel.create_thread(name=forum_name[:100], content=content, view=view or discord.utils.MISSING, allowed_mentions=NO_MENTIONS)
+                created = await channel.create_thread(name=forum_name[:100], content=content, view=view or discord.utils.MISSING,
+                                                      applied_tags=tags, allowed_mentions=NO_MENTIONS)
                 channel, message = created.thread, created.message
                 created_message = True
             else:
@@ -298,15 +347,31 @@ class Service:
                 created_message = True
         if message.author.id != self.bot.user.id:
             raise ClubError('Сохранённая карточка принадлежит другому автору; бот её не редактирует.')
-        if (managed_name and isinstance(channel, discord.Thread)
-                and channel.owner_id == self.bot.user.id and channel.name != managed_name):
-            channel = await channel.edit(name=managed_name)
+        if managed_name and isinstance(channel, discord.Thread) and channel.owner_id == self.bot.user.id:
+            # Only rename a title that still matches our last assignment. Native
+            # Discord renames are a deliberate override, including after restart.
+            previous_name = pub.get('managed_name') if pub else None
+            if channel.name != managed_name and previous_name and channel.name == previous_name:
+                options = {'name': managed_name}
+                if channel.archived:
+                    options['archived'] = False
+                channel = await channel.edit(**options)
+            if channel.name == managed_name:
+                self.store.remember_publication_name(key, managed_name)
         if not created_message:
             if isinstance(channel, discord.Thread) and channel.archived:
                 channel = await channel.edit(archived=False)
             await message.edit(content=content, view=view, allowed_mentions=NO_MENTIONS)
         self.store.save_publication(key, channel.id, message.id, digest)
         return self.store.publication(key)
+
+    def publication_tags(self, guild, forum, key):
+        if key.startswith('book:'):
+            book = self.store.book(guild.id, key.split(':')[1])
+            return self.forum_tags.creation_tags(guild.id, forum, 'book', book['status'])
+        kind = ('catalog' if key.startswith('catalog:') else
+                'imported' if key.startswith('essay-import:') else 'draft')
+        return self.forum_tags.creation_tags(guild.id, forum, kind)
 
     async def paged_post(self, guild, key, forum_id, name, contents, *, view=None):
         # One forum post; pages are ordinary bot replies inside it. Only catalog is pinned.
@@ -388,11 +453,16 @@ class Service:
             view = self.book_view_factory(b) if self.book_view_factory else None
             await self.paged_post(guild, f'book:{b["id"]}', settings['books'], f'{b["title"]} · {b["author"]}', book_pages(self.store, b, settings), view=view)
             root = self.store.publication(f'book:{b["id"]}')
+            thread = await self.channel(guild, root['channel_id'], discord.Thread)
+            await self.forum_tags.sync_thread_tags(guild, thread, [b['status']])
             for m in self.store.rows('SELECT * FROM bc_meetings WHERE book_id=? AND event_id IS NOT NULL', (b['id'],)):
                 view = self.view_factory(m) if self.view_factory else None
                 await self.upsert(guild, f'meeting:{m["id"]}', root['channel_id'], '\n'.join(meeting_lines(self.store, m, settings)), view=view)
-        catalog = await self.paged_post(guild, f'catalog:{guild.id}', settings['books'], 'Каталог книжного клуба', catalog_pages(self.store, guild.id))
+        catalog_view = self.catalog_view_factory(guild.id) if self.catalog_view_factory else None
+        catalog = await self.paged_post(guild, f'catalog:{guild.id}', settings['books'], 'Каталог книжного клуба',
+                                        catalog_pages(self.store, guild.id), view=catalog_view)
         thread = await self.channel(guild, catalog['channel_id'], discord.Thread)
+        await self.forum_tags.sync_thread_tags(guild, thread, ['catalog'])
         if not thread.flags.pinned:
             # Never replace somebody else's forum pin implicitly.
             threads = await guild.active_threads()
@@ -403,15 +473,14 @@ class Service:
                 raise ClubError('В форуме уже закреплён другой пост. Организатор должен освободить закрепление каталога.')
             await thread.edit(pinned=True)
         await self.upsert(guild, f'news:{guild.id}', settings['news'], news_content(self.store, guild.id, settings))
+        await self.upsert(guild, f'chat:{guild.id}', settings['chat'],
+                          '**Площадь клуба**\nМесто для флуда, свободного общения и разговоров о книгах и обо всём остальном.\n'
+                          f'Организационные объявления — в <#{settings["news"]}>; книги и их обсуждения — в <#{settings["books"]}>.')
 
     async def essay_access(self, guild, book_id, actor_id):
         member, _ = await self.actor(guild, actor_id)
         book = self.store.book(guild.id, book_id)
-        settings = self.store.settings(guild.id)
-        books = await self.channel(guild, settings['books'], discord.ForumChannel)
-        forum = await self.channel(guild, settings['essays'], discord.ForumChannel)
-        if not books.permissions_for(member).view_channel or not forum.permissions_for(member).view_channel:
-            raise ClubError('Нет доступа к книге или форуму эссе. Обратитесь к организатору.')
+        forum = await self.forum_access(guild, member, 'essays')
         return member, book, forum
 
     def essay_starter(self, book, actor_id):
@@ -456,6 +525,7 @@ class Service:
         return hook
 
     async def publish_essay_starter(self, guild, forum, key, name, content, member):
+        forum = await self.forum_tags.fresh(guild, forum)
         marker = f'\n-# bc:{key}'
         pub = self.store.publication(key)
         if pub:
@@ -468,10 +538,12 @@ class Service:
         else:
             if not forum.permissions_for(guild.me).manage_threads:
                 raise ClubError('Для работы с темами вебхука боту нужно право Manage Threads в форуме эссе.')
+            tags = self.publication_tags(guild, forum, key)
             hook = await self.essay_webhook(guild, forum)
             self.store.reserve_publication(key, guild.id, forum.id, webhook_id=hook.id)
             message = await hook.send(content + marker, thread_name=name, username=member.display_name[:80],
-                                      avatar_url=str(member.display_avatar.url), wait=True, allowed_mentions=NO_MENTIONS)
+                                      avatar_url=str(member.display_avatar.url), wait=True,
+                                      applied_tags=tags, allowed_mentions=NO_MENTIONS)
             thread = await self.channel(guild, message.channel.id, discord.Thread)
         self.store.save_publication(key, thread.id, message.id)
         return self.store.publication(key)
@@ -538,8 +610,10 @@ class Service:
                 except discord.NotFound:
                     self.store.delete_essay(guild.id, channel_id=pub['channel_id'])
                     self.store.forget_publication(pub['key'])
-            if getattr(forum.flags, 'require_tag', False):
-                raise ClubError('В форуме эссе обязателен тег. Организатору: /club diagnose и настройка форума.')
+            forum = await self.forum_tags.fresh(guild, forum)
+            if not forum.permissions_for(member).send_messages:
+                raise ClubError('Для нового эссе нужно право создавать публикации в форуме эссе.')
+            self.forum_tags.creation_tags(guild.id, forum, 'draft')
             author_name = ' '.join(member.display_name.split())[:40]
             book_name = ' '.join(book['title'].split())
             name = f'{book_name[:100 - len(author_name) - 10]} · Эссе · {author_name}'
@@ -587,6 +661,7 @@ class Service:
             self.store.register_essay(thread.guild.id, target_book['id'], thread.id, thread.id,
                                       old['author_id'], thread.name, thread.jump_url, correct=correct,
                                       managed=old['managed'], submitted=old['submitted'])
+            await self.forum_tags.sync_thread_tags(thread.guild, thread, ['essay', 'imported'])
             return True
         managed_pub = self.store.one("SELECT * FROM bc_publications WHERE guild_id=? AND channel_id=? AND key LIKE 'essay-space:%'",
                                      (thread.guild.id, thread.id))
@@ -632,6 +707,7 @@ class Service:
                 content = self.essay_starter(self.store.book(thread.guild.id, book_id), author_id) + '\n-# bc:' + key
                 if content != starter.content:
                     await self.edit_essay_starter(thread, starter, content, pub)
+            await self.forum_tags.sync_thread_tags(thread.guild, thread, ['essay' if submitted else 'draft'])
             return True
         if old and not correct:
             # The confirmed ID binding always wins over a renamed title.
@@ -648,6 +724,7 @@ class Service:
             return False
         # Historical essays retain their author even after that person leaves.
         self.store.register_essay(thread.guild.id, book_id, thread.id, thread.id, thread.owner_id, thread.name, thread.jump_url, correct=correct)
+        await self.forum_tags.sync_thread_tags(thread.guild, thread, ['essay'])
         return True
 
     async def scan_essays(self, guild):
@@ -710,10 +787,14 @@ class Service:
             elif kind == 'escalate':
                 recipients |= await self.organizers(guild)
         failures = []
+        books_forum = await self.fresh_forum(guild) if recipients else None
+        essays_forum = await self.fresh_forum(guild, 'essays') if recipients and kind.startswith('essay') else None
         for user_id in sorted(recipients):
             try:
                 member = await guild.fetch_member(user_id)
-                if member.bot:
+                if member.bot or not self.can_read(books_forum, member):
+                    continue
+                if essays_forum is not None and not self.can_read(essays_forum, member):
                     continue
                 if kind == 'participants' and settings['reminder_role'] and settings['reminder_role'] not in {r.id for r in member.roles}:
                     continue

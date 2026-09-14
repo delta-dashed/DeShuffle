@@ -151,6 +151,16 @@ class Store:
                 db.execute("""CREATE INDEX IF NOT EXISTS bc_import_source_items
                   ON bc_import_sources(guild_id,item_key)""")
                 db.execute("INSERT INTO bc_migrations(version) VALUES(5)")
+            if not db.execute("SELECT 1 FROM bc_migrations WHERE version=6").fetchone():
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_forum_tags(
+                  guild_id INTEGER NOT NULL, forum_id INTEGER NOT NULL,
+                  purpose TEXT NOT NULL, tag_id INTEGER NOT NULL,
+                  PRIMARY KEY(guild_id,forum_id,purpose), UNIQUE(guild_id,forum_id,tag_id))""")
+                for table, name in (("bc_publications", "managed_name"), ("bc_setup_resources", "name")):
+                    columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+                    if name not in columns:
+                        db.execute(f"ALTER TABLE {table} ADD COLUMN {name} TEXT")
+                db.execute("INSERT INTO bc_migrations(version) VALUES(6)")
 
     @contextmanager
     def tx(self):
@@ -296,6 +306,22 @@ class Store:
         with self.tx() as db:
             db.execute("DELETE FROM bc_setup_resources WHERE guild_id=? AND purpose=?", (guild_id, purpose))
 
+    def remember_setup_name(self, guild_id, purpose, name):
+        """Remember a Discord name without rewriting the channel or club settings."""
+        with self.tx() as db:
+            db.execute("UPDATE bc_setup_resources SET name=? WHERE guild_id=? AND purpose=?",
+                       (name, guild_id, purpose))
+
+    def bindings(self, guild_id, forum_id):
+        return self.rows("SELECT * FROM bc_forum_tags WHERE guild_id=? AND forum_id=? ORDER BY purpose",
+                         (guild_id, forum_id))
+
+    def bind_tag(self, guild_id, forum_id, purpose, tag_id):
+        with self.tx() as db:
+            db.execute("""INSERT INTO bc_forum_tags(guild_id,forum_id,purpose,tag_id) VALUES(?,?,?,?)
+              ON CONFLICT(guild_id,forum_id,purpose) DO UPDATE SET tag_id=excluded.tag_id""",
+                       (guild_id, forum_id, purpose, tag_id))
+
     def _get(self, db, table, guild_id, ident):
         if table not in ("bc_books", "bc_meetings"):
             raise ValueError(table)
@@ -325,6 +351,34 @@ class Store:
                        VALUES(?,?,?,?,?,(SELECT COALESCE(MAX(position),0)+1 FROM bc_books WHERE guild_id=?),?)""",
                        (uuid.uuid4().hex, guild_id, title, author, materials, guild_id, str(request_key)))
             return dict(db.execute("SELECT * FROM bc_books WHERE guild_id=? AND request_key=?", (guild_id, str(request_key))).fetchone())
+
+    def create_books(self, guild_id, books, request_key):
+        """Add a validated batch atomically; retries and matching books are skipped."""
+        from .book_list import book_identity, validate_books
+
+        self.settings(guild_id)
+        books = validate_books(books)
+        created, skipped = [], 0
+        with self.tx() as db:
+            existing = db.execute("SELECT * FROM bc_books WHERE guild_id=?", (guild_id,)).fetchall()
+            identities = {book_identity(row) for row in existing}
+            requests = {row["request_key"] for row in existing}
+            position = max((row["position"] for row in existing), default=0)
+            for index, book in enumerate(books):
+                key = f"{request_key}:{index}"
+                identity = book_identity(book)
+                if key in requests or identity in identities:
+                    skipped += 1
+                    continue
+                position += 1
+                ident = uuid.uuid4().hex
+                db.execute("""INSERT INTO bc_books(id,guild_id,title,author,materials,position,request_key)
+                  VALUES(?,?,?,?,?,?,?)""", (ident, guild_id, book["title"], book["author"],
+                                             book["materials"], position, key))
+                identities.add(identity)
+                requests.add(key)
+                created.append(dict(db.execute("SELECT * FROM bc_books WHERE id=?", (ident,)).fetchone()))
+        return created, skipped
 
     def update_book(self, guild_id, book_id, **fields):
         if not fields or not set(fields) <= {"status", "position", "deadline", "title", "author", "materials"}:
@@ -668,6 +722,11 @@ class Store:
     def forget_publication(self, key):
         with self.tx() as db:
             db.execute("DELETE FROM bc_publications WHERE key=?", (key,))
+
+    def remember_publication_name(self, key, name):
+        """Track only the last bot-assigned name, preserving manual Discord renames."""
+        with self.tx() as db:
+            db.execute("UPDATE bc_publications SET managed_name=? WHERE key=?", (name, key))
 
     def webhook_binding(self, guild_id, channel_id):
         return self.one("SELECT * FROM bc_webhooks WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
