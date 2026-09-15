@@ -96,11 +96,15 @@ class CatalogView(CatalogGuardedView):
     def __init__(self, service, guild_id):
         super().__init__(timeout=None)
         self.service, self.guild_id = service, guild_id
-        for action, label in [('add', 'Добавить книгу'), ('import', 'Загрузить список')]:
+        for action, label in [('add', 'Добавить книгу'), ('import', 'Загрузить список'), ('queue', 'Порядок чтения')]:
             button = discord.ui.Button(label=label, custom_id=f'bc:catalog:{guild_id}:{action}',
                 style=discord.ButtonStyle.primary if action == 'add' else discord.ButtonStyle.secondary)
             async def callback(interaction, selected=action):
                 _same_guild(interaction, self.guild_id)
+                if selected == 'queue':
+                    from .queue_controls import open_queue
+                    await open_queue(self.service, interaction)
+                    return
                 # Modal opening must acknowledge within three seconds. Only the
                 # submitted action reads private state and performs fresh REST checks.
                 if selected == 'import' and not self.service.interaction_organizer(interaction):

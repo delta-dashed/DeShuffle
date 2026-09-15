@@ -277,6 +277,8 @@ class Club(commands.Cog):
         self.service.view_factory = lambda meeting: MeetingView(self, meeting)
         self.service.book_view_factory = lambda book: BookView(self, book)
         self.service.catalog_view_factory = lambda guild_id: CatalogView(self.service, guild_id)
+        from .format_controls import FormatView
+        self.service.format_view_factory = lambda guild_id: FormatView(self.service, guild_id)
         self.importer = ArchiveImporter(self.service, import_config)
 
     async def cog_load(self):
@@ -290,6 +292,8 @@ class Club(commands.Cog):
             self.bot.add_view(BookView(self, book))
         for row in self.store.rows('SELECT guild_id FROM bc_settings'):
             self.bot.add_view(CatalogView(self.service, row['guild_id']))
+            from .format_controls import FormatView
+            self.bot.add_view(FormatView(self.service, row['guild_id']))
         self.worker.start()
 
     async def cog_unload(self):
@@ -396,11 +400,8 @@ class Club(commands.Cog):
     @club.command(name='books', description='Книги и порядок чтения')
     async def books(self, ctx):
         await catalog_access(self.service, ctx.guild, ctx.author.id, write=False)
-        lines = []
-        for b in self.store.books(ctx.guild.id):
-            url = book_url(self.store, b)
-            lines.append(f'{b["position"]}. {safe(b["title"])} · {safe(b["author"])} — {STATUSES[b["status"]]}' + (f'\n{url}' if url else ''))
-        for index, page in enumerate(pages(lines)):
+        from .render import catalog_pages
+        for index, page in enumerate(catalog_pages(self.store, ctx.guild.id)):
             await self.say(ctx, page, view=CatalogView(self.service, ctx.guild.id) if index == 0 else None)
 
     @club.command(name='book_add', description='Предложить книгу')
@@ -422,9 +423,9 @@ class Club(commands.Cog):
             raise ClubError('Прикрепите файл к slash-команде /club library import: предпросмотр виден только вам.')
         await preview_book_file(ctx.interaction, self.service, file)
 
-    @club.command(name='book_edit', description='Изменить книгу, очередь и срок эссе')
+    @club.command(name='book_edit', description='Изменить книгу, очередь и план встреч')
     async def book_edit(self, ctx, book: str, status: Optional[Literal['Предложено', 'В очереди', 'Читаем', 'Прочитано']] = None,
-                        position: Optional[int] = None, deadline: Optional[str] = None, title: Optional[str] = None,
+                        position: Optional[int] = None, title: Optional[str] = None,
                         author: Optional[str] = None, materials: Optional[str] = None, reading_meetings: Optional[str] = None):
         async with self.service.locks[ctx.guild.id]:
             await self.organizer(ctx)
@@ -439,9 +440,7 @@ class Club(commands.Cog):
                 elif value.isdecimal() and len(value) <= 3:
                     fields['reading_meetings'] = int(value)
                 else:
-                    raise ClubError('План: целое число встреч по книге от 1 до 100; «-» убирает план. Разбор эссе добавляется отдельно: +1.')
-            if deadline is not None:
-                fields['deadline'] = None if deadline == '-' else parse_time(deadline, self.store.settings(ctx.guild.id)['timezone'])
+                    raise ClubError('План: целое число встреч по книге от 1 до 100; «-» возвращает стандартные 3. Разбор эссе добавляется отдельно: +1.')
             self.store.update_book(ctx.guild.id, b['id'], status_actor_id=ctx.author.id, **fields)
             await self.service.refresh(ctx.guild)
         await self.say(ctx, 'Книга обновлена; обсуждение и история сохранены.')

@@ -239,6 +239,25 @@ class Store:
                   after_id INTEGER NOT NULL, content TEXT NOT NULL, attachments TEXT NOT NULL,
                   components TEXT NOT NULL, forum_name TEXT, created_at INTEGER NOT NULL, nonce TEXT)""")
                 db.execute("INSERT INTO bc_migrations(version) VALUES(10)")
+            if not db.execute("SELECT 1 FROM bc_migrations WHERE version=11").fetchone():
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_club_format(
+                  guild_id INTEGER PRIMARY KEY, body TEXT NOT NULL, essay_lead_hours INTEGER NOT NULL,
+                  revision INTEGER NOT NULL, actor_id INTEGER, updated_at INTEGER,
+                  schedule_ids TEXT NOT NULL DEFAULT '[]')""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_format_audit(
+                  id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, revision INTEGER NOT NULL,
+                  actor_id INTEGER NOT NULL, created_at INTEGER NOT NULL,
+                  old_body TEXT NOT NULL, new_body TEXT NOT NULL, old_hours INTEGER NOT NULL, new_hours INTEGER NOT NULL,
+                  old_events TEXT NOT NULL DEFAULT '[]', new_events TEXT NOT NULL DEFAULT '[]',
+                  UNIQUE(guild_id,revision))""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_schedule_events(
+                  guild_id INTEGER NOT NULL, event_id INTEGER NOT NULL, name TEXT NOT NULL,
+                  start INTEGER, end INTEGER, voice_id INTEGER, status TEXT NOT NULL,
+                  PRIMARY KEY(guild_id,event_id))""")
+                db.execute("""CREATE TABLE IF NOT EXISTS bc_event_intents(
+                  meeting_id TEXT PRIMARY KEY REFERENCES bc_meetings(id),
+                  after_id INTEGER NOT NULL, payload TEXT NOT NULL)""")
+                db.execute("INSERT INTO bc_migrations(version) VALUES(11)")
 
     @contextmanager
     def tx(self):
@@ -537,6 +556,8 @@ class Store:
         settings = self.settings(guild_id)
         changed = False
         with self.tx() as db:
+            for row in db.execute('SELECT id FROM bc_books WHERE guild_id=?', (guild_id,)).fetchall():
+                self._essay_schedule(db, row['id'], settings)
             books = [dict(row) for row in db.execute("""SELECT * FROM bc_books WHERE guild_id=?
               AND status_automation=1 AND status_automation_pending=0 ORDER BY position,id""", (guild_id,))]
             # Free a completed current book before considering a newly started
@@ -617,6 +638,7 @@ class Store:
                   meeting_id,guild_id,actor_id,old_kind,new_kind,created_at) VALUES(?,?,?,?,?,?)""",
                            (meeting_id, guild_id, actor_id, meeting["plan_kind"], kind, self.clock()))
                 self._schedule(db, meeting_id, settings)
+                self._essay_schedule(db, meeting['book_id'], settings)
             return self._get(db, "bc_meetings", guild_id, meeting_id)
 
     def sync_event(self, guild_id, meeting_id, *, event_id, name, start, end, voice_id, status, status_confirmed=True):
@@ -656,6 +678,7 @@ class Store:
                   WHERE id=? AND status_automation=1""", (m["book_id"],))
             self._auto_book_status(db, m["book_id"], settings, meeting_id=meeting_id)
             self._schedule(db, meeting_id, settings)
+            self._essay_schedule(db, m['book_id'], settings)
             return True
 
     def _job(self, db, m, kind, target, due):
@@ -855,6 +878,21 @@ class Store:
 
     def _essay_schedule(self, db, book_id, settings):
         b = dict(db.execute("SELECT * FROM bc_books WHERE id=?", (book_id,)).fetchone())
+        # A date entered by hand is never authoritative. Only one confirmed,
+        # scheduled essay discussion can define the deadline; ambiguity pauses it.
+        meetings = db.execute("""SELECT * FROM bc_meetings WHERE book_id=? AND plan_kind='essay'
+          AND (status<>'cancelled' OR event_status_confirmed=0)""", (book_id,)).fetchall()
+        rule = db.execute('SELECT essay_lead_hours FROM bc_club_format WHERE guild_id=?', (b['guild_id'],)).fetchone()
+        lead = rule['essay_lead_hours'] if rule else 24
+        deadline = None
+        if len(meetings) == 1:
+            m = meetings[0]
+            if (m['status'] in ('scheduled', 'active') and m['event_status_confirmed']
+                    and m['event_id'] and m['voice_id'] and m['start']):
+                deadline = m['start'] - lead * 3600
+        if b['deadline'] != deadline:
+            db.execute('UPDATE bc_books SET deadline=?,revision=revision+1 WHERE id=?', (deadline, book_id))
+            b['deadline'], b['revision'] = deadline, b['revision'] + 1
         db.execute("UPDATE bc_jobs SET state='cancelled' WHERE entity_id=? AND state='pending' AND revision<>?", (book_id, b["revision"]))
         if b["deadline"]:
             for kind, due in (("essay", b["deadline"] - int(settings["essay_hours"] * 3600)), ("essay_due", b["deadline"])):

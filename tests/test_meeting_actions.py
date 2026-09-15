@@ -209,7 +209,7 @@ class MeetingActionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result['revision'], previous['revision'])
         self.assertFalse(self.store.plan(1, result['id'], 1)['ready'])
         self.assertTrue(all(job['revision'] == result['revision'] for job in self.jobs()))
-        self.assertIn(f'[bookclub:{result["id"]}]', self.event.description)
+        self.assertNotIn('[bookclub:', self.event.description)
 
     async def test_boundary_keeps_invitation_original_due(self):
         self.action('offer', organizer=True, candidate=1)

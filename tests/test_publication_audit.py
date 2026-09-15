@@ -148,7 +148,10 @@ class PublicationAuditTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def test_failed_essay_scan_defers_only_essay_reminders_until_success(self):
         self.store.set_published(1)
         meeting_job = self.jobs()[0]
-        self.store.update_book(1, self.book['id'], deadline=meeting_job['due'] + 86400)
+        discussion = self.essay_event(meeting_job['due'] + 86400)
+        self.h.event(discussion['event_id'], name=discussion['name'],
+                     start_time=datetime.fromtimestamp(discussion['start'], timezone.utc),
+                     end_time=datetime.fromtimestamp(discussion['end'], timezone.utc))
         self.now = meeting_job['due']
         essay_job = next(j for j in self.store.due_jobs(1) if j['kind'] == 'essay')
         self.service.scan_essays = AsyncMock(side_effect=ClubError('Форум временно недоступен'))

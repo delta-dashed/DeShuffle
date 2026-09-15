@@ -1,6 +1,8 @@
 """Conservative book lifecycle rules, driven by observed Discord events only."""
 from __future__ import annotations
 
+from .club_format import reading_count
+
 
 PLAN_KINDS = {'reading': 'По книге', 'essay': 'Обсуждение эссе'}
 
@@ -20,7 +22,7 @@ def desired_book_status(book, meetings):
     observed = [meeting for meeting in planned
                 if meeting.get('event_id') and meeting.get('voice_id')
                 and meeting.get('plan_kind') in PLAN_KINDS and meeting.get('event_status_confirmed', True)]
-    count = book.get('reading_meetings')
+    count = reading_count(book)
     if (count is not None and len(planned) == count + 1
             and len(observed) == len(planned)
             and sum(meeting['plan_kind'] == 'reading' for meeting in observed) == count

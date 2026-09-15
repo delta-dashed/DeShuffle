@@ -367,7 +367,7 @@ class AutomaticBookStatusTests(AutomaticBookStatusFixture, unittest.TestCase):
             self.assertEqual(migrated.rows('SELECT * FROM ' + table), rows)
         restarted = Store(self.path, clock=lambda: self.now)
         self.assertEqual(restarted.book(1, self.book), book)
-        self.assertEqual(restarted.one('SELECT MAX(version) AS version FROM bc_migrations')['version'], 10)
+        self.assertEqual(restarted.one('SELECT MAX(version) AS version FROM bc_migrations')['version'], 11)
 
 
 class AutomaticBookStatusDiscordTests(AutomaticBookStatusFixture, unittest.IsolatedAsyncioTestCase):

@@ -23,8 +23,11 @@ def stub_delivery_transport(test):
         return await hook.send(*args, **kwargs)
     async def channel_send(channel, *args, **kwargs):
         return await channel.send(*args, **kwargs)
+    async def event_send(guild, **kwargs):
+        return await guild.create_scheduled_event(**kwargs)
     for target, effect in (('bookclub.service.create_thread_once', forum_send),
                            ('bookclub.service.channel_send_once', channel_send),
+                           ('bookclub.service.create_event_once', event_send),
                            ('bookclub.service.webhook_send_once', webhook_send),
                            ('bookclub.import_publication.webhook_send_once', webhook_send)):
         transport = patch(target, side_effect=effect)
@@ -59,6 +62,11 @@ class ClubFixture:
         values.update(changes)
         values['end'] = values['end'] or values['start'] + 5400
         return self.store.sync_event(1, m['id'], **values)
+
+    def essay_event(self, deadline):
+        m = self.store.draft_meeting(1, self.book['id'], 'Обсуждение эссе', 'Эссе', 'Вся книга', 'essay-event', plan_kind='essay')
+        self.sync(m, event_id=999, start=deadline + 86400)
+        return self.store.meeting(1, m['id'])
 
     def action(self, action, actor=1, m=None, **kwargs):
         m = self.store.meeting(1, (m or self.meeting)['id'])
@@ -275,15 +283,15 @@ class ClubStateTests(ClubFixture, unittest.TestCase):
         self.store.delete_essay(1, channel_id=502)
         self.assertTrue(self.store.one('SELECT deleted FROM bc_essays WHERE source_id=502')['deleted'])
 
-    def test_essay_deadline_is_explicit_and_config_replans_it(self):
+    def test_essay_deadline_follows_discussion_and_config_replans_reminder(self):
         self.assertFalse(self.store.rows("SELECT * FROM bc_jobs WHERE kind LIKE 'essay%'"))
-        self.store.update_book(1, self.book['id'], deadline=self.now + 86400 * 3)
+        discussion = self.essay_event(self.now + 86400 * 3)
         old = self.jobs(self.book)
         self.store.configure(1, {**CONFIG, 'essay_hours': 12})
         fresh = self.jobs(self.book)
         self.assertEqual(next(j['due'] for j in fresh if j['kind'] == 'essay'), self.now + 86400 * 3 - 43200)
         self.assertTrue(all(not self.store.claim_job(j['key']) for j in old))
-        self.store.update_book(1, self.book['id'], deadline=None)
+        self.sync(discussion, status='cancelled')
         self.assertFalse(self.jobs(self.book))
 
     def test_long_catalog_and_book_cards_fit_discord_and_order_is_stable(self):

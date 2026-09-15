@@ -47,7 +47,7 @@ class EssayMigrationTests(unittest.TestCase):
             self.assertEqual(migrated.one("SELECT note FROM voice_sessions")["note"], "legacy")
             self.assertEqual(migrated.one("PRAGMA user_version")["user_version"], 7)
             self.assertEqual(migrated.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                             [{"version": version} for version in range(1, 11)])
+                             [{"version": version} for version in range(1, 12)])
 
             migrated.register_essay(1, "old-book", 100, 100, 10, "Черновик", "new-url",
                                     managed=True, submitted=False)
@@ -58,7 +58,7 @@ class EssayMigrationTests(unittest.TestCase):
             self.assertEqual(restored.one("PRAGMA user_version")["user_version"], 7)
             self.assertEqual(len(restored.rows("PRAGMA table_info(bc_essays)")), 10)
             self.assertEqual(restored.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                             [{"version": version} for version in range(1, 11)])
+                             [{"version": version} for version in range(1, 12)])
 
 
 class EssayStoreTests(unittest.TestCase):

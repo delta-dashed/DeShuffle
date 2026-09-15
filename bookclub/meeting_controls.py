@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 
-from .render import meeting_lines, safe, time_label
+from .render import meeting_lines, safe, time_label, plan_label
 from .store import ClubError
 from .meeting_actions import create_meeting, move_meeting, edit_meeting, cancel_meeting, _organizer, _current
 
@@ -246,8 +246,7 @@ async def open_book_meetings(cog, interaction, book_id, *, page=0):
     count = {state: sum(m['status'] == state for m in meetings) for state in ('scheduled', 'active', 'completed', 'cancelled', 'draft')}
     unavailable = sum(m['status'] == 'cancelled' and not m.get('event_status_confirmed', 1) for m in meetings)
     count['cancelled'] -= unavailable
-    plan = (f'План: {book["reading_meetings"]} встреч по книге + 1 обсуждение эссе.\n' if book.get('reading_meetings') is not None
-            else 'Количество встреч ещё не задано в плане книги.\n')
+    plan = f'План: {plan_label(book)}.\n'
     text = (f'**Встречи · {safe(book["title"])}**\n' + plan +
             f'Предстоящих: {count["scheduled"]} · идут: {count["active"]} · завершённых: {count["completed"]} · отменённых: {count["cancelled"]}.\n'
             'Добавьте встречу или выберите существующую, чтобы изменить дату, длительность, главы или отменить её.\n'

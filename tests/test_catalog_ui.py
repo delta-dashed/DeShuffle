@@ -42,7 +42,7 @@ class CatalogUITests(unittest.IsolatedAsyncioTestCase):
     async def test_persistent_catalog_buttons_open_modals_without_http(self):
         view = CatalogView(self.service, 1)
         self.assertTrue(view.is_persistent())
-        self.assertEqual([c.custom_id for c in view.children], ['bc:catalog:1:add', 'bc:catalog:1:import'])
+        self.assertEqual([c.custom_id for c in view.children], ['bc:catalog:1:add', 'bc:catalog:1:import', 'bc:catalog:1:queue'])
         interaction = self.h.interaction(99)
         await view.children[0].callback(interaction)
         self.assertIsInstance(interaction.response.send_modal.await_args.args[0], AddBookModal)

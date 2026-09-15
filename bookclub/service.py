@@ -10,14 +10,17 @@ from datetime import datetime, timezone
 from collections import defaultdict
 import hashlib
 import logging
+import json
 
 import discord
 
 from .store import ClubError
 from .forum_tags import ForumTags
 from .publication_delivery import DeliveryJournal
-from .single_delivery import channel_send_once, create_thread_once, webhook_send_once
+from .single_delivery import channel_send_once, create_thread_once, webhook_send_once, create_event_once
+from .event_delivery import event_description, find_draft_events
 from .render import book_pages, catalog_pages, news_content, meeting_lines, pages, safe, book_url
+from .club_format import format_content, get_format
 
 log = logging.getLogger(__name__)
 NO_MENTIONS = discord.AllowedMentions.none()
@@ -32,6 +35,7 @@ class Service:
         self.view_factory = None
         self.book_view_factory = None
         self.catalog_view_factory = None
+        self.format_view_factory = None
         self.forum_tags = ForumTags(self)
         self.delivery = DeliveryJournal(self)
         self.last_essay_scan = {}
@@ -231,11 +235,12 @@ class Service:
 
     async def reconcile(self, guild):
         events = await guild.fetch_scheduled_events()
+        self.cache_schedule(guild, events)
         by_id = {e.id: e for e in events}
         changed = False
         for m in self.store.rows('SELECT * FROM bc_meetings WHERE guild_id=?', (guild.id,)):
             if not m['event_id']:
-                matches = [e for e in events if f'[bookclub:{m["id"]}]' in (e.description or '')]
+                matches = find_draft_events(self.store, guild, m, events, self.bot.user.id)
                 if len(matches) == 1:
                     changed = self.sync(guild, m, matches[0]) or changed
                 elif len(matches) > 1:
@@ -246,6 +251,18 @@ class Service:
                 changed = await self.sync_one(guild, m) or changed
         return self.store.reconcile_book_statuses(guild.id) or changed
 
+    def cache_schedule(self, guild, events):
+        selected = set(json.loads(get_format(self.store, guild.id)['schedule_ids']))
+        with self.store.tx() as db:
+            db.execute('DELETE FROM bc_schedule_events WHERE guild_id=?', (guild.id,))
+            for event in events:
+                if (event.id in selected and event.guild_id == guild.id
+                        and event.entity_type == discord.EntityType.voice):
+                    db.execute('INSERT INTO bc_schedule_events VALUES(?,?,?,?,?,?,?)', (
+                        guild.id, event.id, event.name, int(event.start_time.timestamp()),
+                        int(event.end_time.timestamp()) if event.end_time else None,
+                        event.channel_id, event.status.name))
+
     async def create_event(self, guild, meeting, start, end):
         if meeting['event_id']:
             return meeting
@@ -253,11 +270,19 @@ class Service:
             raise ClubError('Укажите будущую дату и окончание позже начала.')
         settings = self.store.settings(guild.id)
         voice = await self.channel(guild, settings['voice'], discord.VoiceChannel)
-        event = await guild.create_scheduled_event(
+        description = event_description(self.store, guild.id, meeting)
+        events = await guild.fetch_scheduled_events()
+        with self.store.tx() as db:
+            if db.execute('SELECT 1 FROM bc_event_intents WHERE meeting_id=?', (meeting['id'],)).fetchone():
+                raise ClubError('Создание события уже начато. Проверьте /club recover_event перед повтором.')
+            db.execute('INSERT INTO bc_event_intents VALUES(?,?,?)', (meeting['id'],
+                       max((e.id for e in events), default=0), json.dumps(dict(name=meeting['name'],
+                       description=description, voice_id=voice.id, start=start, end=end))))
+        event = await create_event_once(guild,
             name=meeting['name'], start_time=datetime.fromtimestamp(start, timezone.utc),
             end_time=datetime.fromtimestamp(end, timezone.utc),
             channel=voice, entity_type=discord.EntityType.voice, privacy_level=discord.PrivacyLevel.guild_only,
-            description=f'{meeting["part"]}; до главы {meeting["chapter"]} включительно.\n[bookclub:{meeting["id"]}]',
+            description=description,
             reason='Встреча книжного клуба')
         self.sync(guild, meeting, event)
         return self.store.meeting(guild.id, meeting['id'])
@@ -382,7 +407,7 @@ class Service:
                 'imported' if key.startswith('essay-import:') else 'draft')
         return self.forum_tags.creation_tags(guild.id, forum, kind)
 
-    async def paged_post(self, guild, key, forum_id, name, contents, *, view=None):
+    async def paged_post(self, guild, key, forum_id, name, contents, *, view=None, inline_first=False):
         # One forum post; pages are ordinary bot replies inside it. Only catalog is pinned.
         root = self.store.publication(key)
         if root:
@@ -419,6 +444,40 @@ class Service:
             if index + 1 < len(publications):
                 controls.add_item(discord.ui.Button(label='Следующая →', url=url(publications[index + 1]), row=0))
             return controls
+
+        if inline_first:
+            # The catalog opens on the current reading and next ten books.
+            # Remaining sections stay in the same thread and keep stable IDs.
+            sections = []
+            for index, content in enumerate(contents[1:], 1):
+                section = self.store.publication(f'{key}:page:{index}')
+                if not section or not section['message_id']:
+                    section = await self.upsert(guild, f'{key}:page:{index}', root['channel_id'], content)
+                sections.append(section)
+            changed_ids = False
+            for index, content in enumerate(contents[1:]):
+                section = await self.upsert(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
+                                           view=navigation(index, sections))
+                changed_ids = changed_ids or section['message_id'] != sections[index]['message_id']
+                sections[index] = section
+            if changed_ids:
+                for index, content in enumerate(contents[1:]):
+                    await self.upsert(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
+                                      view=navigation(index, sections))
+            first = contents[0]
+            links = []
+            for index, pub in enumerate(sections[:2]):
+                heading = contents[index + 1].splitlines()[0]
+                label = safe(heading.lstrip('# '))[:70] if heading.startswith('#') else f'Продолжение {index + 1}'
+                links.append(f'[{label}]({url(pub)})')
+            if links:
+                first += '\n\n' + ' · '.join(links)
+            root = await self.upsert(guild, key, forum_id, first, forum_name=name, view=view)
+            for old in self.store.rows('SELECT * FROM bc_publications WHERE key LIKE ?', (key + ':page:%',)):
+                if int(old['key'].rsplit(':', 1)[1]) > len(sections):
+                    await self.upsert(guild, old['key'], root['channel_id'],
+                        'Каталог обновлён. Текущая книга и очередь — в начале темы.', view=navigation(0, []))
+            return root
 
         if len(contents) > 1:
             publications = []
@@ -469,7 +528,7 @@ class Service:
                 await self.upsert(guild, f'meeting:{m["id"]}', root['channel_id'], '\n'.join(meeting_lines(self.store, m, settings)), view=view)
         catalog_view = self.catalog_view_factory(guild.id) if self.catalog_view_factory else None
         catalog = await self.paged_post(guild, f'catalog:{guild.id}', settings['books'], 'Каталог книжного клуба',
-                                        catalog_pages(self.store, guild.id), view=catalog_view)
+                                        catalog_pages(self.store, guild.id), view=catalog_view, inline_first=True)
         thread = await self.channel(guild, catalog['channel_id'], discord.Thread)
         await self.forum_tags.sync_thread_tags(guild, thread, ['catalog'])
         if not thread.flags.pinned:
@@ -485,6 +544,13 @@ class Service:
         await self.upsert(guild, f'chat:{guild.id}', settings['chat'],
                           '**Площадь клуба**\nМесто для флуда, свободного общения и разговоров о книгах и обо всём остальном.\n'
                           f'Организационные объявления — в <#{settings["news"]}>; книги и их обсуждения — в <#{settings["books"]}>.')
+        rules_view = self.format_view_factory(guild.id) if self.format_view_factory else None
+        rules = await self.upsert(guild, f'format:{guild.id}', settings['news'],
+                                  format_content(self.store, guild.id), view=rules_view)
+        channel = await self.channel(guild, rules['channel_id'])
+        message = await channel.fetch_message(rules['message_id'])
+        if not message.pinned:
+            await message.pin(reason='Общий формат книжного клуба')
 
     async def essay_access(self, guild, book_id, actor_id):
         member, _ = await self.actor(guild, actor_id)

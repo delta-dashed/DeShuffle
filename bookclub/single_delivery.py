@@ -119,6 +119,13 @@ async def create_thread_once(forum, **kwargs):
     return result
 
 
+async def create_event_once(guild, **kwargs):
+    local_guild, state = _isolated_channel(guild)
+    event = await local_guild.create_scheduled_event(**kwargs)
+    event._state = state
+    return event
+
+
 async def webhook_send_once(webhook, *args, **kwargs):
     """Send a webhook message/thread without ambiguous automatic retries."""
     session = getattr(webhook, 'session', None)

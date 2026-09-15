@@ -49,7 +49,7 @@ class MeetingControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         interaction.response.defer.assert_awaited_once_with(ephemeral=True)
         reply = interaction.followup.send.call_args
         self.assertTrue(reply.kwargs['ephemeral'])
-        self.assertIn('4 встреч по книге + 1 обсуждение эссе', reply.args[0])
+        self.assertIn('4 встречи по книге + обсуждение эссе', reply.args[0])
         self.assertIn('Предстоящих: 1', reply.args[0])
         self.assertIsInstance(reply.kwargs['view'], BookMeetings)
         self.h.guild.create_scheduled_event.assert_not_awaited()

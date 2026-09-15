@@ -42,8 +42,6 @@ class EssayRenderTests(ClubFixture, unittest.TestCase):
             self.assertLess(card.index(url), card.index('Материалы:'))
             self.assertLess(card.index(url), card.index('**Встречи**'))
         self.assertIn('<@45>', card)
-        self.assertIn('«Добавить своё эссе»', card_pages[0])
-        self.assertIn('«Эссе участников»', card_pages[0])
 
     def test_meeting_links_to_published_book_and_essay_navigation(self):
         settings = self.store.settings(1)

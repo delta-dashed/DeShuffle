@@ -135,6 +135,10 @@ class DiscordHarness:
         message.author = self.bot.user
         message.guild, message.webhook_id, message.attachments = self.guild, None, []
         message.nonce = kwargs.get('nonce')
+        message.pinned = False
+        async def pin(**kwargs):
+            message.pinned = True
+        message.pin = AsyncMock(side_effect=pin)
         view = kwargs.get('view')
         message.components = [SimpleNamespace(to_dict=lambda value=value: value) for value in view.to_components()] if view else []
         message.jump_url = f'https://discord.com/channels/1/{channel.id}/{ident}'
@@ -158,7 +162,7 @@ class DiscordHarness:
         event = SimpleNamespace(id=ident, guild_id=1, guild=self.guild,
             name=fields['name'], start_time=fields['start_time'], end_time=fields.get('end_time'),
             channel_id=getattr(fields.get('channel'), 'id', 15), status=discord.EventStatus.scheduled,
-            entity_type=discord.EntityType.voice, description=fields.get('description', ''))
+            entity_type=discord.EntityType.voice, description=fields.get('description', ''), creator_id=self.bot.user.id)
         async def edit(**updates):
             for key, value in updates.items():
                 setattr(event, key, value)
@@ -205,7 +209,7 @@ class DiscordIntegrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         await self.service.refresh(self.h.guild)
         await self.service.refresh(self.h.guild)
         self.assertEqual(self.h.channels[13].create_thread.await_count, 2)
-        self.assertEqual(self.h.channels[11].send.await_count, 1)
+        self.assertEqual(self.h.channels[11].send.await_count, 2)
         root = self.store.publication(f'book:{self.book["id"]}')
         self.assertEqual(self.h.channels[root['channel_id']].send.await_count, 1)
         for channel in self.h.channels.values():
@@ -363,7 +367,7 @@ class DiscordIntegrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def test_essay_reminders_exclude_nonparticipants_and_already_published(self):
         self.store.set_published(1)
         deadline = self.now + 2 * 86400
-        self.store.update_book(1, self.book['id'], deadline=deadline)
+        self.essay_event(deadline)
         self.store.register_essay(1, self.book['id'], 800, 800, 1, 'Готово', 'url')
         job = next(j for j in self.jobs(self.book) if j['kind'] == 'essay')
         self.now = job['due']

@@ -9,7 +9,7 @@ import aiohttp
 import discord
 from discord.http import Route
 
-from bookclub.single_delivery import DeliveryUncertain, channel_send_once, create_thread_once, webhook_send_once
+from bookclub.single_delivery import DeliveryUncertain, channel_send_once, create_thread_once, webhook_send_once, create_event_once
 from bookclub.store import ClubError
 
 
@@ -115,6 +115,20 @@ class SingleDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('private', str(raised.exception))
         self.assertIs(self.forum._state, self.state)
         self.assertIs(self.client.http._HTTPClient__session, session)
+
+    async def test_event_accepted_500_does_not_retry(self):
+        from datetime import datetime, timedelta, timezone
+        voice = discord.VoiceChannel(state=self.state, guild=self.guild,
+                                     data={'id': '15', 'name': 'Club', 'type': 2, 'position': 0, 'bitrate': 64000, 'user_limit': 0})
+        session, _ = self.transport([Response(500, {'private': 'not logged'})])
+        start = datetime.now(timezone.utc) + timedelta(days=1)
+        with self.assertRaises(DeliveryUncertain):
+            await create_event_once(self.guild, name='Синк', start_time=start,
+                end_time=start + timedelta(hours=1), channel=voice,
+                entity_type=discord.EntityType.voice, privacy_level=discord.PrivacyLevel.guild_only)
+        self.assertEqual(len(session.requests), 1)
+        self.assertEqual(session.accepted, 1)
+        self.assertIs(self.guild._state, self.state)
 
     async def test_webhook_accepted_5xx_never_retries(self):
         for status in (500, 502, 503, 504, 524):

@@ -56,7 +56,7 @@ class Provisioner:
     async def check_publications(self, guild, *, repair=False):
         result = []
         for publication in self.store.rows("SELECT * FROM bc_publications WHERE guild_id=? AND state='ready'", (guild.id,)):
-            if not publication['key'].startswith(('book:', 'catalog:', 'meeting:', 'news:', 'chat:')):
+            if not publication['key'].startswith(('book:', 'catalog:', 'meeting:', 'news:', 'chat:', 'format:')):
                 continue
             try:
                 destination = await self.service.channel(guild, publication['channel_id'])

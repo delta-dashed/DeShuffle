@@ -59,7 +59,7 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent.kwargs['ephemeral'])
         self.assertIs(sent.kwargs['view'], view)
         self.assertEqual(len(view.status.options), 4)
-        self.assertIn('План встреч не задан', sent.args[0])
+        self.assertIn('3 встречи по книге + обсуждение эссе', sent.args[0])
         self.h.channels[13].create_thread.assert_not_awaited()
 
     async def test_panel_opens_while_refresh_holds_lock_and_rest_is_blocked(self):
@@ -154,8 +154,8 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         await view.edit_details.callback(interaction)
         modal = interaction.response.send_modal.await_args.args[0]
         self.assertIsInstance(modal, BookDetailsModal)
-        self.assertEqual(len(modal.children), 5)
-        self.assertEqual(modal.fields['deadline'].default, '2034-01-01T12:30+03:00')
+        self.assertEqual(len(modal.children), 4)
+        self.assertNotIn('deadline', modal.fields)
         await view.edit_plan.callback(interaction)
         self.assertIsInstance(interaction.response.send_modal.await_args.args[0], PlanMeetingsModal)
         self.h.guild.fetch_member.assert_not_awaited()
@@ -285,13 +285,13 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         before_members = self.store.participants(self.book['id'])
         modal = self.modal()
         for name, value in dict(title='Новое название', author='Уточнённый автор', position='5',
-                                deadline='2034-01-01 12:30', materials='https://example.org/new').items():
+                                materials='https://example.org/new').items():
             modal.fields[name]._value = value
         await modal.on_submit(self.interaction())
         current = self.current()
         self.assertEqual((current['title'], current['author'], current['position']),
                          ('Новое название', 'Уточнённый автор', 5))
-        self.assertEqual(current['deadline'], parse_time('2034-01-01 12:30'))
+        self.assertIsNone(current['deadline'])
         self.assertEqual(self.store.meeting(1, self.meeting['id']), before_meeting)
         self.assertEqual(self.store.essays(self.book['id'], submitted_only=False), before_essays)
         self.assertEqual(self.store.participants(self.book['id']), before_members)
@@ -299,7 +299,6 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def test_empty_deadline_and_materials_clear_without_changing_title(self):
         self.store.update_book(1, self.book['id'], deadline=self.now + 5000)
         modal = self.modal()
-        modal.fields['deadline']._value = ''
         modal.fields['materials']._value = ''
         await modal.on_submit(self.interaction())
         self.assertIsNone(self.current()['deadline'])
@@ -309,7 +308,7 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def test_invalid_modal_fields_leave_book_unchanged(self):
         before = self.current()
         for field, value in [('position', '--1'), ('position', '+-1'), ('position', '1.5'),
-                             ('position', '1000001'), ('position', '-1000001'), ('position', '١'), ('deadline', 'в пятницу'),
+                             ('position', '1000001'), ('position', '-1000001'), ('position', '١'),
                              ('title', '  '), ('author', 'a' * 181), ('materials', 'x' * 4001)]:
             with self.subTest(field=field, value=value[:30]):
                 modal = self.modal()
@@ -346,7 +345,7 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         interaction = self.interaction()
         await plan.on_submit(interaction)
         self.assertEqual(self.current()['reading_meetings'], 4)
-        self.assertIn('4 встреч по книге + 1 встреча по эссе = 5 всего', panel_content(self.cog, self.current()))
+        self.assertIn('4 встречи по книге + обсуждение эссе', panel_content(self.cog, self.current()))
         self.assertEqual(self.store.rows('SELECT * FROM bc_meetings WHERE book_id=?', (self.book['id'],)), meetings)
         self.h.guild.create_scheduled_event.assert_not_awaited()
         self.h.events[self.meeting['event_id']].edit.assert_not_awaited()
@@ -373,8 +372,9 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         view = self.view()
         self.assertEqual(view.automation.label, 'Включить автостатус')
         self.assertIn('Автостатус выключен', panel_content(self.cog, self.current()))
-        with self.assertRaisesRegex(ClubError, 'План встреч'):
-            await view.automation.callback(self.interaction())
+        initial = self.interaction()
+        await view.automation.callback(initial)
+        self.assertIn('3 встреч по книге', initial.followup.send.await_args.args[0])
         self.store.update_book(1, self.book['id'], reading_meetings=4)
         before = self.current()
         view, interaction = self.view(), self.interaction()
