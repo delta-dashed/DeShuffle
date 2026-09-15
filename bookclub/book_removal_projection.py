@@ -6,7 +6,7 @@ import hashlib
 import discord
 
 from .book_removal import (complete_removal_resource, fail_removal_resource,
-                           removal_operations, removal_resources)
+                           remember_removal_archive_state, removal_operations, removal_resources)
 from .render import safe
 from .store import ClubError
 
@@ -76,9 +76,10 @@ async def _project_essay(service, guild, operation, resource):
         if not first.startswith('**Архивное эссе по книге «') or not first.endswith('»**'):
             raise ClubError('Шапка эссе изменена вручную; автоматическое оформление остановлено.')
         content = f'**Архивное эссе по книге «{safe(book["title"])}»**' + separator + remainder
-    archived = channel.archived
+    archived = remember_removal_archive_state(store, guild.id, operation['id'],
+                                               resource['id'], channel.archived)
     try:
-        if archived:
+        if channel.archived:
             channel = await channel.edit(archived=False)
         if starter.content != content:
             await service.edit_essay_starter(channel, starter, content, pub)
@@ -98,7 +99,9 @@ async def _project_essay(service, guild, operation, resource):
                              managed=essay['managed'], submitted=essay['submitted'])
     finally:
         if archived:
-            await channel.edit(archived=True)
+            restored = await channel.edit(archived=True)
+            if not restored.archived:
+                raise ClubError('Discord не подтвердил восстановление архива темы. Повторите незавершённое действие.')
 
 
 async def process_essay_transfers(service, guild, book_id):

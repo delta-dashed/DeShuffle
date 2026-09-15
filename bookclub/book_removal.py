@@ -267,6 +267,35 @@ def removal_resources(store, guild_id, operation_id, pending_only=True):
     return result
 
 
+def remember_removal_archive_state(store, guild_id, operation_id, resource_id, archived):
+    """Persist the first observed archive state before any Discord thread edit.
+
+    Resource data is the execution journal, distinct from the confirmed plan.
+    Failed attempts and explicit retries retain it, including across restarts.
+    """
+    if type(archived) is not bool:
+        raise ValueError('Archive state must be a boolean')
+    with store.tx() as db:
+        operation = _operation(db, guild_id, operation_id)
+        resource = db.execute('''SELECT * FROM bc_book_removal_resources
+          WHERE guild_id=? AND operation_id=? AND id=?''',
+          (guild_id, operation_id, resource_id)).fetchone()
+        if (not resource or resource['kind'] != 'refresh_essay'
+                or resource['state'] != 'pending' or operation['state'] != 'pending'):
+            raise ClubError('Перенос эссе не ожидает выполнения. Откройте статус операции.')
+        data = json.loads(resource['data'])
+        if 'original_archived' not in data:
+            data['original_archived'] = archived
+            stamp = store.clock()
+            db.execute('UPDATE bc_book_removal_resources SET data=?,updated_at=? WHERE id=?',
+                       (_json(data), stamp, resource_id))
+            db.execute('UPDATE bc_book_removal_operations SET updated_at=? WHERE id=?',
+                       (stamp, operation_id))
+        if type(data['original_archived']) is not bool:
+            raise ClubError('Исходное состояние архива повреждено; проверьте журнал операции.')
+        return data['original_archived']
+
+
 def set_removal_resource_state(store, guild_id, operation_id, resource_id, state, reason=None):
     state = 'failed' if state == 'paused' else state
     if state not in {'pending', 'deleting', 'failed', 'done'}:

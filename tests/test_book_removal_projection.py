@@ -5,7 +5,8 @@ import unittest
 from unittest.mock import AsyncMock
 
 from bookclub.book_removal import (build_removal_plan, commit_removal_plan,
-                                  get_removal_operation, retry_removal_operation)
+                                  get_removal_operation, removal_resources,
+                                  retry_removal_operation)
 from bookclub.import_publication import archive_header
 from bookclub.store import Store
 from bookclub.ui import Club
@@ -184,6 +185,105 @@ class RemovalProjectionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn('Основная книга', self.h.channels[thread.id].name)
         moved = self.store.one('SELECT * FROM bc_essays WHERE guild_id=1 AND source_id=?', (thread.id,))
         self.assertEqual(moved['title'], self.h.channels[thread.id].name)
+
+    async def archived_retry(self, *, restart=False, cancelled=False):
+        await self.publish()
+        essay = await self.service.create_essay_space(self.h.guild, self.book['id'], 1)
+        thread = self.h.channels[essay['channel_id']]
+        body = self.body(essay)
+        starter = thread.messages[thread.id]
+        identity, attachment = starter.author, body.attachments[0]
+        thread.archived = True
+        with self.store.tx() as db:
+            db.execute("INSERT INTO bc_import_budgets VALUES('already-spent',1,30714)")
+        ledger = {table: self.store.rows(f'SELECT * FROM {table}') for table in
+                  ('bc_import_budgets', 'bc_import_runs', 'bc_import_sources')}
+        sent = self.hooks_sent()
+        channel_ids = set(self.h.channels)
+        operation = await self.move()
+        requests, before_unarchive = [], []
+        failure_remaining = True
+
+        async def new_snapshot(**changes):
+            nonlocal failure_remaining
+            requests.append(changes)
+            old = self.h.channels[thread.id]
+            if changes.get('archived') is False and old.archived:
+                # Read SQLite afresh before simulating the outbound PATCH.
+                disk_store = Store(self.path, clock=lambda: self.now)
+                resource = removal_resources(disk_store, 1, operation['id'], False)[0]
+                before_unarchive.append(resource.get('original_archived'))
+            if changes.get('archived') is True and failure_remaining:
+                failure_remaining = False
+                if cancelled:
+                    raise asyncio.CancelledError()
+                raise OSError('simulated rearchive failure')
+            fresh = self.h.channel(old.id, parent_id=old.parent_id, owner_id=old.owner_id,
+                                   name=changes.get('name', old.name))
+            fresh.archived = changes.get('archived', old.archived)
+            fresh.messages = old.messages
+            fresh.edit = AsyncMock(side_effect=new_snapshot)
+            return fresh
+
+        thread.edit = AsyncMock(side_effect=new_snapshot)
+        if cancelled:
+            with self.assertRaises(asyncio.CancelledError):
+                await self.publish()
+        else:
+            await self.publish()
+        self.assertFalse(self.h.channels[thread.id].archived)
+        state = 'pending' if cancelled else 'failed'
+        self.assertEqual(get_removal_operation(self.store, 1, operation['id'])['state'], state)
+        self.assertNotEqual(removal_resources(self.store, 1, operation['id'], False)[0]['state'], 'done')
+        if restart:
+            await self.service.close()
+            self.store = Store(self.path, clock=lambda: self.now)
+            self.cog = Club(self.h.bot, self.store)
+            self.service = self.cog.service
+            self.addAsyncCleanup(self.service.close)
+        if not cancelled:
+            retry_removal_operation(self.store, 1, operation['id'], 99)
+        await self.publish()
+        self.assertEqual(get_removal_operation(self.store, 1, operation['id'])['state'], 'done')
+        self.assertTrue(self.h.channels[thread.id].archived)
+        self.assertEqual(before_unarchive, [True])
+        resource = removal_resources(self.store, 1, operation['id'], False)[0]
+        self.assertIs(resource['original_archived'], True)
+        self.assertEqual(resource['state'], 'done')
+        self.assertEqual(sum(change.get('archived') is True for change in requests), 2)
+        self.assertIs(self.h.channels[thread.id].messages[starter.id], starter)
+        self.assertIs(starter.author, identity)
+        self.assertIs(self.h.channels[thread.id].messages[body.id], body)
+        self.assertIs(body.attachments[0], attachment)
+        body.edit.assert_not_awaited()
+        body.delete.assert_not_awaited()
+        publication = self.store.one('SELECT * FROM bc_publications WHERE message_id=?', (starter.id,))
+        self.assertEqual((publication['channel_id'], publication['message_id']), (thread.id, starter.id))
+        self.assertEqual(self.hooks_sent(), sent)
+        self.assertEqual(set(self.h.channels), channel_ids)
+        self.assertEqual({table: self.store.rows(f'SELECT * FROM {table}') for table in ledger}, ledger)
+
+    async def test_rearchive_failure_explicit_retry_restores_original_archived_state(self):
+        await self.archived_retry()
+
+    async def test_rearchive_failure_restart_and_retry_restore_original_archived_state(self):
+        await self.archived_retry(restart=True)
+
+    async def test_cancelled_rearchive_resumes_pending_operation_after_restart(self):
+        await self.archived_retry(restart=True, cancelled=True)
+
+    async def test_transfer_keeps_originally_open_thread_open(self):
+        await self.publish()
+        essay = await self.service.create_essay_space(self.h.guild, self.book['id'], 1)
+        thread = self.h.channels[essay['channel_id']]
+        self.assertFalse(thread.archived)
+        operation = await self.move()
+        await self.publish()
+        self.assertEqual(get_removal_operation(self.store, 1, operation['id'])['state'], 'done')
+        self.assertFalse(self.h.channels[thread.id].archived)
+        resource = removal_resources(self.store, 1, operation['id'], False)[0]
+        self.assertIs(resource['original_archived'], False)
+        self.assertFalse(any(call.kwargs.get('archived') is True for call in thread.edit.await_args_list))
 
     async def test_gateway_deletion_keeps_frozen_publications_and_imported_identifiers(self):
         await self.publish()
