@@ -2,6 +2,7 @@
 import asyncio
 from dataclasses import replace
 import io
+import json
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock
@@ -583,4 +584,36 @@ class ImportRestyleTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         await self.restyle()
         self.assertEqual(len(self.thread.messages), 4)
         self.assertEqual(self.hook.send.await_count, 2)
+        self.assert_bookkeeping_unchanged()
+
+    async def test_completed_import_restyles_again_after_duplicate_book_merge_without_reanalysis(self):
+        from bookclub.book_removal import build_removal_plan, commit_removal_plan, get_removal_operation
+        from bookclub.book_removal_projection import process_essay_transfers
+        await self.legacy_import(attachment=True)
+        await self.restyle()
+        snapshot = self.importer.ledger.run(1, self.run['id'])['snapshot']
+        candidate = next(item for item in snapshot['books'] if item['book_id'] == self.book['id'])
+        candidate['book_id'] = None
+        candidate['source_url'] = 'https://discord.com/channels/1/41'
+        # Reproduce an old automatically-created archive book whose materials
+        # still point at its source. Restyle must not edit a removed book.
+        with self.store.tx() as db:
+            db.execute('UPDATE bc_books SET request_key=?,materials=? WHERE id=?',
+                       ('archive:' + candidate['ref'], candidate['source_url'], self.book['id']))
+            db.execute('UPDATE bc_import_runs SET snapshot=? WHERE id=?',
+                       (json.dumps(snapshot), self.run['id']))
+        target = self.store.create_book(1, 'Основное название', 'Автор', '', 'merge-target')
+        plan = build_removal_plan(self.store, 1, self.book['id'], 'transfer', target['id'])
+        operation = commit_removal_plan(self.store, 1, 99, plan)
+        ids = set(self.thread.messages)
+        sent = self.hook.send.await_count
+        async with self.service.locks[1]:
+            await process_essay_transfers(self.service, self.h.guild, self.book['id'])
+        self.assertEqual(get_removal_operation(self.store, 1, operation['id'])['state'], 'done')
+        await self.restyle()
+        self.assertEqual(set(self.thread.messages), ids)
+        self.assertEqual(self.hook.send.await_count, sent)
+        self.assertIn('Основное название', self.header.content)
+        self.assertEqual(self.store.essays(target['id'])[0]['source_id'], self.thread.id)
+        self.assertEqual(self.store.book(1, self.book['id'])['materials'], candidate['source_url'])
         self.assert_bookkeeping_unchanged()

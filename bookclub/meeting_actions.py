@@ -36,7 +36,7 @@ def _event_matches(event, guild, meeting):
 
 async def _current(service, guild, meeting_id, expected_revision):
     meeting = service.store.meeting(guild.id, meeting_id)
-    service.store.book(guild.id, meeting['book_id'])
+    service.store.require_active_book(guild.id, meeting['book_id'])
     if not meeting['event_id']:
         raise ClubError('Создание события не подтверждено. Используйте /club recover_event.')
     try:
@@ -102,7 +102,7 @@ async def create_meeting(service, guild, actor_id, book_id, *, name, date, minut
         raise ClubError('Управление встречами доступно только на сервере.')
     async with service.locks[guild.id]:
         await _organizer(service, guild, actor_id)
-        service.store.book(guild.id, book_id)
+        service.store.require_active_book(guild.id, book_id)
         if plan_kind not in {'reading', 'essay'}:
             raise ClubError('Выберите тип встречи: по книге или обсуждение эссе.')
         name = checked_text(name, 'Название встречи', 100)
@@ -183,6 +183,7 @@ async def edit_meeting(service, guild, actor_id, meeting_id, *, name=None, part,
                 settings = service.store.settings(guild.id)
                 with service.store.tx() as db:
                     current = service.store._get(db, 'bc_meetings', guild.id, meeting_id)
+                    service.store._active_book(db, guild.id, current['book_id'])
                     db.execute('UPDATE bc_meetings SET part=?,chapter=?,revision=revision+1 WHERE id=?',
                                (part, chapter, meeting_id))
                     db.execute('UPDATE bc_plans SET ready=0,version=version+1 WHERE meeting_id=? AND generation=?',

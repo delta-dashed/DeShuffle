@@ -21,6 +21,7 @@ from .single_delivery import channel_send_once, create_thread_once, webhook_send
 from .event_delivery import event_description, find_draft_events
 from .render import book_pages, catalog_pages, news_content, meeting_lines, pages, safe, book_url
 from .club_format import format_content, get_format
+from .book_refresh import BookRefreshQueue
 
 log = logging.getLogger(__name__)
 NO_MENTIONS = discord.AllowedMentions.none()
@@ -36,10 +37,19 @@ class Service:
         self.book_view_factory = None
         self.catalog_view_factory = None
         self.format_view_factory = None
+        self.removed_book_view_factory = None
+        self.deleted_books_handler = None
         self.forum_tags = ForumTags(self)
         self.delivery = DeliveryJournal(self)
         self.last_essay_scan = {}
         self.missing_format_pin = set()
+        self.book_updates = BookRefreshQueue(self)
+
+    def request_book_refresh(self, guild, book_id):
+        self.book_updates.request(guild, book_id)
+
+    async def close(self):
+        await self.book_updates.close()
 
     async def setup_actor(self, guild, user_id):
         if guild is None:
@@ -124,10 +134,11 @@ class Service:
 
     async def live_participants(self, guild):
         ids = self.store.rows('''SELECT DISTINCT p.user_id FROM bc_participants p
-          JOIN bc_books b ON b.id=p.book_id WHERE b.guild_id=? AND p.present=1''', (guild.id,))
+          JOIN bc_books b ON b.id=p.book_id WHERE b.guild_id=? AND b.deleted=0 AND p.present=1''', (guild.id,))
         live = set()
         forum = await self.fresh_forum(guild) if ids else None
         for row in ids:
+            await self.book_updates.drain(guild)
             try:
                 member = await guild.fetch_member(row['user_id'])
                 if not member.bot and self.can_read(forum, member):
@@ -151,6 +162,15 @@ class Service:
     async def diagnose(self, guild, *, channels=None, bot_member=None):
         settings = self.store.settings(guild.id)
         result = []
+        from .book_removal import removal_operations
+        failed_removals = [op for op in removal_operations(self.store, guild.id, pending_only=False)
+                           if op['state'] == 'failed']
+        if failed_removals:
+            result.append(f'Приостановлено операций удаления или переноса: {len(failed_removals)}. '
+                          'Откройте «Удалённые книги» → «Статус операции».')
+        if any(key[0] == guild.id for key in self.book_updates.failures):
+            result.append('Изменения книг сохранены; часть карточек ожидает повторного обновления. '
+                          'Проверьте права Discord и журнал, затем /club publish.')
         for key, expected in [('news', discord.TextChannel), ('chat', discord.TextChannel),
                               ('books', discord.ForumChannel), ('essays', discord.ForumChannel),
                               ('voice', discord.VoiceChannel)]:
@@ -242,6 +262,9 @@ class Service:
         by_id = {e.id: e for e in events}
         changed = False
         for m in self.store.rows('SELECT * FROM bc_meetings WHERE guild_id=?', (guild.id,)):
+            await self.book_updates.drain(guild)
+            if self.store.book(guild.id, m['book_id']).get('deleted'):
+                continue
             if not m['event_id']:
                 matches = find_draft_events(self.store, guild, m, events, self.bot.user.id)
                 if len(matches) == 1:
@@ -319,7 +342,8 @@ class Service:
                             'Автоматическая привязка запрещена; организатору нужно проверить копии.')
         return next(iter(matches.values()), None)
 
-    async def upsert(self, guild, key, channel_id, content, *, forum_name=None, view=None, files=None):
+    async def upsert(self, guild, key, channel_id, content, *, forum_name=None, view=None, files=None,
+                     known_message=None):
         if len(content) > 2000:
             raise ClubError('Карточка слишком длинная; требуется разбивка на страницы.')
         managed_name = forum_name[:100] if forum_name and key.startswith(('book:', 'catalog:')) else None
@@ -351,7 +375,11 @@ class Service:
             try:
                 if channel is None:
                     channel = await self.channel(guild, pub['channel_id'])
-                message = await channel.fetch_message(pub['message_id'])
+                if (known_message is not None and known_message.id == pub['message_id']
+                        and known_message.channel.id == channel.id):
+                    message = known_message
+                else:
+                    message = await channel.fetch_message(pub['message_id'])
             except discord.NotFound:
                 self.store.forget_publication(key)
                 pub = None
@@ -413,6 +441,7 @@ class Service:
     async def paged_post(self, guild, key, forum_id, name, contents, *, view=None, inline_first=False):
         # One forum post; pages are ordinary bot replies inside it. Only catalog is pinned.
         root = self.store.publication(key)
+        known_root = None
         if root:
             detach = root['channel_id'] != forum_id if not root['message_id'] else False
             if root['message_id']:
@@ -420,7 +449,7 @@ class Service:
                     thread = await self.channel(guild, root['channel_id'])
                     detach = not isinstance(thread, discord.Thread) or thread.parent_id != forum_id
                     if not detach:
-                        await thread.fetch_message(root['message_id'])
+                        known_root = await thread.fetch_message(root['message_id'])
                 except discord.NotFound:
                     detach = True
             if detach:
@@ -475,7 +504,7 @@ class Service:
                 links.append(f'[{label}]({url(pub)})')
             if links:
                 first += '\n\n' + ' · '.join(links)
-            root = await self.upsert(guild, key, forum_id, first, forum_name=name, view=view)
+            root = await self.upsert(guild, key, forum_id, first, forum_name=name, view=view, known_message=known_root)
             for old in self.store.rows('SELECT * FROM bc_publications WHERE key LIKE ?', (key + ':page:%',)):
                 if int(old['key'].rsplit(':', 1)[1]) > len(sections):
                     await self.upsert(guild, old['key'], root['channel_id'],
@@ -506,9 +535,9 @@ class Service:
                                       view=navigation(index, publications))
             content = (heading + f'\nСтраниц: {len(contents)}. На страницах есть кнопки перехода вперёд, назад и к началу.\n'
                        + f'[Первая страница]({url(publications[0])}) · [Последняя страница]({url(publications[-1])})')
-            root = await self.upsert(guild, key, forum_id, content, forum_name=name, view=view)
+            root = await self.upsert(guild, key, forum_id, content, forum_name=name, view=view, known_message=known_root)
         else:
-            root = await self.upsert(guild, key, forum_id, contents[0], forum_name=name, view=view)
+            root = await self.upsert(guild, key, forum_id, contents[0], forum_name=name, view=view, known_message=known_root)
         old = self.store.rows("SELECT * FROM bc_publications WHERE key LIKE ?", (key + ':page:%',))
         for pub in old:
             index = int(pub['key'].rsplit(':', 1)[1])
@@ -516,19 +545,79 @@ class Service:
                 await self.upsert(guild, pub['key'], root['channel_id'], 'Эта страница больше не нужна. Актуальная карточка — в начале темы.', view=navigation(0, []))
         return root
 
-    async def refresh(self, guild):
+    async def refresh_book(self, guild, book_id):
         settings = self.store.settings(guild.id)
         if not settings['published']:
             return
-        for b in self.store.books(guild.id):
-            view = self.book_view_factory(b) if self.book_view_factory else None
-            await self.paged_post(guild, f'book:{b["id"]}', settings['books'], f'{b["title"]} · {b["author"]}', book_pages(self.store, b, settings), view=view)
-            root = self.store.publication(f'book:{b["id"]}')
-            thread = await self.channel(guild, root['channel_id'], discord.Thread)
-            await self.forum_tags.sync_thread_tags(guild, thread, [b['status']])
-            for m in self.store.rows('SELECT * FROM bc_meetings WHERE book_id=? AND event_id IS NOT NULL', (b['id'],)):
-                view = self.view_factory(m) if self.view_factory else None
-                await self.upsert(guild, f'meeting:{m["id"]}', root['channel_id'], '\n'.join(meeting_lines(self.store, m, settings)), view=view)
+        from .book_removal import latest_book_removal_operation, removal_resources
+        from .book_removal_projection import process_essay_transfers
+        from .book_removal_delivery import process_disposal
+        await process_essay_transfers(self, guild, book_id)
+        await process_disposal(self, guild, book_id)
+        b = self.store.book(guild.id, book_id)
+        if b.get('deleted'):
+            # Never recreate a deleted book's Discord topic. An existing root
+            # becomes a reversible notice while every essay and link survives.
+            key = f'book:{book_id}'
+            pub = self.store.publication(key)
+            if not pub or not pub['message_id']:
+                return None
+            operation = latest_book_removal_operation(self.store, guild.id, book_id)
+            if operation and any(resource['kind'] == 'delete_book_topic' and resource['state'] == 'done'
+                                 for resource in removal_resources(self.store, guild.id, operation['id'], pending_only=False)):
+                return None
+            details = 'Тема, эссе и события сохранены. Напоминания клуба по книге остановлены. '
+            if operation and operation['mode'] == 'all':
+                details = ('Выбрано удаление темы вместе с эссе. Уже удалённые сообщения восстановить нельзя. '
+                           'Напоминания остановлены; события Discord сохранены. ')
+            if operation and operation.get('target_book_id'):
+                target = self.store.book(guild.id, operation['target_book_id'])
+                target_url = book_url(self.store, target)
+                details = (f'Эссе привязаны к книге «{safe(target["title"])}». '
+                           + (f'[Открыть книгу]({target_url}). ' if target_url else '')
+                           + 'Напоминания по удалённой книге остановлены; события сохранены. ')
+            if operation and operation['state'] != 'done':
+                details += ('Операция приостановлена. ' if operation['state'] == 'failed'
+                            else 'Операция ещё выполняется. ')
+                details += 'Проверьте «Статус операции» в списке удалённых книг. '
+            content = (f'**Книга удалена из каталога**\n{safe(b["title"])} · {safe(b["author"])}\n\n'
+                       + details +
+                       'Организатор может восстановить книгу кнопкой ниже или через /club library deleted.')
+            digest = hashlib.sha256(('removed-book-v1\n' + content).encode()).hexdigest()
+            if pub['content_hash'] != digest:
+                try:
+                    thread = await self.channel(guild, pub['channel_id'], discord.Thread)
+                    if thread.parent_id != settings['books']:
+                        return None
+                    message = await thread.fetch_message(pub['message_id'])
+                except discord.NotFound:
+                    return None
+                if not self.owns_starter(message):
+                    raise ClubError('Сохранённая карточка принадлежит другому автору.')
+                view = self.removed_book_view_factory(b) if self.removed_book_view_factory else None
+                archived = thread.archived
+                if archived:
+                    thread = await thread.edit(archived=False)
+                try:
+                    await message.edit(content=content, view=view, allowed_mentions=NO_MENTIONS)
+                finally:
+                    if archived:
+                        await thread.edit(archived=True)
+                self.store.save_publication(key, thread.id, message.id, digest)
+            self.book_updates.failures.pop((guild.id, book_id), None)
+            return pub
+        view = self.book_view_factory(b) if self.book_view_factory else None
+        root = await self.paged_post(guild, f'book:{b["id"]}', settings['books'], f'{b["title"]} · {b["author"]}',
+                                     book_pages(self.store, b, settings), view=view)
+        thread = await self.channel(guild, root['channel_id'], discord.Thread)
+        await self.forum_tags.sync_thread_tags(guild, thread, [b['status']])
+        self.book_updates.failures.pop((guild.id, book_id), None)
+        return root
+
+    async def refresh_catalog(self, guild):
+        settings = self.store.settings(guild.id)
+        if not settings['published']:
+            return
         catalog_view = self.catalog_view_factory(guild.id) if self.catalog_view_factory else None
         catalog = await self.paged_post(guild, f'catalog:{guild.id}', settings['books'], 'Каталог книжного клуба',
                                         catalog_pages(self.store, guild.id), view=catalog_view, inline_first=True)
@@ -543,6 +632,29 @@ class Service:
             if other_pin:
                 raise ClubError('В форуме уже закреплён другой пост. Организатор должен освободить закрепление каталога.')
             await thread.edit(pinned=True)
+        self.book_updates.failures.pop((guild.id, 'catalog'), None)
+        return catalog
+
+    async def refresh(self, guild):
+        settings = self.store.settings(guild.id)
+        if not settings['published']:
+            return
+        await self.book_updates.drain(guild)
+        for b in self.store.books(guild.id, include_deleted=True):
+            await self.book_updates.drain(guild)
+            # A button can save while another HTTP request is pending. Always
+            # render the latest row, not the snapshot from the start of refresh.
+            root = await self.refresh_book(guild, b['id'])
+            if root is None or self.store.book(guild.id, b['id']).get('deleted'):
+                continue
+            for m in self.store.rows('SELECT * FROM bc_meetings WHERE book_id=? AND event_id IS NOT NULL', (b['id'],)):
+                await self.book_updates.drain(guild)
+                if self.store.book(guild.id, b['id']).get('deleted'):
+                    break
+                view = self.view_factory(m) if self.view_factory else None
+                await self.upsert(guild, f'meeting:{m["id"]}', root['channel_id'], '\n'.join(meeting_lines(self.store, m, settings)), view=view)
+        await self.book_updates.drain(guild)
+        await self.refresh_catalog(guild)
         await self.upsert(guild, f'news:{guild.id}', settings['news'], news_content(self.store, guild.id, settings))
         await self.upsert(guild, f'chat:{guild.id}', settings['chat'],
                           '**Площадь клуба**\nМесто для флуда, свободного общения и разговоров о книгах и обо всём остальном.\n'
@@ -571,7 +683,7 @@ class Service:
 
     async def essay_access(self, guild, book_id, actor_id):
         member, _ = await self.actor(guild, actor_id)
-        book = self.store.book(guild.id, book_id)
+        book = self.store.require_active_book(guild.id, book_id)
         forum = await self.forum_access(guild, member, 'essays')
         return member, book, forum
 
@@ -806,6 +918,8 @@ class Service:
         if thread.parent_id != settings['essays']:
             return False
         old = self.store.one('SELECT * FROM bc_essays WHERE guild_id=? AND source_id=?', (thread.guild.id, thread.id))
+        if old and self.store.book(thread.guild.id, old['book_id']).get('deleted'):
+            return False
         try:
             starter = await thread.fetch_message(thread.id)
         except discord.NotFound:
@@ -927,6 +1041,7 @@ class Service:
         forum = await self.channel(guild, settings['essays'], discord.ForumChannel)
         for pub in self.store.rows("SELECT * FROM bc_publications WHERE guild_id=? AND channel_id=? "
                                    "AND state='reserved' AND key LIKE 'essay-space:%'", (guild.id, forum.id)):
+            await self.book_updates.drain(guild)
             found = await self.delivery.recover(guild, forum, pub['key'], forum=True, webhook_id=pub['webhook_id'])
             if found:
                 thread, message = found
@@ -934,16 +1049,21 @@ class Service:
         threads = [t for t in await guild.active_threads() if t.parent_id == forum.id]
         # Archived posts are sorted by archive time. Stop after the enable boundary.
         async for thread in forum.archived_threads(limit=None):
+            await self.book_updates.drain(guild)
             if thread.archive_timestamp and thread.archive_timestamp.timestamp() < settings['scan_after']:
                 break
             threads.append(thread)
         for thread in {t.id: t for t in threads}.values():
+            await self.book_updates.drain(guild)
             if thread.created_at.timestamp() >= settings['scan_after']:
                 await self.register_thread(thread, prompt=False)
         self.last_essay_scan[guild.id] = self.store.clock()
 
     async def check_essays(self, guild):
         for e in self.store.rows('SELECT * FROM bc_essays WHERE guild_id=? AND deleted=0', (guild.id,)):
+            await self.book_updates.drain(guild)
+            if self.store.book(guild.id, e['book_id']).get('deleted'):
+                continue
             try:
                 channel = await self.channel(guild, e['channel_id'])
                 if isinstance(channel, discord.Thread) and e['source_id'] == channel.id:
@@ -991,6 +1111,10 @@ class Service:
         books_forum = await self.fresh_forum(guild) if recipients else None
         essays_forum = await self.fresh_forum(guild, 'essays') if recipients and kind.startswith('essay') else None
         for user_id in sorted(recipients):
+            # Stop remaining recipients if a book was removed during delivery.
+            book_id = book['id'] if kind.startswith('essay') else meeting['book_id']
+            if self.store.book(guild.id, book_id).get('deleted'):
+                break
             try:
                 member = await guild.fetch_member(user_id)
                 if member.bot or not self.can_read(books_forum, member):
@@ -999,6 +1123,8 @@ class Service:
                     continue
                 if kind == 'participants' and settings['reminder_role'] and settings['reminder_role'] not in {r.id for r in member.roles}:
                     continue
+                if self.store.book(guild.id, book_id).get('deleted'):
+                    break
                 await member.send(text[:2000], allowed_mentions=NO_MENTIONS)
             except discord.NotFound:
                 continue
@@ -1010,7 +1136,9 @@ class Service:
 
     async def tick(self, guild):
         async with self.locks[guild.id]:
+            await self.book_updates.drain(guild)
             await self.reconcile(guild)
+            await self.book_updates.drain(guild)
             live = await self.live_participants(guild)
             self.store.expire_offers(guild.id, live)
             if not self.store.settings(guild.id)['published']:
@@ -1030,6 +1158,7 @@ class Service:
             except Exception:
                 log.exception('Book club cards failed for guild %s; meeting reminders remain enabled', guild.id)
             for job in self.store.due_jobs(guild.id):
+                await self.book_updates.drain(guild)
                 if job['kind'].startswith('essay'):
                     if not essays_ready:
                         continue

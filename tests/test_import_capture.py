@@ -327,5 +327,49 @@ class ImportCaptureTests(RecoveryFixture, unittest.IsolatedAsyncioTestCase):
         self.runner.analyze.assert_not_awaited()
 
 
+    async def test_cursor_rejects_removed_book_before_read_or_model_and_can_resume_after_restore(self):
+        self.importer.config = replace(self.config, max_messages=2)
+        first = await self.importer.preview(self.h.guild, 99, 41)
+        self.assertIsNotNone(first['continuation'])
+        book = self.store.book(1, self.book['id'])
+        self.store.remove_book(1, book['id'], expected_revision=book['revision'], actor_id=99)
+        tables = ('bc_import_preview_cursors', 'bc_import_coverage', 'bc_import_budgets', 'bc_import_runs')
+        before = {table: self.store.rows(f'SELECT * FROM {table}') for table in tables}
+        history = self.h.old_thread.history
+        self.h.old_thread.history = Mock(side_effect=AssertionError('Removed book history read'))
+        with self.assertRaisesRegex(ClubError, 'удалена'):
+            await self.importer.preview(self.h.guild, 99, 41, cursor=first['continuation'])
+        with self.assertRaisesRegex(ClubError, 'удалена'):
+            await self.importer.scan(self.h.guild, 99, 41, 'blocked-cursor', cursor=first['continuation'])
+        self.h.old_thread.history.assert_not_called()
+        self.assertEqual({table: self.store.rows(f'SELECT * FROM {table}') for table in tables}, before)
+        self.runner.login_status.assert_not_awaited()
+        self.runner.analyze.assert_not_awaited()
+        removed = self.store.book(1, book['id'])
+        self.store.restore_book(1, book['id'], expected_revision=removed['revision'], actor_id=99)
+        self.h.old_thread.history = history
+        resumed = await self.importer.preview(self.h.guild, 99, 41, cursor=first['continuation'])
+        self.assertFalse({m['id'] for m in first['messages']} & {m['id'] for m in resumed['messages']})
+
+    async def test_removal_during_history_read_does_not_publish_snapshot_or_advance_cursor(self):
+        self.importer.config = replace(self.config, max_messages=2)
+        first = await self.importer.preview(self.h.guild, 99, 41)
+        tables = ('bc_import_preview_cursors', 'bc_import_coverage')
+        before = {table: self.store.rows(f'SELECT * FROM {table}') for table in tables}
+        history = self.h.old_thread.history
+        async def remove_while_reading(**kwargs):
+            async for message in history(**kwargs):
+                book = self.store.book(1, self.book['id'])
+                if not book['deleted']:
+                    self.store.remove_book(1, book['id'], expected_revision=book['revision'], actor_id=99)
+                yield message
+        self.h.old_thread.history = remove_while_reading
+        with self.assertRaisesRegex(ClubError, 'удалена'):
+            await self.importer.preview(self.h.guild, 99, 41, cursor=first['continuation'])
+        self.assertEqual({table: self.store.rows(f'SELECT * FROM {table}') for table in tables}, before)
+        self.runner.login_status.assert_not_awaited()
+        self.runner.analyze.assert_not_awaited()
+
+
 if __name__ == '__main__':
     unittest.main()
