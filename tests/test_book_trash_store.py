@@ -247,7 +247,7 @@ class BookTrashStoreTests(ClubFixture, unittest.TestCase):
         self.store = Store(self.path, clock=lambda: self.now)
         self.assertEqual(self.snapshot(*before), before)
         self.assertEqual(self.store.one('PRAGMA user_version')['user_version'], 42)
-        self.assertEqual(self.store.one('SELECT MAX(version) AS version FROM bc_migrations')['version'], 12)
+        self.assertEqual(self.store.one('SELECT MAX(version) AS version FROM bc_migrations')['version'], 13)
         self.store = Store(self.path, clock=lambda: self.now)
         self.assertEqual(self.snapshot(*before), before)
 

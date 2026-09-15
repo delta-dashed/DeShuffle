@@ -23,7 +23,7 @@ HELP = '''**Архивариус · книжный клуб**
 Участнику: `/club books`, `/club book_add`, `/club join`, `/club essay`.
 В каталоге и `/club books`: «Добавить книгу» создаёт книгу и её тему. Организатору: «Загрузить список» или `/club library import` с файлом TXT, CSV, JSON.
 В карточке книги: «Управление книгой» — статус, данные и план N + 1; «Встречи» — конкретные даты и переносы.
-«Удалить книгу» убирает её из каталога с сохранением темы и эссе. Восстановление — «Удалённые книги» в каталоге или `/club library deleted`.
+«Удалить книгу» предлагает сохранить материалы, удалить тему или перенести эссе в другую книгу. Необратимое удаление подтверждается названием книги. Статус и восстановление — «Удалённые книги» или `/club library deleted`.
 Ведущему: откройте `/club meeting`, нажмите «Провести встречу» и подтвердите. Кнопка «Мой план» открывает личный черновик.
 Организатору: `/club book_edit`, `/club participant`, `/club meeting_add`, `/club meeting_attach`, `/club move`, `/club cancel`, `/club offer`, `/club replace`, `/club handover`.
 Настройка сервера: `/club setup` создаёт недостающие каналы и проверяет существующие; `check_only=True` — только проверка.
@@ -1040,8 +1040,10 @@ class Club(commands.Cog):
     async def on_raw_thread_delete(self, payload):
         async with self.service.locks[payload.guild_id]:
             self.store.delete_essay(payload.guild_id, channel_id=payload.thread_id)
-            with self.store.tx() as db:
-                db.execute('DELETE FROM bc_publications WHERE guild_id=? AND channel_id=?', (payload.guild_id, payload.thread_id))
+            from .book_removal_projection import retained_removal_publication
+            if not retained_removal_publication(self.store, payload.guild_id, channel_id=payload.thread_id):
+                with self.store.tx() as db:
+                    db.execute('DELETE FROM bc_publications WHERE guild_id=? AND channel_id=?', (payload.guild_id, payload.thread_id))
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -1070,8 +1072,12 @@ class Club(commands.Cog):
         if payload.guild_id:
             async with self.service.locks[payload.guild_id]:
                 self.store.delete_essay(payload.guild_id, source_id=payload.message_id)
-                with self.store.tx() as db:
-                    db.execute('DELETE FROM bc_publications WHERE guild_id=? AND message_id=?', (payload.guild_id, payload.message_id))
+                from .book_removal_projection import retained_removal_publication
+                if not retained_removal_publication(self.store, payload.guild_id,
+                                                     channel_id=getattr(payload, 'channel_id', None),
+                                                     message_id=payload.message_id):
+                    with self.store.tx() as db:
+                        db.execute('DELETE FROM bc_publications WHERE guild_id=? AND message_id=?', (payload.guild_id, payload.message_id))
             if getattr(payload, 'channel_id', None) is not None:
                 await self.refresh_essay_message(payload)
 

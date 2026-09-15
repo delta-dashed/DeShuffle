@@ -261,6 +261,9 @@ class Store:
             if not db.execute("SELECT 1 FROM bc_migrations WHERE version=12").fetchone():
                 from .book_trash import migrate
                 migrate(db)
+            if not db.execute("SELECT 1 FROM bc_migrations WHERE version=13").fetchone():
+                from .book_removal import migrate
+                migrate(db)
 
     @contextmanager
     def tx(self):
@@ -882,8 +885,10 @@ class Store:
 
     def register_essay(self, guild_id, book_id, source_id, channel_id, author_id, title, url, *, correct=False,
                        managed=None, submitted=None):
+        from .book_removal import assert_essay_registration_allowed
         with self.tx() as db:
             self._active_book(db, guild_id, book_id)
+            assert_essay_registration_allowed(db, guild_id, source_id, channel_id)
             old = db.execute("SELECT * FROM bc_essays WHERE guild_id=? AND source_id=?", (guild_id, source_id)).fetchone()
             if old and (old["book_id"] != book_id or old["author_id"] != author_id) and not correct:
                 raise ClubError("Работа уже связана с книгой; используйте исправление связи.")

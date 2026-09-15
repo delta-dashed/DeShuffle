@@ -27,7 +27,7 @@ class BookPlanTests(ClubFixture, unittest.TestCase):
         self.assertEqual(migrated.one('PRAGMA user_version')['user_version'], 27)
         self.assertEqual(migrated.one('SELECT note FROM legacy')['note'], 'keep')
         self.assertEqual(Store(self.path).rows('SELECT version FROM bc_migrations ORDER BY version'),
-                         [{'version': value} for value in range(1, 13)])
+                         [{'version': value} for value in range(1, 14)])
 
     def test_plan_change_and_clear_do_not_create_or_cancel_meetings(self):
         self.action('volunteer')

@@ -162,6 +162,12 @@ class Service:
     async def diagnose(self, guild, *, channels=None, bot_member=None):
         settings = self.store.settings(guild.id)
         result = []
+        from .book_removal import removal_operations
+        failed_removals = [op for op in removal_operations(self.store, guild.id, pending_only=False)
+                           if op['state'] == 'failed']
+        if failed_removals:
+            result.append(f'Приостановлено операций удаления или переноса: {len(failed_removals)}. '
+                          'Откройте «Удалённые книги» → «Статус операции».')
         if any(key[0] == guild.id for key in self.book_updates.failures):
             result.append('Изменения книг сохранены; часть карточек ожидает повторного обновления. '
                           'Проверьте права Discord и журнал, затем /club publish.')
@@ -543,6 +549,11 @@ class Service:
         settings = self.store.settings(guild.id)
         if not settings['published']:
             return
+        from .book_removal import latest_book_removal_operation, removal_resources
+        from .book_removal_projection import process_essay_transfers
+        from .book_removal_delivery import process_disposal
+        await process_essay_transfers(self, guild, book_id)
+        await process_disposal(self, guild, book_id)
         b = self.store.book(guild.id, book_id)
         if b.get('deleted'):
             # Never recreate a deleted book's Discord topic. An existing root
@@ -551,8 +562,26 @@ class Service:
             pub = self.store.publication(key)
             if not pub or not pub['message_id']:
                 return None
+            operation = latest_book_removal_operation(self.store, guild.id, book_id)
+            if operation and any(resource['kind'] == 'delete_book_topic' and resource['state'] == 'done'
+                                 for resource in removal_resources(self.store, guild.id, operation['id'], pending_only=False)):
+                return None
+            details = 'Тема, эссе и события сохранены. Напоминания клуба по книге остановлены. '
+            if operation and operation['mode'] == 'all':
+                details = ('Выбрано удаление темы вместе с эссе. Уже удалённые сообщения восстановить нельзя. '
+                           'Напоминания остановлены; события Discord сохранены. ')
+            if operation and operation.get('target_book_id'):
+                target = self.store.book(guild.id, operation['target_book_id'])
+                target_url = book_url(self.store, target)
+                details = (f'Эссе привязаны к книге «{safe(target["title"])}». '
+                           + (f'[Открыть книгу]({target_url}). ' if target_url else '')
+                           + 'Напоминания по удалённой книге остановлены; события сохранены. ')
+            if operation and operation['state'] != 'done':
+                details += ('Операция приостановлена. ' if operation['state'] == 'failed'
+                            else 'Операция ещё выполняется. ')
+                details += 'Проверьте «Статус операции» в списке удалённых книг. '
             content = (f'**Книга удалена из каталога**\n{safe(b["title"])} · {safe(b["author"])}\n\n'
-                       'Тема, эссе и события сохранены. Напоминания клуба по книге остановлены. '
+                       + details +
                        'Организатор может восстановить книгу кнопкой ниже или через /club library deleted.')
             digest = hashlib.sha256(('removed-book-v1\n' + content).encode()).hexdigest()
             if pub['content_hash'] != digest:

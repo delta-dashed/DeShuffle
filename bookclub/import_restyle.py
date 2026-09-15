@@ -205,7 +205,7 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
             if candidate.get('source_url') and not candidate.get('book_id'):
                 book = store.one('SELECT * FROM bc_books WHERE guild_id=? AND request_key=?',
                                  (guild.id, 'archive:' + candidate['ref']))
-                if book and book['materials'] == candidate['source_url']:
+                if book and not book['deleted'] and book['materials'] == candidate['source_url']:
                     store.update_book(guild.id, book['id'], materials='')
         if store.settings(guild.id)['published']:
             await service.refresh(guild)

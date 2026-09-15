@@ -33,6 +33,8 @@ def change_book_removal(store, guild_id, book_id, *, removed, expected_revision,
             raise ClubError('Книга изменилась. Откройте управление книгой заново.')
         if bool(book['deleted']) == removed:
             return book
+        from .book_removal import assert_restore_allowed
+        assert_restore_allowed(db, guild_id, book_id)
         try:
             db.execute('''UPDATE bc_books SET deleted=?,status_automation=0,
               status_automation_pending=0,revision=revision+1 WHERE id=?''', (int(removed), book_id))
