@@ -56,7 +56,7 @@ async def capture_prepared(importer, guild, actor, source, before_id=None,
         for selection in sorted(selections, key=lambda s: int(s['thread_id']), reverse=True):
             book_id = selection.get('book_id')
             if book_id:
-                book = importer.store.book(guild.id, book_id)
+                book = importer.store.require_active_book(guild.id, book_id)
                 title, author = book['title'], book['author']
             else:
                 title, author = selection['title'], selection['author']
@@ -72,6 +72,17 @@ async def capture_prepared(importer, guild, actor, source, before_id=None,
                  'range_limited': before_id is not None or after_id is not None}
 
     queue, index, after = state['queue'], state['index'], state['after']
+    remaining = queue[index:]
+
+    def validate_remaining_books():
+        # Cursors freeze source selection, not permission to reuse a removed
+        # book. Check the remaining queue before any history read, and again
+        # after awaited reads before exposing the snapshot or advancing progress.
+        for entry in remaining:
+            if entry['book'] is not None:
+                importer.active_snapshot_book(guild.id, entry['book'])
+
+    validate_remaining_books()
     token = uuid.uuid4().hex
     snapshot = {'source_id': source.id, 'books': [], 'messages': [], 'warnings': [],
                 'target_forum_id': importer.store.settings(guild.id)['essays'],
@@ -187,6 +198,7 @@ async def capture_prepared(importer, guild, actor, source, before_id=None,
         for entry in queue[index + 1:]:
             coverage_updates[int(entry['thread_id'])] = 'limited'
     # Commit progress only if the same human selection is still current.
+    validate_remaining_books()
     preparation.finalize(guild.id, source.id, revision, coverage_updates,
                          token=None if complete else token,
                          payload=None if complete else {**state, 'index': index, 'after': after})

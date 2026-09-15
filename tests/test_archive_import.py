@@ -570,5 +570,107 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.runner.analyze.assert_awaited_once()
 
 
+    async def test_removal_after_first_body_ack_preserves_id_and_resumes_without_duplicates(self):
+        self.h.first.content = 'Длинное эссе с границами слов. ' * 90
+        run = await self.scan()
+        budget = self.importer.ledger.budget(self.config.budget_id)
+        hook = await self.service.essay_webhook(self.h.guild, self.h.channels[14])
+        send = hook.send.side_effect
+        async def remove_after_body(content, **kwargs):
+            response = await send(content, **kwargs)
+            if kwargs.get('thread') is not None:
+                hook.send.side_effect = send
+                book = self.store.book(1, self.book['id'])
+                self.store.remove_book(1, book['id'], expected_revision=book['revision'], actor_id=99)
+            return response
+        hook.send.side_effect = remove_after_body
+        with self.assertRaisesRegex(ClubError, 'удалена'):
+            await self.apply(run)
+        first = self.store.publication('essay-import:1:61:message:61:0:v2')
+        self.assertIsNotNone(first['message_id'])
+        self.assertIn(first['message_id'], self.h.channels[first['channel_id']].messages)
+        self.assertIsNone(self.store.publication('essay-import:1:61:message:61:1:v2'))
+        self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'review')
+        self.assertEqual(hook.send.await_count, 2)  # Header and acknowledged part.
+        book = self.store.book(1, self.book['id'])
+        self.store.restore_book(1, book['id'], expected_revision=book['revision'], actor_id=99)
+        self.importer = ArchiveImporter(Service(self.h.bot, Store(self.path, clock=lambda: self.now)), self.config, self.runner)
+        await self.apply(run)
+        self.assertEqual(self.store.publication(first['key'])['message_id'], first['message_id'])
+        expected = 1 + sum(len(archive_chunks(m)) for m in run['snapshot']['messages'] if m['id'] in ('61', '62'))
+        self.assertEqual(hook.send.await_count, expected)
+        self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'done')
+        self.assertEqual(self.importer.ledger.budget(self.config.budget_id), budget)
+        self.runner.analyze.assert_awaited_once()
+
+    async def test_removal_during_attachment_download_stops_before_body_reservation(self):
+        async def download():
+            book = self.store.book(1, self.book['id'])
+            self.store.remove_book(1, book['id'], expected_revision=book['revision'], actor_id=99)
+            return discord.File(io.BytesIO(b'original-file'), filename='essay.txt')
+        self.h.first.attachments = [SimpleNamespace(id=701, filename='essay.txt', size=13,
+                                                    to_file=AsyncMock(side_effect=download))]
+        run = await self.scan()
+        with self.assertRaisesRegex(ClubError, 'удалена'):
+            await self.apply(run)
+        hook, = self.h.hooks.values()
+        self.assertEqual(hook.send.await_count, 1)
+        header = self.store.publication('essay-import:1:61')
+        self.assertIsNotNone(header['message_id'])
+        self.assertIsNone(self.store.publication('essay-import:1:61:message:61:0:v2'))
+        self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'review')
+        self.runner.analyze.assert_awaited_once()
+
+    async def test_removal_of_later_item_during_prior_copy_does_not_claim_its_sources(self):
+        second_book = self.store.create_book(1, 'Следующая книга', 'Другой автор', '', 'second-book')
+        thread = self.h.channel(71, parent_id=41, name='Следующая книга')
+        self.h.human_message(self.h.source, 71, 'Старая шапка', 99)
+        self.h.human_message(thread, 81, 'Эссе по следующей книге.', 2)
+        confirm_book_thread(self.store, second_book, thread_id=71)
+        self.runner.analyze.side_effect = None
+        self.runner.analyze.return_value = {'output': {'essays': [
+            {'book_ref': 'book:' + self.book['id'], 'message_ids': ['61', '62']},
+            {'book_ref': 'book:' + second_book['id'], 'message_ids': ['81']}]} }
+        run = await self.scan()
+        budget = self.importer.ledger.budget(self.config.budget_id)
+        hook = await self.service.essay_webhook(self.h.guild, self.h.channels[14])
+        send = hook.send.side_effect
+        async def remove_next_book(content, **kwargs):
+            response = await send(content, **kwargs)
+            if kwargs.get('thread') is not None:
+                hook.send.side_effect = send
+                book = self.store.book(1, second_book['id'])
+                self.store.remove_book(1, book['id'], expected_revision=book['revision'], actor_id=99)
+            return response
+        hook.send.side_effect = remove_next_book
+        with self.assertRaisesRegex(ClubError, 'удалена'):
+            await self.apply(run)
+        self.assertEqual(len(self.store.essays(self.book['id'])), 1)
+        self.assertIsNone(self.importer.ledger.imported_source(1, 81))
+        self.assertIsNone(self.store.publication('essay-import:1:81'))
+        self.assertEqual(hook.send.await_count, 3)
+        self.assertEqual(self.importer.ledger.run(1, run['id'])['state'], 'review')
+        removed = self.store.book(1, second_book['id'])
+        self.store.restore_book(1, removed['id'], expected_revision=removed['revision'], actor_id=99)
+        await self.apply(run)
+        self.assertEqual(hook.send.await_count, 5)
+        self.assertEqual(len(self.store.essays(second_book['id'])), 1)
+        self.assertEqual(self.importer.ledger.budget(self.config.budget_id), budget)
+        self.runner.analyze.assert_awaited_once()
+
+    async def test_removal_during_login_check_does_not_reserve_quota_or_start_analysis(self):
+        async def login():
+            book = self.store.book(1, self.book['id'])
+            self.store.remove_book(1, book['id'], expected_revision=book['revision'], actor_id=99)
+            return True
+        self.runner.login_status.side_effect = login
+        budget = self.importer.ledger.budget(self.config.budget_id)
+        with self.assertRaisesRegex(ClubError, 'удалена'):
+            await self.scan()
+        self.assertEqual(self.importer.ledger.budget(self.config.budget_id), budget)
+        self.assertEqual(self.store.rows('SELECT * FROM bc_import_runs'), [])
+        self.runner.analyze.assert_not_awaited()
+
+
 if __name__ == '__main__':
     unittest.main()

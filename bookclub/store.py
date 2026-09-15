@@ -258,6 +258,9 @@ class Store:
                   meeting_id TEXT PRIMARY KEY REFERENCES bc_meetings(id),
                   after_id INTEGER NOT NULL, payload TEXT NOT NULL)""")
                 db.execute("INSERT INTO bc_migrations(version) VALUES(11)")
+            if not db.execute("SELECT 1 FROM bc_migrations WHERE version=12").fetchone():
+                from .book_trash import migrate
+                migrate(db)
 
     @contextmanager
     def tx(self):
@@ -318,10 +321,11 @@ class Store:
                 data["scan_after"] = self.clock()
             db.execute("INSERT OR REPLACE INTO bc_settings VALUES(?,?)", (guild_id, json.dumps(data)))
             # Settings affect deadlines too; new generations invalidate all old pending jobs.
-            for m in db.execute("SELECT * FROM bc_meetings WHERE guild_id=?", (guild_id,)).fetchall():
+            for m in db.execute("""SELECT m.* FROM bc_meetings m JOIN bc_books b ON b.id=m.book_id
+              WHERE m.guild_id=? AND b.deleted=0""", (guild_id,)).fetchall():
                 db.execute("UPDATE bc_meetings SET revision=revision+1 WHERE id=?", (m["id"],))
                 self._schedule(db, m["id"], data)
-            for b in db.execute("SELECT id FROM bc_books WHERE guild_id=?", (guild_id,)).fetchall():
+            for b in db.execute("SELECT id FROM bc_books WHERE guild_id=? AND deleted=0", (guild_id,)).fetchall():
                 db.execute("UPDATE bc_books SET revision=revision+1 WHERE id=?", (b[0],))
                 self._essay_schedule(db, b[0], data)
 
@@ -431,12 +435,34 @@ class Store:
         with self.tx() as db:
             return self._get(db, "bc_books", guild_id, ident)
 
+    def _active_book(self, db, guild_id, ident):
+        book = self._get(db, "bc_books", guild_id, ident)
+        if book["deleted"]:
+            raise ClubError("Книга удалена из каталога. Организатор может восстановить её через «Удалённые книги» или /club library deleted.")
+        return book
+
+    def require_active_book(self, guild_id, ident):
+        with self.tx() as db:
+            return self._active_book(db, guild_id, ident)
+
+    def remove_book(self, guild_id, book_id, *, expected_revision, actor_id):
+        from .book_trash import change_book_removal
+        return change_book_removal(self, guild_id, book_id, removed=True,
+                                   expected_revision=expected_revision, actor_id=actor_id)
+
+    def restore_book(self, guild_id, book_id, *, expected_revision, actor_id):
+        from .book_trash import change_book_removal
+        return change_book_removal(self, guild_id, book_id, removed=False,
+                                   expected_revision=expected_revision, actor_id=actor_id)
+
     def meeting(self, guild_id, ident):
         with self.tx() as db:
             return self._get(db, "bc_meetings", guild_id, ident)
 
-    def books(self, guild_id):
-        return self.rows("SELECT * FROM bc_books WHERE guild_id=? ORDER BY position,id", (guild_id,))
+    def books(self, guild_id, *, include_deleted=False):
+        return self.rows("SELECT * FROM bc_books WHERE guild_id=?"
+                         + ("" if include_deleted else " AND deleted=0")
+                         + " ORDER BY position,id", (guild_id,))
 
     def create_book(self, guild_id, title, author, materials, request_key):
         self.settings(guild_id)
@@ -491,7 +517,7 @@ class Store:
                 fields[name] = checked_text(fields[name], name, limit, name != "materials")
         settings = self.settings(guild_id)
         with self.tx() as db:
-            book = self._get(db, "bc_books", guild_id, book_id)
+            book = self._active_book(db, guild_id, book_id)
             if expected_revision is not None and book["revision"] != expected_revision:
                 raise ClubError("Книга изменилась. Откройте управление книгой заново.")
             try:
@@ -514,7 +540,7 @@ class Store:
             raise ClubError("Автоматический статус: нужно включить или выключить правило.")
         settings = self.settings(guild_id)
         with self.tx() as db:
-            book = self._get(db, "bc_books", guild_id, book_id)
+            book = self._active_book(db, guild_id, book_id)
             if expected_revision is not None and book["revision"] != expected_revision:
                 raise ClubError("Книга изменилась. Откройте управление книгой заново.")
             if bool(book["status_automation"]) != enabled:
@@ -531,7 +557,7 @@ class Store:
         from .book_status import desired_book_status
 
         book = dict(db.execute("SELECT * FROM bc_books WHERE id=?", (book_id,)).fetchone())
-        if not book["status_automation"] or book["status_automation_pending"] or book["status"] == "read":
+        if book["deleted"] or not book["status_automation"] or book["status_automation_pending"] or book["status"] == "read":
             return False
         meetings = [dict(row) for row in db.execute("SELECT * FROM bc_meetings WHERE book_id=?", (book_id,))]
         target = desired_book_status(book, meetings)
@@ -541,7 +567,7 @@ class Store:
         # Keep the observed meeting state, then retry after the current reading
         # finishes; never silently move another book out of an organizer's way.
         if target == "reading" and db.execute(
-                "SELECT 1 FROM bc_books WHERE guild_id=? AND status='reading' AND id<>?",
+                "SELECT 1 FROM bc_books WHERE guild_id=? AND status='reading' AND deleted=0 AND id<>?",
                 (book["guild_id"], book_id)).fetchone():
             return False
         db.execute("UPDATE bc_books SET status=?,revision=revision+1 WHERE id=?", (target, book_id))
@@ -556,10 +582,10 @@ class Store:
         settings = self.settings(guild_id)
         changed = False
         with self.tx() as db:
-            for row in db.execute('SELECT id FROM bc_books WHERE guild_id=?', (guild_id,)).fetchall():
+            for row in db.execute('SELECT id FROM bc_books WHERE guild_id=? AND deleted=0', (guild_id,)).fetchall():
                 self._essay_schedule(db, row['id'], settings)
             books = [dict(row) for row in db.execute("""SELECT * FROM bc_books WHERE guild_id=?
-              AND status_automation=1 AND status_automation_pending=0 ORDER BY position,id""", (guild_id,))]
+              AND deleted=0 AND status_automation=1 AND status_automation_pending=0 ORDER BY position,id""", (guild_id,))]
             # Free a completed current book before considering a newly started
             # book; iteration order must not introduce a full tick of delay.
             for target in ("read", "reading"):
@@ -572,7 +598,7 @@ class Store:
     def participant(self, guild_id, book_id, user_id, *, joined=True, willing=False):
         settings = self.settings(guild_id)
         with self.tx() as db:
-            self._get(db, "bc_books", guild_id, book_id)
+            self._active_book(db, guild_id, book_id)
             db.execute("INSERT INTO bc_participants VALUES(?,?,?,?) ON CONFLICT(book_id,user_id) DO UPDATE SET willing=excluded.willing,present=excluded.present", (book_id, user_id, int(willing and joined), int(joined)))
             if not joined:
                 meetings = db.execute("SELECT id FROM bc_meetings WHERE book_id=? AND host_id=? AND status IN ('scheduled','active')", (book_id, user_id)).fetchall()
@@ -594,6 +620,7 @@ class Store:
         settings = self.settings(guild_id)
         with self.tx() as db:
             m = self._get(db, "bc_meetings", guild_id, meeting_id)
+            self._active_book(db, guild_id, m['book_id'])
             if not db.execute("SELECT 1 FROM bc_participants WHERE book_id=? AND user_id=? AND present=1", (m["book_id"], user_id)).fetchone():
                 raise ClubError("Сначала присоединитесь к чтению.")
             if absent:
@@ -618,7 +645,7 @@ class Store:
         part = checked_text(part, "Часть", 200)
         chapter = checked_text(chapter, "Последняя глава", 250)
         with self.tx() as db:
-            self._get(db, "bc_books", guild_id, book_id)
+            self._active_book(db, guild_id, book_id)
             db.execute("INSERT OR IGNORE INTO bc_meetings(id,guild_id,book_id,name,part,chapter,request_key,plan_kind) VALUES(?,?,?,?,?,?,?,?)", (uuid.uuid4().hex, guild_id, book_id, name, part, chapter, str(request_key), plan_kind))
             return dict(db.execute("SELECT * FROM bc_meetings WHERE guild_id=? AND request_key=?", (guild_id, str(request_key))).fetchone())
 
@@ -630,6 +657,7 @@ class Store:
         settings = self.settings(guild_id)
         with self.tx() as db:
             meeting = self._get(db, "bc_meetings", guild_id, meeting_id)
+            self._active_book(db, guild_id, meeting['book_id'])
             if expected_revision is not None and meeting["revision"] != expected_revision:
                 raise ClubError("Встреча изменилась. Откройте управление встречей заново.")
             if meeting["plan_kind"] != kind:
@@ -647,6 +675,8 @@ class Store:
         settings = self.settings(guild_id)
         with self.tx() as db:
             m = self._get(db, "bc_meetings", guild_id, meeting_id)
+            if self._get(db, "bc_books", guild_id, m['book_id'])['deleted']:
+                return False
             if m["event_id"] is not None and m["event_id"] != event_id:
                 raise ClubError("Встреча уже связана с другим событием.")
             # Discord scheduled-event lifecycle is monotonic. Delayed gateway
@@ -682,11 +712,17 @@ class Store:
             return True
 
     def _job(self, db, m, kind, target, due):
+        book_id = m['book_id'] if 'book_id' in m.keys() else m['id']
+        if db.execute('SELECT 1 FROM bc_books WHERE id=? AND deleted=1', (book_id,)).fetchone():
+            return
         key = f'{m["id"]}:{m["revision"]}:{kind}:{target}'
         db.execute("INSERT OR IGNORE INTO bc_jobs(key,guild_id,entity_id,revision,kind,target,due) VALUES(?,?,?,?,?,?,?)", (key, m["guild_id"], m["id"], m["revision"], kind, target, int(due)))
 
     def _schedule(self, db, meeting_id, settings):
         m = dict(db.execute("SELECT * FROM bc_meetings WHERE id=?", (meeting_id,)).fetchone())
+        if db.execute('SELECT 1 FROM bc_books WHERE id=? AND deleted=1', (m['book_id'],)).fetchone():
+            db.execute("UPDATE bc_jobs SET state='cancelled' WHERE entity_id=? AND state='pending'", (meeting_id,))
+            return
         # Renaming an event or changing settings revises its reminder jobs, but
         # must not lose a host invitation that is still waiting for delivery.
         # Keep its original due time; a revision must not revive stale notices.
@@ -717,6 +753,7 @@ class Store:
         settings = self.settings(guild_id)
         with self.tx() as db:
             m = self._get(db, "bc_meetings", guild_id, meeting_id)
+            self._active_book(db, guild_id, m['book_id'])
             if m["status"] != "scheduled" or not m["start"] or m["start"] <= self.clock():
                 raise ClubError("Назначение доступно только для будущей встречи.")
             if m["host_version"] != version:
@@ -768,7 +805,8 @@ class Store:
     def _pick(self, db, meeting_id, settings, live_ids):
         m = dict(db.execute("SELECT * FROM bc_meetings WHERE id=?", (meeting_id,)).fetchone())
         candidates = db.execute("""SELECT p.user_id,
-          (SELECT COUNT(*) FROM bc_meetings x WHERE x.guild_id=? AND x.id<>? AND x.host_id=p.user_id
+          (SELECT COUNT(*) FROM bc_meetings x JOIN bc_books xb ON xb.id=x.book_id
+           WHERE x.guild_id=? AND x.id<>? AND x.host_id=p.user_id AND xb.deleted=0
            AND x.host_state IN ('confirmed','pending') AND x.status='scheduled' AND x.start>?) AS upcoming,
           COALESCE((SELECT MAX(h.completed_at) FROM bc_host_history h WHERE h.guild_id=? AND h.user_id=p.user_id),0) AS last
           FROM bc_participants p WHERE p.book_id=? AND p.willing=1 AND p.present=1
@@ -784,7 +822,8 @@ class Store:
     def expire_offers(self, guild_id, live_ids):
         settings = self.settings(guild_id)
         with self.tx() as db:
-            expired = db.execute("SELECT * FROM bc_meetings WHERE guild_id=? AND host_state='pending' AND offer_until<=?", (guild_id, self.clock())).fetchall()
+            expired = db.execute("""SELECT m.* FROM bc_meetings m JOIN bc_books b ON b.id=m.book_id
+              WHERE m.guild_id=? AND b.deleted=0 AND m.host_state='pending' AND m.offer_until<=?""", (guild_id, self.clock())).fetchall()
             for m in expired:
                 db.execute("INSERT OR IGNORE INTO bc_declines VALUES(?,?)", (m["id"], m["host_id"]))
                 self._clear_host(db, m["id"])
@@ -813,6 +852,7 @@ class Store:
                 fields[key] = checked_text(fields[key], key, 4000, False)
         with self.tx() as db:
             m = self._plan_access(db, guild_id, meeting_id, actor_id, organizer)
+            self._active_book(db, guild_id, m['book_id'])
             if generation != m["plan_generation"] or not m["host_id"]:
                 raise ClubError("Ведущий изменился. Откройте новый план.")
             db.execute("INSERT OR IGNORE INTO bc_plans(meeting_id,generation,owner_id) VALUES(?,?,?)", (meeting_id, generation, m["host_id"]))
@@ -830,6 +870,7 @@ class Store:
             raise ClubError("Передать черновик может организатор.")
         with self.tx() as db:
             m = self._plan_access(db, guild_id, meeting_id, actor_id, True)
+            self._active_book(db, guild_id, m['book_id'])
             if not m["host_id"] or m["host_state"] != "confirmed":
                 raise ClubError("Сначала подтвердите нового ведущего.")
             if db.execute("SELECT 1 FROM bc_plans WHERE meeting_id=? AND generation=?", (meeting_id, m["plan_generation"])).fetchone():
@@ -842,7 +883,7 @@ class Store:
     def register_essay(self, guild_id, book_id, source_id, channel_id, author_id, title, url, *, correct=False,
                        managed=None, submitted=None):
         with self.tx() as db:
-            self._get(db, "bc_books", guild_id, book_id)
+            self._active_book(db, guild_id, book_id)
             old = db.execute("SELECT * FROM bc_essays WHERE guild_id=? AND source_id=?", (guild_id, source_id)).fetchone()
             if old and (old["book_id"] != book_id or old["author_id"] != author_id) and not correct:
                 raise ClubError("Работа уже связана с книгой; используйте исправление связи.")
@@ -878,6 +919,9 @@ class Store:
 
     def _essay_schedule(self, db, book_id, settings):
         b = dict(db.execute("SELECT * FROM bc_books WHERE id=?", (book_id,)).fetchone())
+        if b['deleted']:
+            db.execute("UPDATE bc_jobs SET state='cancelled' WHERE entity_id=? AND state='pending'", (book_id,))
+            return
         # A date entered by hand is never authoritative. Only one confirmed,
         # scheduled essay discussion can define the deadline; ambiguity pauses it.
         meetings = db.execute("""SELECT * FROM bc_meetings WHERE book_id=? AND plan_kind='essay'
@@ -919,7 +963,10 @@ class Store:
                 return False
             table = "bc_books" if row["kind"].startswith("essay") else "bc_meetings"
             entity = db.execute(f"SELECT * FROM {table} WHERE id=? AND revision=?", (row["entity_id"], row["revision"])).fetchone()
-            if not entity or (table == "bc_meetings" and (entity["status"] != "scheduled" or entity["start"] <= self.clock())):
+            book_id = entity['id'] if entity and table == 'bc_books' else entity['book_id'] if entity else None
+            deleted = db.execute('SELECT deleted FROM bc_books WHERE id=?', (book_id,)).fetchone()
+            if (not entity or not deleted or deleted['deleted']
+                    or (table == "bc_meetings" and (entity["status"] != "scheduled" or entity["start"] <= self.clock()))):
                 db.execute("UPDATE bc_jobs SET state='cancelled' WHERE key=?", (key,))
                 return False
             if row["kind"] in ("prepare", "escalate"):

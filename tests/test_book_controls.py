@@ -22,6 +22,9 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.h = DiscordHarness()
         self.cog = Club(self.h.bot, self.store)
         self.service = self.cog.service
+        # Publication is queued after the durable write; these controls tests
+        # inspect the queue request and flush transport explicitly when needed.
+        self.service.request_book_refresh = Mock()
         m = self.meeting
         self.h.event(m['event_id'], name=m['name'],
                      start_time=datetime.fromtimestamp(m['start'], timezone.utc),
@@ -244,6 +247,8 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         interaction = self.interaction()
         await view.change_status(interaction)
         self.assertEqual(self.current()['status'], 'reading')
+        self.service.request_book_refresh.assert_called_once_with(self.h.guild, self.book['id'])
+        await self.service.refresh(self.h.guild)
         self.assertEqual(self.store.publication(pub['key'])['channel_id'], pub['channel_id'])
         self.assertEqual(forum.create_thread.await_count, before_count)
         desired = self.service.forum_tags.bindings(1, forum)['reading']
@@ -270,6 +275,7 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         view.status._values = ['proposed']
         await view.change_status(self.interaction())
         self.assertEqual(self.current(), before)
+        self.service.request_book_refresh.assert_not_called()
         for invalid in ([], ['read', 'reading'], ['deleted']):
             with self.subTest(invalid=invalid):
                 view = self.view()
@@ -432,6 +438,131 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         await view.change_status(self.interaction())
         self.assertEqual(self.current()['status'], before['status'])
         self.assertFalse(self.current()['status_automation'])
+        self.service.request_book_refresh.assert_called_once_with(self.h.guild, self.book['id'])
+
+    async def test_all_saves_finish_while_guild_refresh_lock_is_held(self):
+        gate = asyncio.Event()
+
+        async def blocked_refresh(_):
+            await gate.wait()
+
+        self.service.refresh = AsyncMock(side_effect=blocked_refresh)
+        for kind in ('status', 'details', 'plan', 'automation_off', 'automation_on'):
+            with self.subTest(kind=kind):
+                if kind == 'automation_off':
+                    self.store.set_book_status_automation(1, self.book['id'], True)
+                elif kind == 'automation_on':
+                    self.store.set_book_status_automation(1, self.book['id'], False)
+                before = self.current()
+                if kind == 'status':
+                    view = self.view()
+                    view.status._values = ['read']
+                    action = view.change_status
+                elif kind == 'details':
+                    modal = self.modal()
+                    modal.fields['title']._value = 'Быстрое изменение'
+                    action = modal.on_submit
+                elif kind == 'plan':
+                    modal = PlanMeetingsModal(self.cog, self.current(), 99)
+                    modal.count._value = '4'
+                    action = modal.on_submit
+                elif kind == 'automation_off':
+                    action = self.view().automation.callback
+                else:
+                    action = BookAutomationConfirmation(self.cog, self.current(), 99).confirm.callback
+                self.service.request_book_refresh.reset_mock()
+                interaction = self.interaction()
+
+                async def observe_response(**kwargs):
+                    self.service.request_book_refresh.assert_called_once_with(self.h.guild, self.book['id'])
+                    self.assertGreater(self.current()['revision'], before['revision'])
+                    self.assertEqual(kwargs['view'].book, self.current())
+
+                interaction.edit_original_response.side_effect = observe_response
+                async with self.service.locks[1]:
+                    await asyncio.wait_for(action(interaction), timeout=0.25)
+                    self.assertTrue(self.service.locks[1].locked())
+                    interaction.edit_original_response.assert_awaited_once()
+                self.service.refresh.assert_not_awaited()
+        # Every write still fetches fresh member and forum permissions.
+        self.assertEqual(self.h.guild.fetch_member.await_count, 5)
+        self.assertEqual(self.h.bot.fetch_channel.await_count, 5)
+
+    async def test_revision_change_during_rest_authorization_rejects_submission(self):
+        view = self.view()
+        view.status._values = ['read']
+        actor = self.service.actor
+
+        async def racing_authorization(guild, actor_id):
+            result = await actor(guild, actor_id)
+            self.store.update_book(1, self.book['id'], title='Правка другого организатора')
+            return result
+
+        self.service.actor = racing_authorization
+        interaction = self.interaction()
+        async with self.service.locks[1]:
+            with self.assertRaisesRegex(ClubError, 'изменена'):
+                await asyncio.wait_for(view.change_status(interaction), timeout=0.25)
+        self.assertEqual(self.current()['title'], 'Правка другого организатора')
+        self.assertEqual(self.current()['status'], 'proposed')
+        self.service.request_book_refresh.assert_not_called()
+        interaction.edit_original_response.assert_not_awaited()
+
+    async def test_slash_book_edit_saves_and_replies_while_publication_lock_is_held(self):
+        before = self.current()
+        interaction = self.interaction()
+        ctx = SimpleNamespace(guild=self.h.guild, author=self.h.members[99],
+                              interaction=interaction, command=self.cog.book_edit)
+        update_book = self.store.update_book
+        self.store.update_book = Mock(wraps=update_book)
+
+        async def blocked_refresh(_):
+            await asyncio.Event().wait()
+
+        self.service.refresh = AsyncMock(side_effect=blocked_refresh)
+
+        async def observe_response(content, **kwargs):
+            self.assertEqual(self.current()['status'], 'read')
+            self.assertEqual(self.current()['title'], 'Правка slash-командой')
+            self.assertTrue(kwargs['ephemeral'])
+            self.assertIn('Сохранено', content)
+            self.service.request_book_refresh.assert_called_once_with(self.h.guild, self.book['id'])
+
+        interaction.followup.send.side_effect = observe_response
+        async with self.service.locks[1]:
+            await asyncio.wait_for(self.cog.book_edit.callback(
+                self.cog, ctx, self.book['id'], status='Прочитано', title='Правка slash-командой',
+                reading_meetings='4'), timeout=0.25)
+            self.assertTrue(self.service.locks[1].locked())
+        interaction.followup.send.assert_awaited_once()
+        self.service.refresh.assert_not_awaited()
+        self.assertEqual(self.store.update_book.call_args.kwargs['expected_revision'], before['revision'])
+        self.assertEqual(self.store.update_book.call_args.kwargs['status_actor_id'], 99)
+        self.assertFalse(self.current()['status_automation'])
+        self.h.guild.fetch_member.assert_awaited_once_with(99)
+        self.h.bot.fetch_channel.assert_awaited_once_with(13)
+
+    async def test_slash_book_edit_rechecks_fresh_organizer_permissions_before_saving(self):
+        interaction = self.interaction()
+        ctx = SimpleNamespace(guild=self.h.guild, author=self.h.members[99],
+                              interaction=interaction, command=self.cog.book_edit)
+        self.h.guild.owner_id = 90
+        self.store.configure(1, {**CONFIG, 'organizers': [], 'organizer_roles': [22]})
+        fresh_member = Mock(spec=discord.Member)
+        fresh_member.id, fresh_member.bot, fresh_member.roles = 99, False, []
+        self.h.guild.fetch_member.side_effect = None
+        self.h.guild.fetch_member.return_value = fresh_member
+        self.assertTrue(self.service.interaction_organizer(interaction))
+        before = self.current()
+        async with self.service.locks[1]:
+            with self.assertRaisesRegex(ClubError, 'организатор'):
+                await asyncio.wait_for(self.cog.book_edit.callback(
+                    self.cog, ctx, self.book['id'], status='Прочитано'), timeout=0.25)
+        self.assertEqual(self.current(), before)
+        self.service.request_book_refresh.assert_not_called()
+        interaction.followup.send.assert_not_awaited()
+        self.h.guild.fetch_member.assert_awaited_once_with(99)
+        self.h.bot.fetch_channel.assert_awaited_once_with(13)
 
 
 if __name__ == '__main__':

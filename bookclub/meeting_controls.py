@@ -226,7 +226,7 @@ class BookMeetings(OrganizerView):
     @discord.ui.button(label='Добавить встречу', style=discord.ButtonStyle.success, row=1)
     async def add(self, interaction, button):
         self.modal_access(interaction)
-        self.cog.store.book(self.guild_id, self.book['id'])
+        self.cog.store.require_active_book(self.guild_id, self.book['id'])
         await interaction.response.send_modal(MeetingModal(self, 'create', request_key=f'meeting-form:{interaction.id}'))
 
 
@@ -236,7 +236,7 @@ async def open_book_meetings(cog, interaction, book_id, *, page=0):
     await interaction.response.defer(ephemeral=True)
     async with cog.service.locks[interaction.guild_id]:
         await _organizer(cog.service, interaction.guild, interaction.user.id)
-        book = cog.store.book(interaction.guild_id, book_id)
+        book = cog.store.require_active_book(interaction.guild_id, book_id)
         await cog.service.reconcile(interaction.guild)
         meetings = cog.store.rows('''SELECT * FROM bc_meetings WHERE guild_id=? AND book_id=?
             ORDER BY CASE status WHEN 'scheduled' THEN 0 WHEN 'active' THEN 1 WHEN 'draft' THEN 2 ELSE 3 END,
