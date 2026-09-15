@@ -39,6 +39,7 @@ class Service:
         self.forum_tags = ForumTags(self)
         self.delivery = DeliveryJournal(self)
         self.last_essay_scan = {}
+        self.missing_format_pin = set()
 
     async def setup_actor(self, guild, user_id):
         if guild is None:
@@ -174,6 +175,8 @@ class Service:
                     required += ['manage_webhooks']
                 if key == 'voice':
                     required += ['connect', 'create_events', 'manage_events']
+                if key == 'news':
+                    required += ['pin_messages']
                 missing = [p for p in required if not getattr(permissions, p, False)]
                 if key in ('books', 'essays'):
                     try:
@@ -550,7 +553,21 @@ class Service:
         channel = await self.channel(guild, rules['channel_id'])
         message = await channel.fetch_message(rules['message_id'])
         if not message.pinned:
-            await message.pin(reason='Общий формат книжного клуба')
+            # Since February 2026 Manage Messages no longer grants pinning.
+            # Keep all cards usable when this separate permission is missing.
+            if not getattr(channel.permissions_for(guild.me), 'pin_messages', False):
+                if guild.id not in self.missing_format_pin:
+                    log.warning('Club format needs Pin Messages in channel %s', channel.id)
+                    self.missing_format_pin.add(guild.id)
+                return
+            try:
+                await message.pin(reason='Общий формат книжного клуба')
+            except discord.Forbidden:
+                if guild.id not in self.missing_format_pin:
+                    log.warning('Discord refused to pin club format in channel %s', channel.id)
+                    self.missing_format_pin.add(guild.id)
+                return
+        self.missing_format_pin.discard(guild.id)
 
     async def essay_access(self, guild, book_id, actor_id):
         member, _ = await self.actor(guild, actor_id)

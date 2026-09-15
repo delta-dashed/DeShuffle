@@ -34,6 +34,8 @@ def required_permissions(purpose, settings):
     if purpose == 'voice':
         return result + ['connect', 'create_events', 'manage_events']
     result += ['send_messages', 'read_message_history', 'send_messages_in_threads']
+    if purpose == 'news':
+        result += ['pin_messages']
     if purpose in ('books', 'essays'):
         result += ['manage_threads']
     if purpose == 'essays' and settings['essay_webhooks']:

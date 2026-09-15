@@ -143,6 +143,22 @@ class PresentationDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
             await modal.on_submit(self.h.interaction(99))
         self.assertEqual(get_format(self.store, 1)['revision'], 0)
 
+    async def test_missing_pin_permission_preserves_cards_and_retries_after_grant(self):
+        self.store.set_published(1)
+        permissions = self.h.channels[11].permissions_for.return_value
+        permissions.pin_messages = False
+        with self.assertLogs('bookclub.service', level='WARNING') as captured:
+            await self.service.refresh(self.h.guild)
+            await self.service.refresh(self.h.guild)
+        self.assertEqual(len(captured.output), 1)
+        pub = self.store.publication('format:1')
+        message = self.h.channels[11].messages[pub['message_id']]
+        message.pin.assert_not_awaited()
+        permissions.pin_messages = True
+        await self.service.refresh(self.h.guild)
+        message.pin.assert_awaited_once()
+        self.assertEqual(pub['message_id'], self.store.publication('format:1')['message_id'])
+
     async def test_inline_catalog_repairs_deleted_section_link_in_same_refresh(self):
         contents = ['## Сейчас читаем\nКнига', '## Архив\nПрошлые книги', '## Предложения\nНовые книги']
         root = await self.service.paged_post(self.h.guild, 'catalog:1', 13, 'Каталог', contents, inline_first=True)

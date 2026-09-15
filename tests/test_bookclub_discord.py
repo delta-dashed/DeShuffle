@@ -91,7 +91,7 @@ class DiscordHarness:
         channel.parent = self.channels.get(parent_id)
         channel.jump_url = f'https://discord.com/channels/1/{ident}'
         channel.messages = {}
-        channel.permissions_for.return_value = SimpleNamespace(**dict.fromkeys(('view_channel','send_messages','read_message_history','send_messages_in_threads','manage_threads','manage_webhooks','manage_channels','connect','create_events','manage_events'), True))
+        channel.permissions_for.return_value = SimpleNamespace(**dict.fromkeys(('view_channel','send_messages','read_message_history','send_messages_in_threads','manage_threads','manage_webhooks','manage_channels','connect','create_events','manage_events','pin_messages'), True))
         async def fetch_message(message_id):
             if message_id not in channel.messages:
                 raise not_found()
