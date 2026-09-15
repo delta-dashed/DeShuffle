@@ -97,7 +97,7 @@ class SetupStoreTests(StoreFixture, unittest.TestCase):
         restored = Store(self.path)
         self.assertEqual(restored.setup_resource(1, "news")["channel_id"], 11)
         self.assertEqual(restored.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": i} for i in range(1, 9)])
+                         [{"version": i} for i in range(1, 12)])
 
 
 class ConfigImportTests(StoreFixture, unittest.TestCase):
@@ -128,7 +128,9 @@ class ConfigImportTests(StoreFixture, unittest.TestCase):
     def test_interval_file_change_preserves_runtime_channels_and_updates_deadlines(self):
         self.store.import_config(1, CONFIG)
         book = self.store.create_book(1, "Книга", "Автор", "", "book")
-        self.store.update_book(1, book["id"], deadline=self.store.clock() + 86400 * 5)
+        meeting = self.store.draft_meeting(1, book['id'], 'Эссе', 'Эссе', 'Вся книга', 'essay', plan_kind='essay')
+        self.store.sync_event(1, meeting['id'], event_id=999, name='Эссе', start=self.store.clock() + 86400 * 6,
+                              end=None, voice_id=15, status='scheduled')
         self.store.configure(1, {**self.store.settings(1), "essays": 140})
         self.store.import_config(1, {**CONFIG, "essay_hours": 48})
         self.assertEqual(self.store.settings(1)["essays"], 140)

@@ -103,7 +103,7 @@ class PublicationDestinationTests(ClubFixture, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(before, self.capture_history(old_channels))
         await self.service.refresh(self.h.guild)
         self.assertEqual(self.new_forum.create_thread.await_count, 2)
-        self.new_news.send.assert_awaited_once()
+        self.assertEqual(self.new_news.send.await_count, 2)
         self.assertEqual(before, self.capture_history(old_channels))
 
 

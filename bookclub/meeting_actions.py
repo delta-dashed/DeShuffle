@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import discord
 
 from .store import ClubError, checked_text, parse_time
+from .event_delivery import event_description, find_draft_events
 
 
 async def _organizer(service, guild, actor_id):
@@ -53,10 +54,8 @@ async def _current(service, guild, meeting_id, expected_revision):
 
 
 async def _recover_draft(service, guild, meeting):
-    marker = f'[bookclub:{meeting["id"]}]'
     events = await guild.fetch_scheduled_events()
-    matches = [event for event in events if marker in (event.description or '').splitlines()
-               and event.guild_id == guild.id and event.entity_type == discord.EntityType.voice]
+    matches = find_draft_events(service.store, guild, meeting, events, service.bot.user.id)
     if len(matches) != 1:
         raise ClubError('Предыдущая попытка создания не подтверждена. Используйте /club recover_event; повторное событие не создано.')
     service.sync(guild, meeting, matches[0])
@@ -97,12 +96,15 @@ async def _change_event(service, guild, meeting, change, confirmed):
     return event
 
 
-async def create_meeting(service, guild, actor_id, book_id, *, name, date, minutes, part, chapter, request_key):
+async def create_meeting(service, guild, actor_id, book_id, *, name, date, minutes, part, chapter, request_key,
+                         plan_kind='reading'):
     if guild is None:
         raise ClubError('Управление встречами доступно только на сервере.')
     async with service.locks[guild.id]:
         await _organizer(service, guild, actor_id)
         service.store.book(guild.id, book_id)
+        if plan_kind not in {'reading', 'essay'}:
+            raise ClubError('Выберите тип встречи: по книге или обсуждение эссе.')
         name = checked_text(name, 'Название встречи', 100)
         part = checked_text(part, 'Часть', 200)
         chapter = checked_text(chapter, 'Последняя глава', 250)
@@ -118,7 +120,7 @@ async def create_meeting(service, guild, actor_id, book_id, *, name, date, minut
             else:
                 result = await _recover_draft(service, guild, existing)
         else:
-            draft = service.store.draft_meeting(guild.id, book_id, name, part, chapter, request_key)
+            draft = service.store.draft_meeting(guild.id, book_id, name, part, chapter, request_key, plan_kind=plan_kind)
             try:
                 await service.create_event(guild, draft, start, end)
             except (discord.HTTPException, OSError, asyncio.TimeoutError) as exc:
@@ -169,7 +171,7 @@ async def edit_meeting(service, guild, actor_id, meeting_id, *, name=None, part,
         boundary_changed = part != meeting['part'] or chapter != meeting['chapter']
         fields = {}
         if boundary_changed:
-            fields['description'] = f'{part}; до главы {chapter} включительно.\n[bookclub:{meeting_id}]'
+            fields['description'] = event_description(service.store, guild.id, {**meeting, 'part': part, 'chapter': chapter})
         if name is not None and name != meeting['name']:
             fields['name'] = name
         if fields:

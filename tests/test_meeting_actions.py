@@ -61,6 +61,21 @@ class MeetingActionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.event.cancel.assert_not_awaited()
         self.service.refresh.assert_not_awaited()
 
+    async def test_explicit_essay_kind_is_saved_without_changing_book_status_on_scheduling(self):
+        before = self.store.book(1, self.book['id'])['status']
+        result = await self.create(plan_kind='essay')
+        self.assertEqual(result['plan_kind'], 'essay')
+        self.assertEqual(result['status'], 'scheduled')
+        self.assertEqual(self.store.book(1, self.book['id'])['status'], before)
+        replay = await self.create(plan_kind='essay')
+        self.assertEqual(replay['id'], result['id'])
+        self.guild.create_scheduled_event.assert_awaited_once()
+
+    async def test_invalid_kind_is_rejected_before_discord_creation(self):
+        with self.assertRaises(ClubError):
+            await self.create(plan_kind='guessed-from-title')
+        self.guild.create_scheduled_event.assert_not_awaited()
+
     async def test_revoked_club_access_blocks_organizer(self):
         self.h.channels[13].permissions_for.return_value.view_channel = False
         with self.assertRaises(ClubError):
@@ -194,7 +209,7 @@ class MeetingActionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertGreater(result['revision'], previous['revision'])
         self.assertFalse(self.store.plan(1, result['id'], 1)['ready'])
         self.assertTrue(all(job['revision'] == result['revision'] for job in self.jobs()))
-        self.assertIn(f'[bookclub:{result["id"]}]', self.event.description)
+        self.assertNotIn('[bookclub:', self.event.description)
 
     async def test_boundary_keeps_invitation_original_due(self):
         self.action('offer', organizer=True, candidate=1)

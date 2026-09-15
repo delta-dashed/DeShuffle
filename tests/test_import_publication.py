@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
-from bookclub.import_publication import ImportPublisher
+from bookclub.import_publication import ImportPublisher, matches_clean_content
 from bookclub.import_store import ImportStore
 from bookclub.service import Service
 from bookclub.store import ClubError
@@ -15,6 +15,13 @@ from test_bookclub import ClubFixture
 
 
 class ImportPublicationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
+    def test_discord_edge_space_normalization_preserves_internal_text(self):
+        self.assertTrue(matches_clean_content('текст', ' текст'))
+        self.assertTrue(matches_clean_content('текст', 'текст '))
+        self.assertFalse(matches_clean_content('текст', 'те кст'))
+        self.assertTrue(matches_clean_content('текст', '\tтекст\r\n\n'))
+        self.assertFalse(matches_clean_content('два\nабзаца', 'два\n\nабзаца'))
+
     def setUp(self):
         super().setUp()
         self.h = ArchiveHarness()
@@ -30,7 +37,9 @@ class ImportPublicationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def saved_body(self, key=None, body=None):
         key, body = key or self.key, body or self.body
         pub = await self.service.upsert(self.h.guild, key, self.thread.id, body)
-        return pub, self.thread.messages[pub['message_id']]
+        message = self.thread.messages[pub['message_id']]
+        message.content = body + '\n-# bc:' + key  # Historical fixture, before clean deliveries.
+        return pub, message
 
     async def test_changed_legacy_attachment_is_rechecked_before_delete_and_audit(self):
         _, old = await self.saved_body()
@@ -171,13 +180,13 @@ class WebhookImportPublicationTests(ClubFixture, unittest.IsolatedAsyncioTestCas
         self.assertEqual(self.message(pub).content, self.body)
         self.assertEqual(self.message(pub).author.display_name, self.h.members[1].display_name)
         self.assertEqual(self.message(pub).author.display_avatar.url, self.h.members[1].display_avatar.url)
-        self.assertEqual(self.hook.send.await_args.args[0], self.body + '\n-# bc:' + self.key)
+        self.assertEqual(self.hook.send.await_args.args[0], self.body)
         for _ in range(2):
             pub = await self.publish(expected_attachments=[])
             self.assertEqual(pub['message_id'], first_id)
             self.assertEqual(self.message(pub).content, self.body)
         self.hook.send.assert_awaited_once()
-        self.hook.edit_message.assert_awaited_once()
+        self.hook.edit_message.assert_not_awaited()
 
     async def test_existing_v2_marker_is_removed_without_new_copy_or_id_change(self):
         self.store.reserve_publication(self.key, 1, self.thread.id, webhook_id=self.hook.id)
@@ -193,7 +202,7 @@ class WebhookImportPublicationTests(ClubFixture, unittest.IsolatedAsyncioTestCas
         self.hook.send.assert_not_awaited()
         self.hook.edit_message.assert_awaited_once()
 
-    async def test_lost_send_ack_recovers_transient_marker_without_duplicate(self):
+    async def test_lost_send_ack_recovers_clean_intent_without_duplicate(self):
         original = self.hook.send.side_effect
         async def send_then_lose_ack(*args, **kwargs):
             self.hook.send.side_effect = original
@@ -204,7 +213,7 @@ class WebhookImportPublicationTests(ClubFixture, unittest.IsolatedAsyncioTestCas
             await self.publish(expected_attachments=[])
         pending = self.store.publication(self.key)
         self.assertIsNone(pending['message_id'])
-        self.assertEqual(self.copies()[0].content, self.body + '\n-# bc:' + self.key)
+        self.assertEqual(self.copies()[0].content, self.body)
         pub = await self.publish(expected_attachments=[])
         self.assertEqual(self.message(pub).content, self.body)
         self.assertEqual(len(self.copies()), 1)
@@ -218,9 +227,11 @@ class WebhookImportPublicationTests(ClubFixture, unittest.IsolatedAsyncioTestCas
             self.hook.edit_message.side_effect = original
             await original(message_id, **kwargs)
             raise OSError('cleanup acknowledgement lost')
-        self.hook.edit_message.side_effect = edit_then_lose_ack
         file = discord.File(io.BytesIO(b'original-file'), filename='essay.txt')
         try:
+            original_pub = await self.publish(files=[file], expected_attachments=[('essay.txt', 13)])
+            self.message(original_pub).content += '\n-# bc:' + self.key
+            self.hook.edit_message.side_effect = edit_then_lose_ack
             with self.assertRaisesRegex(OSError, 'cleanup acknowledgement lost'):
                 await self.publish(files=[file], expected_attachments=[('essay.txt', 13)])
         finally:
@@ -239,13 +250,13 @@ class WebhookImportPublicationTests(ClubFixture, unittest.IsolatedAsyncioTestCas
         self.hook.send.assert_awaited_once()
         self.hook.edit_message.assert_awaited_once()
 
-    async def test_failed_binding_save_keeps_recovery_marker_until_retry(self):
+    async def test_failed_binding_save_keeps_clean_intent_until_retry(self):
         with patch.object(self.store, 'save_publication', side_effect=OSError('database unavailable')):
             with self.assertRaisesRegex(OSError, 'database unavailable'):
                 await self.publish(expected_attachments=[])
         self.assertIsNone(self.store.publication(self.key)['message_id'])
         old, = self.copies()
-        self.assertEqual(old.content, self.body + '\n-# bc:' + self.key)
+        self.assertEqual(old.content, self.body)
         self.hook.edit_message.assert_not_awaited()
         pub = await self.publish(expected_attachments=[])
         self.assertEqual(pub['message_id'], old.id)

@@ -61,7 +61,7 @@ class EssayDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual((essay['author_id'], essay['managed'], essay['submitted']), (1, 1, 0))
         self.assertIn('Автор: <@1>', starter.content)
         self.assertIn('Карточка книги и другие эссе', starter.content)
-        self.assertIn(f'-# bc:essay-space:{self.book["id"]}:1', starter.content)
+        self.assertNotIn('-# bc:essay-space:', starter.content)
         self.assertEqual(self.store.essays(self.book['id']), [])
         self.assertIn(1, {p['user_id'] for p in self.store.missing_essays(self.book['id'])})
         self.assertFalse(self.h.channels[14].create_thread.await_args.kwargs['allowed_mentions'].everyone)
@@ -188,7 +188,7 @@ class EssayDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(original_book_essay['book_id'], self.book['id'])
         self.assertNotEqual(original_book_essay['source_id'], essay['source_id'])
 
-    async def test_unacknowledged_creation_recovers_marker_after_restart(self):
+    async def test_unacknowledged_creation_recovers_clean_intent_after_restart(self):
         forum = self.h.channels[14]
         original = forum.create_thread.side_effect
 
@@ -258,7 +258,8 @@ class EssayDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.store.essays(second_book['id'])), 2)
         starter = self.h.channels[first['source_id']].messages[first['source_id']]
         self.assertIn('«Другая книга»', starter.content)
-        self.assertIn(f'-# bc:essay-space:{second_book["id"]}:1:{first["source_id"]}', starter.content)
+        self.assertNotIn('-# bc:essay-space:', starter.content)
+        self.assertIsNotNone(self.store.publication(f'essay-space:{second_book["id"]}:1:{first["source_id"]}'))
 
     async def test_long_book_and_display_name_fit_discord_forum_title(self):
         title = 'Очень длинное название книги ' * 6
@@ -348,7 +349,8 @@ class EssayDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         with patch.object(restarted.worker, 'start'):
             await restarted.cog_load()
         restored_views = [call.args[0] for call in self.h.bot.add_view.call_args_list]
-        self.assertEqual(len(restored_views), 3)
+        self.assertEqual(len(restored_views), 4)
+        expected_ids.update({'bc:catalog:1:queue', 'bc:format:1:edit', 'bc:format:1:history'})
         self.assertEqual({child.custom_id for view in restored_views for child in view.children}, expected_ids)
         self.assertTrue(all(view.is_persistent() for view in restored_views))
 

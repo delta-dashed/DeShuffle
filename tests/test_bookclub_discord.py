@@ -91,13 +91,17 @@ class DiscordHarness:
         channel.parent = self.channels.get(parent_id)
         channel.jump_url = f'https://discord.com/channels/1/{ident}'
         channel.messages = {}
-        channel.permissions_for.return_value = SimpleNamespace(**dict.fromkeys(('view_channel','send_messages','read_message_history','send_messages_in_threads','manage_threads','manage_webhooks','manage_channels','connect','create_events','manage_events'), True))
+        channel.permissions_for.return_value = SimpleNamespace(**dict.fromkeys(('view_channel','send_messages','read_message_history','send_messages_in_threads','manage_threads','manage_webhooks','manage_channels','connect','create_events','manage_events','pin_messages'), True))
         async def fetch_message(message_id):
             if message_id not in channel.messages:
                 raise not_found()
             return channel.messages[message_id]
         channel.fetch_message = AsyncMock(side_effect=fetch_message)
-        channel.history = lambda **_: iterate(list(channel.messages.values()))
+        def history(*, limit=100, before=None, after=None, oldest_first=False):
+            rows = sorted(channel.messages.values(), key=lambda m: m.id, reverse=not oldest_first)
+            rows = [m for m in rows if (before is None or m.id < before.id) and (after is None or m.id > after.id)]
+            return iterate(rows[:limit] if limit is not None else rows)
+        channel.history = history
         async def send(content, **kwargs):
             self.seq += 1
             return self.message(channel, self.seq, content, **kwargs)
@@ -130,10 +134,20 @@ class DiscordHarness:
         message.id, message.channel, message.content = ident, channel, content
         message.author = self.bot.user
         message.guild, message.webhook_id, message.attachments = self.guild, None, []
+        message.nonce = kwargs.get('nonce')
+        message.pinned = False
+        async def pin(**kwargs):
+            message.pinned = True
+        message.pin = AsyncMock(side_effect=pin)
+        view = kwargs.get('view')
+        message.components = [SimpleNamespace(to_dict=lambda value=value: value) for value in view.to_components()] if view else []
         message.jump_url = f'https://discord.com/channels/1/{channel.id}/{ident}'
         async def edit(**kwargs):
             if 'content' in kwargs:
                 message.content = kwargs['content']
+            if 'view' in kwargs:
+                view = kwargs['view']
+                message.components = [SimpleNamespace(to_dict=lambda value=value: value) for value in view.to_components()] if view else []
             return message
         message.edit = AsyncMock(side_effect=edit)
         async def delete():
@@ -148,7 +162,7 @@ class DiscordHarness:
         event = SimpleNamespace(id=ident, guild_id=1, guild=self.guild,
             name=fields['name'], start_time=fields['start_time'], end_time=fields.get('end_time'),
             channel_id=getattr(fields.get('channel'), 'id', 15), status=discord.EventStatus.scheduled,
-            entity_type=discord.EntityType.voice, description=fields.get('description', ''))
+            entity_type=discord.EntityType.voice, description=fields.get('description', ''), creator_id=self.bot.user.id)
         async def edit(**updates):
             for key, value in updates.items():
                 setattr(event, key, value)
@@ -195,7 +209,7 @@ class DiscordIntegrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         await self.service.refresh(self.h.guild)
         await self.service.refresh(self.h.guild)
         self.assertEqual(self.h.channels[13].create_thread.await_count, 2)
-        self.assertEqual(self.h.channels[11].send.await_count, 1)
+        self.assertEqual(self.h.channels[11].send.await_count, 2)
         root = self.store.publication(f'book:{self.book["id"]}')
         self.assertEqual(self.h.channels[root['channel_id']].send.await_count, 1)
         for channel in self.h.channels.values():
@@ -353,7 +367,7 @@ class DiscordIntegrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def test_essay_reminders_exclude_nonparticipants_and_already_published(self):
         self.store.set_published(1)
         deadline = self.now + 2 * 86400
-        self.store.update_book(1, self.book['id'], deadline=deadline)
+        self.essay_event(deadline)
         self.store.register_essay(1, self.book['id'], 800, 800, 1, 'Готово', 'url')
         job = next(j for j in self.jobs(self.book) if j['kind'] == 'essay')
         self.now = job['due']

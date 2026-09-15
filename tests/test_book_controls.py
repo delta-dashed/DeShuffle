@@ -3,9 +3,11 @@ import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
-from bookclub.book_controls import (BookControlsView, BookDetailsModal, PlanMeetingsModal,
+import discord
+
+from bookclub.book_controls import (BookAutomationConfirmation, BookControlsView, BookDetailsModal, PlanMeetingsModal,
                                     open_book_controls, panel_content)
 from bookclub.forum_tags import TEMPLATES
 from bookclub.store import ClubError, parse_time
@@ -47,18 +49,69 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.h.members[99].roles = []
         self.store.configure(1, {**CONFIG, 'organizers': [], 'organizer_roles': []})
 
-    async def test_panel_is_private_and_freshly_authorized(self):
+    async def test_panel_is_private_and_authorized_from_current_interaction(self):
         interaction = self.interaction()
         view = await open_book_controls(self.cog, interaction, self.book['id'])
         interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-        self.h.guild.fetch_member.assert_awaited_once_with(99)
-        self.h.bot.fetch_channel.assert_awaited_once_with(13)
+        self.h.guild.fetch_member.assert_not_awaited()
+        self.h.bot.fetch_channel.assert_not_awaited()
         sent = interaction.followup.send.await_args
         self.assertTrue(sent.kwargs['ephemeral'])
         self.assertIs(sent.kwargs['view'], view)
         self.assertEqual(len(view.status.options), 4)
-        self.assertIn('План встреч не задан', sent.args[0])
+        self.assertIn('3 встречи по книге + обсуждение эссе', sent.args[0])
         self.h.channels[13].create_thread.assert_not_awaited()
+
+    async def test_panel_opens_while_refresh_holds_lock_and_rest_is_blocked(self):
+        rest_gate = asyncio.Event()
+        async def blocked_rest(_):
+            await rest_gate.wait()
+        self.h.guild.fetch_member.side_effect = blocked_rest
+        self.h.bot.fetch_channel.side_effect = blocked_rest
+        interaction = self.interaction()
+        lock = self.service.locks[1]
+        async with lock:
+            # A timeout only guards against a regression hanging the test. The
+            # assertion is structural: the panel completes while refresh cannot.
+            view = await asyncio.wait_for(
+                open_book_controls(self.cog, interaction, self.book['id']), timeout=0.25)
+            self.assertTrue(lock.locked())
+            self.assertIs(interaction.followup.send.await_args.kwargs['view'], view)
+        self.h.guild.fetch_member.assert_not_awaited()
+        self.h.bot.fetch_channel.assert_not_awaited()
+
+    async def test_panel_uses_interaction_roles_instead_of_stale_cached_member(self):
+        self.h.guild.owner_id = 90
+        self.store.configure(1, {**CONFIG, 'organizers': [], 'organizer_roles': [22]})
+        interaction = self.interaction()
+        current_member = Mock(spec=discord.Member)
+        current_member.id, current_member.bot = 99, False
+        current_member.guild, current_member.roles = self.h.guild, []
+        interaction.user = current_member
+        self.assertEqual(self.h.members[99].roles[0].id, 22)
+        with self.assertRaisesRegex(ClubError, 'организатор'):
+            await open_book_controls(self.cog, interaction, self.book['id'])
+        interaction.followup.send.assert_not_awaited()
+        self.h.guild.fetch_member.assert_not_awaited()
+
+    async def test_panel_fails_closed_without_cached_forum_access(self):
+        self.h.channels[13].permissions_for.return_value.view_channel = False
+        interaction = self.interaction()
+        with self.assertRaisesRegex(ClubError, 'доступа'):
+            await open_book_controls(self.cog, interaction, self.book['id'])
+        interaction.followup.send.assert_not_awaited()
+        del self.h.channels[13]
+        with self.assertRaisesRegex(ClubError, 'доступа'):
+            await open_book_controls(self.cog, interaction, self.book['id'])
+        interaction.followup.send.assert_not_awaited()
+        self.h.bot.fetch_channel.assert_not_awaited()
+
+    async def test_panel_rejects_disabled_guild_without_showing_book(self):
+        self.service.guild_ids = {2}
+        interaction = self.interaction()
+        with self.assertRaisesRegex(ClubError, 'отключён'):
+            await open_book_controls(self.cog, interaction, self.book['id'])
+        interaction.followup.send.assert_not_awaited()
 
     async def test_member_cannot_open_panel(self):
         interaction = self.interaction(1)
@@ -68,8 +121,10 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_private_controls_bind_guild_and_actor_before_any_response(self):
         view, modal = self.view(), self.modal()
+        confirmation = BookAutomationConfirmation(self.cog, self.current(), 99)
         for action in (view.change_status, view.edit_details.callback, view.edit_plan.callback,
-                       view.meetings.callback, modal.on_submit,
+                       view.meetings.callback, view.automation.callback, confirmation.confirm.callback,
+                       confirmation.back.callback, modal.on_submit,
                        PlanMeetingsModal(self.cog, self.current(), 99).on_submit):
             for wrong in ('actor', 'guild', 'guild_object'):
                 with self.subTest(action=action, wrong=wrong):
@@ -99,8 +154,8 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         await view.edit_details.callback(interaction)
         modal = interaction.response.send_modal.await_args.args[0]
         self.assertIsInstance(modal, BookDetailsModal)
-        self.assertEqual(len(modal.children), 5)
-        self.assertEqual(modal.fields['deadline'].default, '2034-01-01T12:30+03:00')
+        self.assertEqual(len(modal.children), 4)
+        self.assertNotIn('deadline', modal.fields)
         await view.edit_plan.callback(interaction)
         self.assertIsInstance(interaction.response.send_modal.await_args.args[0], PlanMeetingsModal)
         self.h.guild.fetch_member.assert_not_awaited()
@@ -129,6 +184,25 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ClubError, 'организатор'):
                 await action(self.interaction())
         self.assertEqual(self.current(), before)
+
+    async def test_write_rechecks_rest_permissions_when_open_panel_member_is_stale(self):
+        interaction = self.interaction()
+        view = await open_book_controls(self.cog, interaction, self.book['id'])
+        self.h.guild.owner_id = 90
+        self.store.configure(1, {**CONFIG, 'organizers': [], 'organizer_roles': [22]})
+        fresh_member = Mock(spec=discord.Member)
+        fresh_member.id, fresh_member.bot, fresh_member.roles = 99, False, []
+        self.h.guild.fetch_member.side_effect = None
+        self.h.guild.fetch_member.return_value = fresh_member
+        before = self.current()
+        view.status._values = ['reading']
+        self.assertTrue(self.service.interaction_organizer(interaction))
+        with self.assertRaisesRegex(ClubError, 'организатор'):
+            await view.change_status(interaction)
+        self.assertEqual(self.current(), before)
+        self.h.guild.fetch_member.assert_awaited_once_with(99)
+        self.h.bot.fetch_channel.assert_awaited_once_with(13)
+        interaction.edit_original_response.assert_not_awaited()
 
     async def test_submit_rechecks_forum_access_through_rest(self):
         modal = self.modal()
@@ -190,6 +264,7 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.current()['status'], 'proposed')
 
     async def test_same_status_is_noop_and_invalid_selection_is_rejected(self):
+        self.store.set_book_status_automation(1, self.book['id'], False)
         view = self.view()
         before = self.current()
         view.status._values = ['proposed']
@@ -210,13 +285,13 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         before_members = self.store.participants(self.book['id'])
         modal = self.modal()
         for name, value in dict(title='Новое название', author='Уточнённый автор', position='5',
-                                deadline='2034-01-01 12:30', materials='https://example.org/new').items():
+                                materials='https://example.org/new').items():
             modal.fields[name]._value = value
         await modal.on_submit(self.interaction())
         current = self.current()
         self.assertEqual((current['title'], current['author'], current['position']),
                          ('Новое название', 'Уточнённый автор', 5))
-        self.assertEqual(current['deadline'], parse_time('2034-01-01 12:30'))
+        self.assertIsNone(current['deadline'])
         self.assertEqual(self.store.meeting(1, self.meeting['id']), before_meeting)
         self.assertEqual(self.store.essays(self.book['id'], submitted_only=False), before_essays)
         self.assertEqual(self.store.participants(self.book['id']), before_members)
@@ -224,7 +299,6 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def test_empty_deadline_and_materials_clear_without_changing_title(self):
         self.store.update_book(1, self.book['id'], deadline=self.now + 5000)
         modal = self.modal()
-        modal.fields['deadline']._value = ''
         modal.fields['materials']._value = ''
         await modal.on_submit(self.interaction())
         self.assertIsNone(self.current()['deadline'])
@@ -234,7 +308,7 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def test_invalid_modal_fields_leave_book_unchanged(self):
         before = self.current()
         for field, value in [('position', '--1'), ('position', '+-1'), ('position', '1.5'),
-                             ('position', '1000001'), ('position', '-1000001'), ('position', '١'), ('deadline', 'в пятницу'),
+                             ('position', '1000001'), ('position', '-1000001'), ('position', '١'),
                              ('title', '  '), ('author', 'a' * 181), ('materials', 'x' * 4001)]:
             with self.subTest(field=field, value=value[:30]):
                 modal = self.modal()
@@ -271,7 +345,7 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         interaction = self.interaction()
         await plan.on_submit(interaction)
         self.assertEqual(self.current()['reading_meetings'], 4)
-        self.assertIn('4 встреч по книге + 1 встреча по эссе = 5 всего', panel_content(self.cog, self.current()))
+        self.assertIn('4 встречи по книге + обсуждение эссе', panel_content(self.cog, self.current()))
         self.assertEqual(self.store.rows('SELECT * FROM bc_meetings WHERE book_id=?', (self.book['id'],)), meetings)
         self.h.guild.create_scheduled_event.assert_not_awaited()
         self.h.events[self.meeting['event_id']].edit.assert_not_awaited()
@@ -292,6 +366,72 @@ class BookControlsTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
                     await modal.on_submit(self.interaction())
         self.assertEqual(self.current(), before)
         self.h.guild.create_scheduled_event.assert_not_awaited()
+
+    async def test_automation_requires_plan_and_explicit_rule_confirmation(self):
+        self.store.set_book_status_automation(1, self.book['id'], False)
+        view = self.view()
+        self.assertEqual(view.automation.label, 'Включить автостатус')
+        self.assertIn('Автостатус выключен', panel_content(self.cog, self.current()))
+        initial = self.interaction()
+        await view.automation.callback(initial)
+        self.assertIn('3 встреч по книге', initial.followup.send.await_args.args[0])
+        self.store.update_book(1, self.book['id'], reading_meetings=4)
+        before = self.current()
+        view, interaction = self.view(), self.interaction()
+        await view.automation.callback(interaction)
+        sent = interaction.followup.send.await_args
+        self.assertTrue(sent.kwargs['ephemeral'])
+        self.assertIn('4 встреч по книге + 1 обсуждение эссе', sent.args[0])
+        self.assertIn('Отменённые встречи не считаются', sent.args[0])
+        self.assertIn('явно укажите её роль', sent.args[0])
+        confirmation = sent.kwargs['view']
+        self.assertIsInstance(confirmation, BookAutomationConfirmation)
+        self.assertEqual(self.current(), before)
+        confirmed = self.interaction()
+        await confirmation.confirm.callback(confirmed)
+        current = self.current()
+        self.assertTrue(current['status_automation'])
+        self.assertTrue(current['status_automation_pending'])
+        self.assertEqual(current['status'], before['status'])
+        self.assertEqual(confirmed.edit_original_response.await_args.kwargs['view'].automation.label,
+                         'Выключить автостатус')
+        self.h.guild.create_scheduled_event.assert_not_awaited()
+        self.h.events[self.meeting['event_id']].edit.assert_not_awaited()
+
+    async def test_automation_confirmation_rechecks_authorization_and_plan_revision(self):
+        self.store.set_book_status_automation(1, self.book['id'], False)
+        self.store.update_book(1, self.book['id'], reading_meetings=4)
+        confirmation = BookAutomationConfirmation(self.cog, self.current(), 99)
+        self.store.update_book(1, self.book['id'], reading_meetings=3)
+        with self.assertRaisesRegex(ClubError, 'изменена'):
+            await confirmation.confirm.callback(self.interaction())
+        self.assertFalse(self.current()['status_automation'])
+        confirmation = BookAutomationConfirmation(self.cog, self.current(), 99)
+        self.revoke()
+        with self.assertRaisesRegex(ClubError, 'организатор'):
+            await confirmation.confirm.callback(self.interaction())
+        self.assertFalse(self.current()['status_automation'])
+
+    async def test_automation_can_be_disabled_without_changing_status(self):
+        self.store.update_book(1, self.book['id'], reading_meetings=4)
+        self.store.set_book_status_automation(1, self.book['id'], True)
+        before = self.current()
+        interaction = self.interaction()
+        await self.view().automation.callback(interaction)
+        current = self.current()
+        self.assertFalse(current['status_automation'])
+        self.assertEqual(current['status'], before['status'])
+        self.assertIn('Автостатус выключен', interaction.edit_original_response.await_args.kwargs['content'])
+
+    async def test_manual_confirmation_of_same_status_disables_automation(self):
+        self.store.update_book(1, self.book['id'], reading_meetings=4)
+        self.store.set_book_status_automation(1, self.book['id'], True)
+        before = self.current()
+        view = self.view()
+        view.status._values = [before['status']]
+        await view.change_status(self.interaction())
+        self.assertEqual(self.current()['status'], before['status'])
+        self.assertFalse(self.current()['status_automation'])
 
 
 if __name__ == '__main__':

@@ -34,6 +34,8 @@ def required_permissions(purpose, settings):
     if purpose == 'voice':
         return result + ['connect', 'create_events', 'manage_events']
     result += ['send_messages', 'read_message_history', 'send_messages_in_threads']
+    if purpose == 'news':
+        result += ['pin_messages']
     if purpose in ('books', 'essays'):
         result += ['manage_threads']
     if purpose == 'essays' and settings['essay_webhooks']:
@@ -56,7 +58,7 @@ class Provisioner:
     async def check_publications(self, guild, *, repair=False):
         result = []
         for publication in self.store.rows("SELECT * FROM bc_publications WHERE guild_id=? AND state='ready'", (guild.id,)):
-            if not publication['key'].startswith(('book:', 'catalog:', 'meeting:', 'news:', 'chat:')):
+            if not publication['key'].startswith(('book:', 'catalog:', 'meeting:', 'news:', 'chat:', 'format:')):
                 continue
             try:
                 destination = await self.service.channel(guild, publication['channel_id'])

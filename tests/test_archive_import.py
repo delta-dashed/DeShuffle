@@ -11,12 +11,19 @@ import discord
 
 from bookclub.archive_import import ArchiveImporter, validate_plan
 from bookclub.import_config import ImportConfig
+from bookclub.import_preparation import PreparationStore
 from bookclub.import_publication import archive_chunks, archive_header
 from bookclub.service import Service
 from bookclub.store import ClubError, Store
 from test_bookclub import ClubFixture
 from test_bookclub_discord import iterate
 from test_webhook_discord import WebhookHarness
+
+
+def confirm_book_thread(store, book, *, source_id=41, thread_id=51):
+    """Seed a human-approved decision without exercising Discord UI in fixtures."""
+    return PreparationStore(store).save(1, source_id, thread_id, 'included', 99,
+                                         title=book['title'], author=book['author'], book_id=book['id'])
 
 
 class ArchiveHarness(WebhookHarness):
@@ -74,6 +81,7 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
                                       begin_login=AsyncMock(), close=AsyncMock(),
                                       analyze=AsyncMock(side_effect=self.classify))
         self.importer = ArchiveImporter(self.service, self.config, self.runner)
+        confirm_book_thread(self.store, self.book)
 
     async def asyncSetUp(self):
         asyncio.get_running_loop().slow_callback_duration = 1.0
@@ -137,7 +145,7 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.runner.analyze.assert_not_awaited()
         self.assert_no_discord_writes()
 
-    async def test_scan_builds_review_plan_from_book_heading_without_discord_writes(self):
+    async def test_scan_builds_review_plan_from_confirmed_book_without_discord_writes(self):
         run = await self.scan()
         self.assertEqual(run['state'], 'review')
         self.assertEqual(run['plan']['essays'], [{'book_ref': 'book:' + self.book['id'],
@@ -163,22 +171,28 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         run = await self.scan()
         self.assertEqual({m['id'] for m in run['snapshot']['messages']}, {'61', '62', '63'})
 
-    async def test_unknown_book_is_only_proposed_until_confirmation(self):
+    async def test_confirmed_new_book_is_created_only_when_reviewed_plan_is_applied(self):
         self.h.source.messages[51].content = '# Неизвестная книга'
+        await self.importer.preparation.select(self.h.guild, 99, 41, 51, decision='included',
+                                               title='Неизвестная книга', author='Подтверждённый автор', confirm=True)
         run = await self.scan()
         self.assertEqual(run['plan']['essays'][0]['book_ref'], 'source:51')
         self.assertEqual(len(self.store.books(1)), 1)
         self.assert_no_discord_writes()
         await self.apply(run)
         added = next(b for b in self.store.books(1) if b['title'] == 'Неизвестная книга')
+        self.assertEqual(added['author'], 'Подтверждённый автор')
         essay, = self.store.essays(added['id'])
         self.assertEqual(essay['author_id'], 1)
 
-    async def test_forum_uses_topic_name_as_book_and_preserves_starter_essay(self):
+    async def test_forum_uses_confirmed_book_and_preserves_starter_essay(self):
         source = self.h.channel(42, discord.ForumChannel)
-        topic = self.h.channel(71, parent_id=42, name='Книга')
+        topic = self.h.channel(71, parent_id=42, name='Произвольное имя обсуждения')
         starter = self.h.human_message(topic, 71, 'Полное эссе начинается в стартовом посте.', 1)
         self.h.human_message(topic, 72, 'Продолжение.', 1)
+        self.importer.config = replace(self.config, allowed_channel_ids=(41, 42))
+        await self.importer.preparation.select(self.h.guild, 99, 42, 71, decision='included',
+                                               book_id=self.book['id'], confirm=True)
         snapshot = await self.importer.capture(self.h.guild, self.h.members[99], source)
         self.assertEqual({m['id'] for m in snapshot['messages']}, {'71', '72'})
         self.assertTrue(all(m['context_ref'] == 'book:' + self.book['id'] for m in snapshot['messages']))
@@ -191,7 +205,8 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.importer.config = replace(self.config, max_messages=3)
         first = await self.scan()
         self.assertEqual({m['id'] for m in first['snapshot']['messages']}, {'61', '62'})
-        self.assertTrue(any('after:62' in line for line in first['snapshot']['warnings']))
+        self.assertIsInstance(first['snapshot']['continuation'], str)
+        self.assertEqual(first['snapshot']['coverage']['after'], '62')
         await self.apply(first)
         self.h.old_thread.archived = True
         self.h.source.archived_threads.side_effect = lambda **_: iterate([])
@@ -215,6 +230,25 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         for output in invalid:
             with self.subTest(output=output), self.assertRaises(ClubError):
                 validate_plan(run['snapshot'], output)
+        self.assert_no_discord_writes()
+
+    async def test_model_cannot_reassign_messages_between_human_confirmed_books(self):
+        other = self.store.create_book(1, 'Вторая книга', 'Другой автор', '', 'second-book')
+        thread = self.h.channel(71, parent_id=41, name='Вторая книга')
+        self.h.human_message(thread, 72, 'Тот же участник пишет об иной книге.', 1)
+        await self.importer.preparation.select(self.h.guild, 99, 41, 71, decision='included',
+                                               book_id=other['id'], confirm=True)
+        snapshot = await self.importer.preview(self.h.guild, 99, 41)
+        first_ref, other_ref = 'book:' + self.book['id'], 'book:' + other['id']
+        for entries in ([{'book_ref': other_ref, 'message_ids': ['61']}],
+                        [{'book_ref': first_ref, 'message_ids': ['61', '72']}]):
+            with self.subTest(entries=entries), self.assertRaises(ClubError):
+                validate_plan(snapshot, {'essays': entries})
+        accepted = validate_plan(snapshot, {'essays': [
+            {'book_ref': first_ref, 'message_ids': ['61']},
+            {'book_ref': other_ref, 'message_ids': ['72']}]})
+        self.assertEqual([item['author_id'] for item in accepted['essays']], [1, 1])
+        self.runner.analyze.assert_not_awaited()
         self.assert_no_discord_writes()
 
     async def test_invalid_model_result_is_failed_and_budget_stays_charged(self):
@@ -474,6 +508,11 @@ class ArchiveImportTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         run = await self.scan()
         hook = self.h.webhook(14)
         self.store.save_webhook(1, 14, hook.id)
+        key = 'essay-import:1:61'
+        self.store.reserve_publication(key, 1, 14, webhook_id=hook.id)
+        old = await hook.send(archive_header(self.book, 1) + '\n-# bc:' + key,
+                              thread_name='Старый импорт', username='Автор', avatar_url='', wait=True, allowed_mentions=discord.AllowedMentions.none())
+        self.store.save_publication(key, old.channel.id, old.id)
         original_edit = hook.edit_message.side_effect
         observed_binding = []
         async def edit_then_lose_ack(message_id, **kwargs):

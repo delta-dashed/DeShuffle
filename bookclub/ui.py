@@ -277,6 +277,8 @@ class Club(commands.Cog):
         self.service.view_factory = lambda meeting: MeetingView(self, meeting)
         self.service.book_view_factory = lambda book: BookView(self, book)
         self.service.catalog_view_factory = lambda guild_id: CatalogView(self.service, guild_id)
+        from .format_controls import FormatView
+        self.service.format_view_factory = lambda guild_id: FormatView(self.service, guild_id)
         self.importer = ArchiveImporter(self.service, import_config)
 
     async def cog_load(self):
@@ -290,6 +292,8 @@ class Club(commands.Cog):
             self.bot.add_view(BookView(self, book))
         for row in self.store.rows('SELECT guild_id FROM bc_settings'):
             self.bot.add_view(CatalogView(self.service, row['guild_id']))
+            from .format_controls import FormatView
+            self.bot.add_view(FormatView(self.service, row['guild_id']))
         self.worker.start()
 
     async def cog_unload(self):
@@ -396,11 +400,8 @@ class Club(commands.Cog):
     @club.command(name='books', description='Книги и порядок чтения')
     async def books(self, ctx):
         await catalog_access(self.service, ctx.guild, ctx.author.id, write=False)
-        lines = []
-        for b in self.store.books(ctx.guild.id):
-            url = book_url(self.store, b)
-            lines.append(f'{b["position"]}. {safe(b["title"])} · {safe(b["author"])} — {STATUSES[b["status"]]}' + (f'\n{url}' if url else ''))
-        for index, page in enumerate(pages(lines)):
+        from .render import catalog_pages
+        for index, page in enumerate(catalog_pages(self.store, ctx.guild.id)):
             await self.say(ctx, page, view=CatalogView(self.service, ctx.guild.id) if index == 0 else None)
 
     @club.command(name='book_add', description='Предложить книгу')
@@ -422,9 +423,9 @@ class Club(commands.Cog):
             raise ClubError('Прикрепите файл к slash-команде /club library import: предпросмотр виден только вам.')
         await preview_book_file(ctx.interaction, self.service, file)
 
-    @club.command(name='book_edit', description='Изменить книгу, очередь и срок эссе')
+    @club.command(name='book_edit', description='Изменить книгу, очередь и план встреч')
     async def book_edit(self, ctx, book: str, status: Optional[Literal['Предложено', 'В очереди', 'Читаем', 'Прочитано']] = None,
-                        position: Optional[int] = None, deadline: Optional[str] = None, title: Optional[str] = None,
+                        position: Optional[int] = None, title: Optional[str] = None,
                         author: Optional[str] = None, materials: Optional[str] = None, reading_meetings: Optional[str] = None):
         async with self.service.locks[ctx.guild.id]:
             await self.organizer(ctx)
@@ -439,10 +440,8 @@ class Club(commands.Cog):
                 elif value.isdecimal() and len(value) <= 3:
                     fields['reading_meetings'] = int(value)
                 else:
-                    raise ClubError('План: целое число встреч по книге от 1 до 100; «-» убирает план. Разбор эссе добавляется отдельно: +1.')
-            if deadline is not None:
-                fields['deadline'] = None if deadline == '-' else parse_time(deadline, self.store.settings(ctx.guild.id)['timezone'])
-            self.store.update_book(ctx.guild.id, b['id'], **fields)
+                    raise ClubError('План: целое число встреч по книге от 1 до 100; «-» возвращает стандартные 3. Разбор эссе добавляется отдельно: +1.')
+            self.store.update_book(ctx.guild.id, b['id'], status_actor_id=ctx.author.id, **fields)
             await self.service.refresh(ctx.guild)
         await self.say(ctx, 'Книга обновлена; обсуждение и история сохранены.')
 
@@ -466,16 +465,18 @@ class Club(commands.Cog):
         await self.say(ctx, 'Участие обновлено. Готовность к ротации человек отмечает сам через /club join.')
 
     @club.command(name='meeting_add', description='Создать встречу книги и событие Discord')
-    async def meeting_add(self, ctx, book: str, name: str, date: str, part: str, chapter: str, minutes: int = 90):
+    async def meeting_add(self, ctx, book: str, name: str, date: str, part: str, chapter: str, minutes: int = 90,
+                          plan_kind: Literal['reading', 'essay'] = 'reading'):
         from .meeting_actions import create_meeting
         b = self.resolve_book(ctx.guild.id, book)
         request = str(ctx.interaction.id if ctx.interaction else ctx.message.id)
         await create_meeting(self.service, ctx.guild, ctx.author.id, b['id'], name=name, date=date,
-                             part=part, chapter=chapter, minutes=minutes, request_key=request)
+                             part=part, chapter=chapter, minutes=minutes, request_key=request, plan_kind=plan_kind)
         await self.say(ctx, 'Встреча создана. Время теперь берётся из события Discord; ведущего выбирают в /club meeting.')
 
     @club.command(name='meeting_attach', description='Связать существующее событие с книгой')
-    async def meeting_attach(self, ctx, book: str, event: str, part: str, chapter: str):
+    async def meeting_attach(self, ctx, book: str, event: str, part: str, chapter: str,
+                             plan_kind: Literal['reading', 'essay'] = 'reading'):
         async with self.service.locks[ctx.guild.id]:
             await self.organizer(ctx)
             b = self.resolve_book(ctx.guild.id, book)
@@ -487,7 +488,8 @@ class Club(commands.Cog):
             old = self.store.one('SELECT * FROM bc_meetings WHERE event_id=?', (e.id,))
             if old and old['book_id'] != b['id']:
                 raise ClubError('Событие уже связано с другой книгой.')
-            m = old or self.store.draft_meeting(ctx.guild.id, b['id'], e.name, part, chapter, f'attach:{e.id}')
+            m = old or self.store.draft_meeting(ctx.guild.id, b['id'], e.name, part, chapter, f'attach:{e.id}',
+                                               plan_kind=plan_kind)
             self.service.sync(ctx.guild, m, e)
             await self.service.refresh(ctx.guild)
         await self.say(ctx, 'Событие связано с книгой.')
@@ -662,9 +664,92 @@ class Club(commands.Cog):
     @club.group(name='import', description='Временный импорт архива через Codex', invoke_without_command=True)
     async def archive(self, ctx):
         await self.import_context(ctx)
-        await self.say(ctx, 'Временный импорт: preview → login → scan → review → apply. preview не вызывает Codex. '
+        await self.say(ctx, 'Подготовка архива без модели: inventory → prepare → preview. '
+                           'inventory показывает все доступные публичные треды, prepare сохраняет ваш выбор и данные книги. '
+                           'preview канала читает подтверждённую очередь; preview с thread позволяет сначала ознакомиться '
+                           'с неподтверждённым тредом. Продолжайте по cursor до конца выбранного списка. '
+                           'Анализ через scan и новый лимит запусков согласуются отдельно. '
                            'restore восстанавливает failed/unknown по проверенному JSON без нового анализа. '
                            'Настройки и лимиты меняются на машине бота с перезапуском.')
+
+    @archive.command(name='inventory', description='Все публичные треды архива и их подготовка, без модели')
+    async def import_inventory(self, ctx, source: Optional[discord.TextChannel | discord.ForumChannel] = None,
+                               page: int = 1):
+        await self.import_context(ctx)
+        if page < 1:
+            raise ClubError('Номер страницы должен быть не меньше 1.')
+        source, _ = self.import_range(ctx, source, None, None, None)
+        inventory = await self.importer.preparation.inventory(ctx.guild, ctx.author.id, source.id)
+        threads = inventory['threads']
+        page_count = max(1, (len(threads) + 9) // 10)
+        if page > page_count:
+            raise ClubError(f'В перечне {page_count} стр.; выберите существующую страницу.')
+        active = sum(not thread['archived'] for thread in threads)
+        archived = len(threads) - active
+        completeness = 'Полный перечень доступных публичных тредов' if inventory['complete'] else 'Неполный перечень публичных тредов'
+        lines = [f'**{completeness}**: {len(threads)}; активных {active}, архивных {archived}. '
+                 f'Страница {page}/{page_count}.',
+                 'Это перечень тредов, а не число книг или прочитанных эссе. '
+                 'Статусы просмотра относятся к сохранённым фрагментам; новые сообщения могут появиться позже. '
+                 'Codex не вызван; квота запусков и токенов не изменена.']
+        decisions = {'included': 'включён', 'excluded': 'исключён', 'pending': 'нужен выбор человека'}
+        capture_states = {'unread': 'ещё не просмотрен', 'partial': 'просмотрен частично',
+                          'complete': 'предпросмотр завершён', 'limited': 'не просмотрен из-за лимита'}
+        for thread in threads[(page - 1) * 10:page * 10]:
+            status = [decisions.get(thread['decision'], 'нужен выбор человека')]
+            if thread.get('imported_messages', 0):
+                status.append(f'уже импортирован: {thread["imported_messages"]} исходных сообщений')
+            if thread.get('access') is False:
+                status.append('нет доступа к истории')
+            else:
+                status.append(capture_states.get(thread.get('capture_state', 'unread'), 'ещё не просмотрен'))
+            name = safe(thread['name'])
+            state = 'архивный' if thread['archived'] else 'активный'
+            lines.append(f'`{thread["id"]}` · **{name}** ({state}) — {"; ".join(status)}. '
+                         f'[Открыть тред](https://discord.com/channels/{ctx.guild.id}/{thread["id"]})')
+            if thread.get('title'):
+                metadata = f'Книга: {safe(thread["title"])} · {safe(thread.get("author") or "автор не подтверждён")}'
+                if thread.get('book_id'):
+                    metadata += f' · ID `{thread["book_id"]}`'
+                lines.append(metadata)
+            elif thread.get('source_title'):
+                lines.append(f'Первая строка источника (данные книги не подтверждены): {safe(thread["source_title"][:500])}')
+        lines.extend(inventory.get('warnings', []))
+        lines.append('Подтвердить выбор: /club import prepare thread:<ID> decision:included '
+                     'title:<название> author:<автор> confirm:true; '
+                     'для существующей книги укажите book вместо title/author. '
+                     'decision:excluded исключает тред, pending возвращает на проверку.')
+        if page < page_count:
+            lines.append(f'Следующая страница: /club import inventory source:<#{source.id}> page:{page + 1}.')
+        for text in pages(lines):
+            await self.say(ctx, text)
+        data = json.dumps(inventory, ensure_ascii=False, indent=2).encode()
+        await self.say(ctx, 'Полный полученный перечень тредов для проверки:',
+                       file=discord.File(io.BytesIO(data), filename='import-inventory.json'))
+
+    @archive.command(name='prepare', description='Подтвердить книжный тред и его данные или исключить его')
+    async def import_prepare(self, ctx, thread: str, decision: Literal['included', 'excluded', 'pending'],
+                             source: Optional[discord.TextChannel | discord.ForumChannel] = None,
+                             title: Optional[str] = None, author: Optional[str] = None,
+                             book: Optional[str] = None, confirm: bool = False):
+        await self.import_context(ctx)
+        if not thread.isdecimal() or not 0 < int(thread) < 2**63:
+            raise ClubError('thread: укажите числовой ID публичного треда Discord, в том числе архивного.')
+        if not confirm:
+            raise ClubError('Проверьте выбранный тред и данные книги, затем укажите confirm:true. '
+                            'Включение требует title и author либо сопоставления с существующей book.')
+        source, _ = self.import_range(ctx, source, None, None, None)
+        book_id = self.resolve_book(ctx.guild.id, book)['id'] if book else None
+        result = await self.importer.preparation.select(
+            ctx.guild, ctx.author.id, source.id, int(thread), decision,
+            title=title, author=author, book_id=book_id, confirm=True)
+        labels = {'included': 'Тред включён в подготовку', 'excluded': 'Тред исключён из подготовки',
+                  'pending': 'Тред возвращён на проверку человеком'}
+        text = f'{labels[decision]}: `{thread}`.'
+        if decision == 'included':
+            text += f' Книга: **{safe(result["title"])}** · {safe(result["author"])}.'
+        await self.say(ctx, text + ' Выбор сохранён по ID треда; переименование его не сбросит. '
+                       'Исходные сообщения не изменены. Codex не вызван; квота не изменена.')
 
     @archive.command(name='login', description='Войти в отдельный профиль Codex по одноразовому коду')
     async def import_login(self, ctx):
@@ -682,39 +767,68 @@ class Club(commands.Cog):
 
     @archive.command(name='scan', description='Составить план переноса эссе из выбранного канала и тредов')
     async def import_scan(self, ctx, source: Optional[discord.TextChannel | discord.ForumChannel] = None,
-                          before: Optional[str] = None, thread: Optional[discord.Thread] = None,
-                          after: Optional[str] = None):
+                          before: Optional[str] = None, thread: Optional[str] = None,
+                          after: Optional[str] = None, cursor: Optional[str] = None):
         await self.import_context(ctx)
-        source, range_options = self.import_range(ctx, source, before, thread, after)
+        source, range_options = self.import_range(ctx, source, before, thread, after, cursor)
         run = await self.importer.scan(ctx.guild, ctx.author.id, source.id, str(ctx.interaction.id), **range_options)
         await self.show_import(ctx, run)
 
     @staticmethod
-    def import_range(ctx, source, before, thread, after):
-        source = source or (thread.parent if thread else ctx.channel)
+    def import_range(ctx, source, before, thread, after, cursor=None):
+        if cursor is not None and (thread is not None or before is not None or after is not None):
+            raise ClubError('cursor уже содержит точное продолжение; не совмещайте его с thread/before/after.')
+        source = source or (thread.parent if isinstance(thread, discord.Thread) else ctx.channel)
         if isinstance(source, discord.Thread):
-            thread, source = source, source.parent
-        def message_id(value):
+            if cursor is None and thread is None:
+                thread = source
+            source = source.parent
+        def message_id(value, field='before/after'):
             if value is not None and (not value.isdecimal() or not 0 < int(value) < 2**63):
-                raise ClubError('before/after: укажите числовой ID сообщения Discord.')
+                raise ClubError(f'{field}: укажите числовой ID Discord.')
             return int(value) if value else None
         if source is None:
             raise ClubError('Не удалось определить исходный канал.')
-        return source, {'before_id': message_id(before), 'thread_id': thread.id if thread else None,
-                        'after_id': message_id(after)}
+        options = {'before_id': message_id(before),
+                   'thread_id': thread.id if isinstance(thread, discord.Thread) else message_id(thread, 'thread'),
+                   'after_id': message_id(after)}
+        if cursor is not None:
+            options['cursor'] = cursor
+        return source, options
 
     @archive.command(name='preview', description='Проверить выбранный фрагмент архива без расхода Codex')
     async def import_preview(self, ctx, source: Optional[discord.TextChannel | discord.ForumChannel] = None,
-                             before: Optional[str] = None, thread: Optional[discord.Thread] = None,
-                             after: Optional[str] = None):
+                             before: Optional[str] = None, thread: Optional[str] = None,
+                             after: Optional[str] = None, cursor: Optional[str] = None):
         await self.import_context(ctx)
-        source, range_options = self.import_range(ctx, source, before, thread, after)
+        source, range_options = self.import_range(ctx, source, before, thread, after, cursor)
         snapshot = await self.importer.preview(ctx.guild, ctx.author.id, source.id, **range_options)
         data = json.dumps(snapshot, ensure_ascii=False).encode()
         lines = [f'**Предпросмотр архива**: {len(snapshot["messages"])} сообщений, '
-                 f'{len(snapshot["books"])} книг, {len(data)}/{self.importer.config.max_input_bytes} байт.',
+                 f'{len(snapshot["books"])} подтверждённых книг в этом фрагменте, '
+                 f'{len(data)}/{self.importer.config.max_input_bytes} байт.',
                  'Codex не вызван; квота запусков и токенов не изменена. '
-                 'Для анализа используйте /club import scan с теми же source/thread/after/before.']
+                 'Полный перечень тредов и оставшиеся проверки — /club import inventory. '
+                 'Новый лимит запусков и анализ моделью согласуются отдельно.']
+        coverage = snapshot.get('coverage', {})
+        if snapshot.get('preparation_confirmed') is False:
+            lines.append('Ознакомительный фрагмент: название книги, автор и включение треда ещё не подтверждены. '
+                         'Проверьте источник и сохраните решение через /club import prepare; '
+                         'этот фрагмент не разрешает анализ моделью.')
+        if 'total_threads' in coverage:
+            scope = 'Ознакомительный просмотр' if snapshot.get('preparation_confirmed') is False else 'Подтверждённая очередь'
+            lines.append(f'{scope}: завершено {coverage["completed_threads"]} '
+                         f'из {coverage["total_threads"]} тредов. Это не охват всего архива.')
+        if coverage.get('range_limited'):
+            lines.append('Выбран диапазон сообщений; завершение этого диапазона не означает просмотр всего треда.')
+        if snapshot.get('continuation'):
+            lines.append(f'Продолжение: /club import preview source:<#{source.id}> cursor:{snapshot["continuation"]}')
+        elif coverage.get('complete'):
+            if snapshot.get('preparation_confirmed') is False:
+                lines.append('Ознакомительный просмотр выбранного треда завершён; решение о книге ещё требуется.')
+            else:
+                lines.append('Предпросмотр выбранных подтверждённых тредов завершён. '
+                             'Исключённые и неподтверждённые треды в этот охват не входят.')
         lines.extend(snapshot['warnings'])
         for page in pages(lines):
             await self.say(ctx, page)
@@ -786,7 +900,8 @@ class Club(commands.Cog):
                 raise ClubError('Сначала /club diagnose: проверьте, что перечисленные неподтверждённые публикации отсутствуют. Затем checked_absent=True. Существующие карточки не удаляются.')
             for pub in self.store.rows("SELECT * FROM bc_publications WHERE guild_id=? AND state='reserved'", (ctx.guild.id,)):
                 channel = await self.service.channel(ctx.guild, pub['channel_id'])
-                found = await self.service._find_marker(ctx.guild, channel, f'\n-# bc:{pub["key"]}', isinstance(channel, discord.ForumChannel), webhook_id=pub['webhook_id'])
+                found = await self.service.delivery.recover(ctx.guild, channel, pub['key'],
+                    forum=isinstance(channel, discord.ForumChannel), webhook_id=pub['webhook_id'])
                 if found:
                     self.store.save_publication(pub['key'], found[0].id, found[1].id)
                 else:
@@ -953,6 +1068,7 @@ class Club(commands.Cog):
 
 
 # Attach autocomplete callbacks before Cog copies the hybrid commands.
+Club.import_prepare.autocomplete('book')(Club.book_autocomplete)
 for _command in Club.club.commands:
     if _command.app_command:
         for _param, _callback in [('book', Club.book_autocomplete), ('meeting', Club.meeting_autocomplete), ('event', Club.event_autocomplete)]:

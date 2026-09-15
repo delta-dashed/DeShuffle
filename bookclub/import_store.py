@@ -102,6 +102,46 @@ class ImportStore:
         return self.store.one("SELECT * FROM bc_import_budgets WHERE budget_id=?", (budget_id,)) or {
             "budget_id": budget_id, "runs_used": 0, "tokens_reserved": 0}
 
+    def stage_reviewed_plan(self, guild_id, actor_id, source_channel_id, budget_id,
+                            request_key, snapshot, plan):
+        """Stage a human-approved plan without a model call or budget debit.
+
+        This is an operator recovery path for a complete, reviewed archive
+        snapshot. The caller must validate the plan and current source access.
+        The existing apply path rechecks every source fingerprint before writes.
+        """
+        for value, label in ((guild_id, "Сервер"), (actor_id, "Участник"),
+                             (source_channel_id, "Канал")):
+            _positive(value, label)
+        _key(budget_id, "Идентификатор бюджета")
+        _key(request_key, "Ключ запроса")
+        encoded_snapshot = _json(snapshot, "Снимок сообщений")
+        encoded_plan = _json(plan, "План импорта")
+        canonical = json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        digest = hashlib.sha256(canonical.encode()).hexdigest()
+        with self.store.tx() as db:
+            previous = db.execute("SELECT * FROM bc_import_runs WHERE guild_id=? AND request_key=?",
+                                  (guild_id, request_key)).fetchone()
+            if previous is not None:
+                if previous['snapshot'] != encoded_snapshot or previous['plan'] != encoded_plan:
+                    raise ClubError('Ключ ручного плана уже занят другим снимком или планом.')
+                return self._decode(previous)
+            if db.execute("SELECT 1 FROM bc_import_runs WHERE state IN ('running','applying')").fetchone():
+                raise ClubError('Другой импорт ещё выполняется.')
+            run_id, timestamp = uuid.uuid4().hex, self.store.clock()
+            db.execute("""INSERT INTO bc_import_runs(
+                          id,guild_id,actor_id,source_channel_id,budget_id,request_key,
+                          reserved_tokens,usage_tokens,state,detail,snapshot,plan,created_at,updated_at)
+                          VALUES(?,?,?,?,?,?,0,0,'review',?,?,?,?,?)""",
+                       (run_id, guild_id, actor_id, source_channel_id, budget_id, request_key,
+                        'План проверен человеком; Codex не вызывался.', encoded_snapshot,
+                        encoded_plan, timestamp, timestamp))
+            db.execute("""INSERT INTO bc_import_plan_restores
+                          (run_id,guild_id,actor_id,old_state,plan_sha256,created_at)
+                          VALUES(?,?,?,?,?,?)""",
+                       (run_id, guild_id, actor_id, 'human-approved', digest, timestamp))
+            return self._decode(self._row(db, guild_id, run_id))
+
     def save_plan(self, guild_id, run_id, plan, usage_tokens=None):
         encoded = _json(plan, "План импорта")
         if usage_tokens is not None and (type(usage_tokens) is not int or usage_tokens < 0):

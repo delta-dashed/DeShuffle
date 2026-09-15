@@ -124,15 +124,17 @@ class ClubCustomizationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         view = call.kwargs['view']
         self.assertIsInstance(view, CatalogView)
         self.assertTrue(view.is_persistent())
-        self.assertEqual([button.label for button in view.children], ['Добавить книгу', 'Загрузить список'])
-        self.assertIn('/club library import', call.kwargs['content'])
+        self.assertEqual([button.label for button in view.children], ['Добавить книгу', 'Загрузить список', 'Порядок чтения'])
+        pub = self.store.publication('catalog:1')
+        content = self.h.channels[pub['channel_id']].messages[pub['message_id']].content
+        self.assertIn('Сейчас читаем', content)
 
     async def test_books_command_shows_catalog_buttons_to_read_only_member(self):
         self.h.channels[13].permissions_for.return_value.send_messages = False
         ctx = SimpleNamespace(guild=self.h.guild, author=self.h.members[1])
         self.cog.say = AsyncMock()
         await self.cog.books.callback(self.cog, ctx)
-        self.assertIsInstance(self.cog.say.await_args.kwargs['view'], CatalogView)
+        self.assertIsInstance(self.cog.say.await_args_list[0].kwargs['view'], CatalogView)
 
     async def test_cog_load_registers_catalog_buttons_for_restart(self):
         with patch.object(type(self.cog.worker), 'start'):

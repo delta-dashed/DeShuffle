@@ -4,6 +4,8 @@ Discord bot that shuffles members in a voice channel, keeps a live order as peop
 
 ## Features
 
+- Club catalog with the current book, the next ten queued books, a separate archive and organizer queue controls. Book cards use short file links and default to three reading meetings plus an essay discussion. Shared rules live in a pinned, editable post with revision history; essay deadlines follow the discussion event. Selected recurring Discord syncs appear with their current dates without being permanently assigned to a book. See [catalog and club format](docs/BOOK_CLUB.md#каталог-общий-формат-и-повторяющиеся-синки).
+
 - Organizer buttons on book cards manage status, description and a reading plan of **N book meetings + one essay discussion**. The plan is separate from scheduled events. Private meeting controls add individual events, change dates/duration and reading boundaries, or confirm a cancellation while preserving history. See [book and meeting controls](docs/BOOK_CLUB.md#управление-книгой-и-план-встреч).
 
 - Optional book club extension: books, participants, native Discord meetings, host rotation, private preparation plans, essays, and durable reminders. Book and meeting cards let each reader create an essay forum post, open their existing work with **Открыть моё эссе**, and browse published essays. The create button reuses imported and manually registered work before an empty draft. New posts use a shared webhook with the reader's server nickname and avatar; readers write and edit their own messages inside. An empty header does not count as an essay. The essay forum needs Manage Webhooks and Manage Threads; `essay_webhooks: false` keeps the original bot-header mode. See [Russian setup and command guide](docs/BOOK_CLUB.md).

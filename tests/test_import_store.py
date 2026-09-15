@@ -45,6 +45,23 @@ class ImportStoreTests(unittest.TestCase):
                          dict(budget_id="not-created", runs_used=0, tokens_reserved=0))
         self.assertEqual(ImportStore(Store(self.path)).run(1, run["id"]), run)
 
+    def test_human_reviewed_plan_is_audited_idempotent_and_does_not_debit_budget(self):
+        snapshot = {'messages': [{'id': '61'}]}
+        plan = {'essays': [{'book_ref': 'book:1', 'message_ids': ['61'], 'author_id': 1}],
+                'skipped_message_ids': []}
+        args = (1, 10, 20, 'migration-2026', 'reviewed-1', snapshot, plan)
+        before = self.imports.budget('migration-2026')
+        first = self.imports.stage_reviewed_plan(*args)
+        self.assertEqual(first['state'], 'review')
+        self.assertEqual((first['reserved_tokens'], first['usage_tokens']), (0, 0))
+        self.assertEqual(self.imports.stage_reviewed_plan(*args), first)
+        self.assertEqual(self.imports.budget('migration-2026'), before)
+        audit = self.store.one('SELECT old_state,actor_id FROM bc_import_plan_restores WHERE run_id=?',
+                               (first['id'],))
+        self.assertEqual((audit['old_state'], audit['actor_id']), ('human-approved', 10))
+        with self.assertRaisesRegex(ClubError, 'уже занят'):
+            self.imports.stage_reviewed_plan(*args[:-1], {'essays': []})
+
     def test_duplicate_request_key_returns_original_without_debit_or_payload_replacement(self):
         first = self.reserve()
         duplicate = self.reserve(snapshot={"messages": []}, budget_id="another-budget")
@@ -267,7 +284,7 @@ class ImportStoreTests(unittest.TestCase):
         self.assertEqual(migrated.one("SELECT note FROM legacy_notes")["note"], "preserved")
         self.assertEqual(migrated.one("PRAGMA user_version")["user_version"], 7)
         self.assertEqual(migrated.rows("SELECT version FROM bc_migrations ORDER BY version"),
-                         [{"version": version} for version in range(1, 9)])
+                         [{"version": version} for version in range(1, 12)])
         run = ImportStore(migrated).reserve_run(1, 10, 20, "budget", "key", 1, 100, 100, {})
         restored = ImportStore(Store(self.path))
         self.assertEqual(restored.run(1, run["id"]), run)

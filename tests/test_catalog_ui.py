@@ -9,12 +9,13 @@ from bookclub.catalog_ui import (AddBookModal, BookListModal, CatalogView,
                                   catalog_access, preview_book_file, preview_book_text)
 from bookclub.service import Service
 from bookclub.store import ClubError, Store
-from test_bookclub import CONFIG
+from test_bookclub import stub_delivery_transport, CONFIG
 from test_bookclub_discord import DiscordHarness
 
 
 class CatalogUITests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        stub_delivery_transport(self)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.store = Store(Path(temporary.name) / 'club.db')
@@ -41,7 +42,7 @@ class CatalogUITests(unittest.IsolatedAsyncioTestCase):
     async def test_persistent_catalog_buttons_open_modals_without_http(self):
         view = CatalogView(self.service, 1)
         self.assertTrue(view.is_persistent())
-        self.assertEqual([c.custom_id for c in view.children], ['bc:catalog:1:add', 'bc:catalog:1:import'])
+        self.assertEqual([c.custom_id for c in view.children], ['bc:catalog:1:add', 'bc:catalog:1:import', 'bc:catalog:1:queue'])
         interaction = self.h.interaction(99)
         await view.children[0].callback(interaction)
         self.assertIsInstance(interaction.response.send_modal.await_args.args[0], AddBookModal)

@@ -5,23 +5,22 @@ import hashlib
 
 import discord
 
+from .import_chunks import archive_chunks
 from .render import safe
 from .service import NO_MENTIONS
 from .store import ClubError
+from .single_delivery import webhook_send_once
+from .publication_delivery import normalized_content
 
 
 def archive_header(book, author_id):
     return f'**Архивное эссе по книге «{safe(book["title"])}»**\nАвтор: <@{author_id}>.'
 
 
-def archive_chunks(snapshot, *, legacy=False):
-    body = snapshot['content']
-    attachments = [f'Вложение: {safe(a["filename"])}' +
-                   ('' if a['copy'] else (' — см. оригинал' if legacy else ' — файл превышает лимит переноса'))
-                   for a in snapshot['attachments']]
-    if attachments:
-        body += ('\n' if body else '') + '\n'.join(attachments)
-    return [body[index:index + 1500] for index in range(0, len(body), 1500)] or ['']
+def matches_clean_content(actual, expected):
+    # Paragraph boundaries can leave line breaks as well as spaces at message
+    # edges. Only normalize those edges, never words or internal separators.
+    return normalized_content(actual) == normalized_content(expected)
 
 
 class ImportPublisher:
@@ -61,7 +60,7 @@ class ImportPublisher:
 
     async def upsert(self, guild, thread, key, content, member, *, files=None, expected_attachments=None):
         marker = '\n-# bc:' + key
-        if len(content + marker) > 2000:
+        if len(content) > 2000:
             raise ClubError('Часть эссе слишком длинная для Discord.')
         if thread.guild.id != guild.id or thread.parent_id != self.store.settings(guild.id)['essays']:
             raise ClubError('Тема копии больше не принадлежит настроенному форуму эссе.')
@@ -78,7 +77,7 @@ class ImportPublisher:
             if pub and pub['webhook_id'] is not None:
                 raise ClubError('Сохранённая часть отправлена вебхуком. Обычный бот не меняет её отправителя.')
             if message is None and pub:
-                found = await self.service._find_marker(guild, thread, marker)
+                found = await self.service.delivery.recover(guild, thread, key)
                 if not found:
                     raise ClubError('Отправка части эссе не подтверждена. Проверьте /club diagnose и /club repair; повторная копия не создана.')
                 _, message = found
@@ -100,16 +99,19 @@ class ImportPublisher:
                 hook = await self.service.essay_webhook(guild, forum)
             if message is None:
                 if pub:
-                    found = await self.service._find_marker(guild, thread, marker, webhook_id=hook.id)
+                    found = await self.service.delivery.recover(guild, thread, key, webhook_id=hook.id)
                     if not found:
                         raise ClubError('Отправка части эссе не подтверждена. Проверьте /club diagnose и /club repair; повторная копия не создана.')
                     _, message = found
                 else:
                     if thread.archived:
                         thread = await thread.edit(archived=False)
-                    self.store.reserve_publication(key, guild.id, thread.id, webhook_id=hook.id)
+                    fresh = await self.service.delivery.reserve(guild, thread, key, content, webhook_id=hook.id,
+                                                                files=files, expected_attachments=expected_attachments)
+                    if not fresh:
+                        raise ClubError('Отправка части эссе уже начата; повторите проверку сохранённой отправки.')
                     try:
-                        message = await hook.send(content + marker, thread=discord.Object(id=thread.id),
+                        message = await webhook_send_once(hook, content, thread=discord.Object(id=thread.id),
                                                   username=member.display_name[:80], avatar_url=str(member.display_avatar.url),
                                                   files=files or discord.utils.MISSING, wait=True, allowed_mentions=NO_MENTIONS)
                     except discord.HTTPException as exc:
@@ -120,7 +122,8 @@ class ImportPublisher:
         def verify(value, *, clean=False):
             if (not self.service.owns_starter(value, hook.id if hook else None)
                     or value.channel.id != thread.id
-                    or value.content not in ((content,) if clean else (content, content + marker))):
+                    or (not matches_clean_content(value.content, content)
+                        and (clean or not matches_clean_content(value.content, content + marker)))):
                 raise ClubError('Копия эссе не совпадает с сохранённым текстом и отправителем. Прежние сообщения сохранены.')
             if expected_attachments is not None:
                 actual = sorted((a.filename, a.size) for a in value.attachments)
@@ -128,12 +131,11 @@ class ImportPublisher:
                     raise ClubError('Вложения новой копии не подтверждены. Прежние сообщения сохранены.')
 
         verify(message)
-        # Keep the recovery marker until the acknowledged Discord ID is durable.
-        # A crash after this save resumes by ID, including a lost edit response;
-        # a crash before it can still find the original send by its marker.
+        # New sends are clean from the start. Their durable intent recovers a
+        # lost response; old marker-bearing copies are cleaned using their ID.
         digest = hashlib.sha256(content.encode()).hexdigest()
         self.store.save_publication(key, thread.id, message.id, digest)
-        if message.content != content:
+        if not matches_clean_content(message.content, content):
             if thread.archived:
                 thread = await thread.edit(archived=False)
             if hook:

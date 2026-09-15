@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 import discord
 
-from .import_publication import archive_chunks, archive_header
+from .import_publication import archive_chunks, archive_header, matches_clean_content
+from .import_chunks import publication_chunks
 from .store import ClubError
 
 
@@ -72,7 +73,8 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
             parts, obsolete = [], []
             for ident in ids:
                 old = snapshots[ident]
-                desired, legacy = archive_chunks(old), archive_chunks(old, legacy=True)
+                desired = publication_chunks(store, guild.id, key, old)
+                legacy = archive_chunks(old, legacy=True)
                 old_copies = {}
                 for index, text in enumerate(legacy):
                     legacy_key = f'{key}:message:{ident}:{index}'
@@ -109,10 +111,11 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
                         if copy['message_id']:
                             message = await thread.fetch_message(copy['message_id'])
                             if (not service.owns_starter(message, copy['webhook_id'])
-                                    or message.content not in (text, text + '\n-# bc:' + copy_key)
+                                    or (not matches_clean_content(message.content, text)
+                                        and message.content != text + '\n-# bc:' + copy_key)
                                     or sorted((a.filename, a.size) for a in message.attachments) != expected_files):
                                 raise ClubError('Новая копия эссе изменена. Автоматическое исправление остановлено.')
-                            if message.content != text:
+                            if not matches_clean_content(message.content, text):
                                 cleanup_count += 1
                     attachments = []
                     if index == 0 and not copy:
@@ -142,6 +145,12 @@ async def restyle(importer, guild, actor_id, run_id, *, confirm=False):
         report.extend(f'<#{thread.id}> · частей эссе: {len(parts)}' for thread, _, _, _, _, _, parts, _ in prepared)
         if not confirm:
             return report + [f'Подтверждение: /club import restyle run:{run_id} confirm:true']
+        # Freeze every verified layout before Discord writes. Existing v2 parts
+        # keep their old boundaries and IDs; new applies already own a plan.
+        for item in plan['essays']:
+            key = f'essay-import:{guild.id}:{min(item["message_ids"], key=int)}'
+            for ident in item['message_ids']:
+                publication_chunks(store, guild.id, key, snapshots[ident], persist=True)
         for thread, starter, pub, book, author_id, member, parts, obsolete in prepared:
             archived = thread.archived or store.one(
                 'SELECT 1 FROM bc_import_restyle_threads WHERE guild_id=? AND run_id=? AND thread_id=?',
