@@ -120,14 +120,15 @@ class ClubCustomizationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def test_catalog_publication_contains_working_persistent_buttons(self):
         await self.service.refresh(self.h.guild)
         calls = self.h.channels[13].create_thread.await_args_list
-        call = next(call for call in calls if call.kwargs['name'] == 'Каталог книжного клуба')
+        call = next(call for call in calls if call.kwargs['name'] == 'Путеводитель книжного клуба')
         view = call.kwargs['view']
         self.assertIsInstance(view, CatalogView)
         self.assertTrue(view.is_persistent())
         self.assertEqual([button.label for button in view.children], ['Добавить книгу', 'Загрузить список', 'Порядок чтения', 'Удалённые книги'])
         pub = self.store.publication('catalog:1')
         content = self.h.channels[pub['channel_id']].messages[pub['message_id']].content
-        self.assertIn('Сейчас читаем', content)
+        self.assertIn('Текущая книга', content)
+        self.assertIn('catalog:1:current', [row['key'] for row in self.store.rows('SELECT key FROM bc_publications')])
 
     async def test_books_command_shows_catalog_buttons_to_read_only_member(self):
         self.h.channels[13].permissions_for.return_value.send_messages = False
