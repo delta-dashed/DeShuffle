@@ -96,7 +96,7 @@ class BookRefreshTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn('Прочитано', message.content)
         desired = self.service.forum_tags.bindings(1, self.h.channels[13])['read']
         self.assertEqual({tag.id for tag in message.channel.applied_tags}, {desired})
-        self.assertEqual(self.h.channels[13].create_thread.await_count, 5)  # Book, guide, three sections.
+        self.assertEqual(self.h.channels[13].create_thread.await_count, 4)  # Book, current pin, plan, archive.
 
     async def test_targeted_refresh_skips_other_twelve_books_meetings_rules_and_members(self):
         books = self.more_books()
@@ -206,7 +206,7 @@ class BookRefreshTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.root_message(), message)
         self.assertIn('Прочитано', message.content)
         self.assertNotIn((1, self.book['id']), self.service.book_updates.failures)
-        self.assertEqual(self.h.channels[13].create_thread.await_count, 5)
+        self.assertEqual(self.h.channels[13].create_thread.await_count, 4)
 
     async def test_shutdown_cancels_worker_and_restart_reconciles_durable_edit(self):
         await self.publish()
@@ -233,7 +233,7 @@ class BookRefreshTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
             await restarted.refresh(self.h.guild)
         self.assertIs(self.root_message(), message)
         self.assertIn('Прочитано', message.content)
-        self.assertEqual(self.h.channels[13].create_thread.await_count, 5)
+        self.assertEqual(self.h.channels[13].create_thread.await_count, 4)
 
     async def test_unpublished_or_disabled_club_does_not_publish_queued_updates(self):
         self.service.refresh_book = AsyncMock()
@@ -329,7 +329,7 @@ class BookRefreshTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         essay.delete.assert_not_awaited()
         def catalog_text():
             roots = [self.store.publication(key) for key in
-                     ('catalog:1', 'catalog:1:current', 'catalog:1:plan', 'catalog:1:archive')]
+                     ('catalog:1', 'catalog:1:plan', 'catalog:1:archive')]
             return '\n'.join(item.content for root in roots
                              for item in self.h.channels[root['channel_id']].messages.values())
         self.assertNotIn(message.channel.jump_url, catalog_text())
@@ -355,7 +355,7 @@ class BookRefreshTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         async with restarted.locks[1]:
             await restarted.refresh(self.h.guild)
         self.assertIsNone(self.store.publication(f'book:{self.book["id"]}'))
-        self.assertEqual(self.h.channels[13].create_thread.await_count, 4)  # Guide and three sections; no book.
+        self.assertEqual(self.h.channels[13].create_thread.await_count, 3)  # Current pin, plan, archive; no book.
 
     async def test_removed_book_missing_root_is_not_recreated(self):
         await self.publish()
@@ -372,7 +372,7 @@ class BookRefreshTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         async with restarted.locks[1]:
             await restarted.refresh(self.h.guild)
         self.assertEqual(self.store.publication(publication['key']), publication)
-        self.assertEqual(self.h.channels[13].create_thread.await_count, 5)
+        self.assertEqual(self.h.channels[13].create_thread.await_count, 4)
 
     async def test_restart_finishes_removal_and_skips_removed_participants_events_and_essays(self):
         essay = self.archived_essay()
@@ -488,7 +488,7 @@ class BookRefreshTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(message.edit.await_args.kwargs['view'], RemovedBookView)
         keys = [call.args[1] for call in self.service.upsert.await_args_list]
         self.assertNotIn(f'meeting:{self.meeting["id"]}', keys)
-        self.assertEqual(self.h.channels[13].create_thread.await_count, 5)
+        self.assertEqual(self.h.channels[13].create_thread.await_count, 4)
 
 
 if __name__ == '__main__':

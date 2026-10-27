@@ -223,7 +223,7 @@ class Service:
         failures = self.store.rows("SELECT kind,state,detail FROM bc_jobs WHERE guild_id=? AND state IN ('failed','unknown') ORDER BY due DESC LIMIT 10", (guild.id,))
         result.extend(f'Напоминание {j["kind"]}: {j["state"]} · {j["detail"]}' for j in failures)
         if guild.id in self.town_pin_warning:
-            result.append('Путеводитель опубликован без закрепления. Проверьте Manage Threads и текущее закрепление форума: '
+            result.append('Карточка текущей книги опубликована без закрепления. Проверьте Manage Threads и текущее закрепление форума: '
                           'Discord допускает только одну закреплённую тему. Чужое закрепление бот не заменяет.')
         for binding in self.store.rows('SELECT * FROM bc_webhooks WHERE guild_id=?', (guild.id,)):
             if binding['webhook_id'] is None:

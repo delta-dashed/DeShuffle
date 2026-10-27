@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from bookclub.store import Store
-from bookclub.town_render import town_guide, town_sections
+from bookclub.town_render import pinned_title, town_guide, town_sections
 
 
 class TownRenderTests(unittest.TestCase):
@@ -147,6 +147,9 @@ class TownRenderTests(unittest.TestCase):
         for omitted in ('Отменённая встреча', 'Прошедшая встреча', 'Черновая встреча',
                         'СЕКРЕТНЫЕ ВОПРОСЫ', 'ПРИВАТНЫЕ ЗАМЕТКИ', 'Дубликат события', 'Отменённый синк'):
             self.assertNotIn(omitted, str(result))
+        pinned = '\n'.join(town_guide(self.store, 1, {}))
+        self.assertNotIn('СЕКРЕТНЫЕ ВОПРОСЫ', pinned)
+        self.assertNotIn('ПРИВАТНЫЕ ЗАМЕТКИ', pinned)
 
     def test_archive_counts_only_submitted_existing_essays(self):
         book = self.book('Прочитано с эссе', 'read')
@@ -156,7 +159,7 @@ class TownRenderTests(unittest.TestCase):
         self.store.delete_essay(1, source_id=503)
         self.assertIn('эссе: 1', self.text()['archive'])
 
-    def test_guide_stays_short_and_links_all_sections_without_queue_dump(self):
+    def test_pin_shows_current_reading_and_two_ordered_links_without_queue_dump(self):
         book = self.book('Текущая книга', 'reading')
         for index in range(10):
             self.book(f'Будущая {index}', 'queued')
@@ -165,14 +168,73 @@ class TownRenderTests(unittest.TestCase):
         result = town_guide(self.store, 1, links)
         self.assertEqual(len(result), 1)
         self.assertLessEqual(len(result[0]), 1750)
-        for url in links.values():
-            self.assertIn(url, result[0])
-        for title in ('Текущая книга', 'План чтения', 'Архив прочитанного'):
+        for key in ('plan', 'archive'):
+            self.assertIn(links[key], result[0])
+        self.assertNotIn(links['current'], result[0])
+        for title in ('План чтения', 'Архив прочитанного'):
             self.assertIn(f'[{title}](', result[0])
+        self.assertLess(result[0].index('[План чтения]'), result[0].index('[Архив прочитанного]'))
         self.assertIn('Текущая книга', result[0])
         self.assertNotIn('Будущая', result[0])
         publication = self.store.publication(f'book:{book["id"]}')
         self.assertIn(f'/{publication["channel_id"]}/{publication["message_id"]}', result[0])
+
+    def test_pin_contains_named_materials_plan_and_submitted_essay_count(self):
+        book = self.book('Нынешняя', 'reading', materials='https://example.org/book.pdf\n[Другое издание](https://example.org/edition)',
+                         reading_meetings=5)
+        self.store.register_essay(1, book['id'], 501, 501, 51, 'Работа', 'https://example.org/one')
+        self.store.register_essay(1, book['id'], 502, 502, 52, 'Черновик', 'https://example.org/two', submitted=False)
+        with self.store.tx() as db:
+            db.execute('UPDATE bc_books SET deadline=2000000000 WHERE id=?', (book['id'],))
+        text = '\n'.join(town_guide(self.store, 1, {}))
+        self.assertIn('[Читать PDF](<https://example.org/book.pdf>)', text)
+        self.assertIn('[Другое издание](https://example.org/edition)', text)
+        self.assertIn('5 встреч по книге + обсуждение эссе', text)
+        self.assertIn('Опубликовано эссе: **1**', text)
+        self.assertNotIn('Эссе до:', text)
+        self.assertNotIn('18.05.2033', text)
+
+    def test_pin_title_and_contents_follow_current_book_and_renaming(self):
+        first = self.book('Первая', 'reading')
+        second = self.book('Следующая', 'queued')
+        self.assertEqual(pinned_title(self.store, 1), 'Текущая книга · Первая')
+        self.store.update_book(1, first['id'], title='Уточнённая первая')
+        self.assertEqual(pinned_title(self.store, 1), 'Текущая книга · Уточнённая первая')
+        self.store.update_book(1, first['id'], status='read')
+        self.store.update_book(1, second['id'], status='reading')
+        self.assertEqual(pinned_title(self.store, 1), 'Текущая книга · Следующая')
+        text = '\n'.join(town_guide(self.store, 1, {}))
+        self.assertIn('Следующая', text)
+        self.assertNotIn('Уточнённая первая', text)
+        current = self.store.book(1, second['id'])
+        self.store.remove_book(1, second['id'], expected_revision=current['revision'], actor_id=99)
+        self.assertEqual(pinned_title(self.store, 1), 'Текущая книга')
+        self.assertIn('Текущая книга ещё не выбрана', '\n'.join(town_guide(self.store, 1, {})))
+
+    def test_pin_title_is_single_line_safe_and_fits_discord(self):
+        self.assertEqual(pinned_title(self.store, 1), 'Текущая книга')
+        self.book('@everyone\n## [Сюрприз] ' + 'Очень длинное ' * 10, 'reading')
+        title = pinned_title(self.store, 1)
+        self.assertLessEqual(len(title), 100)
+        self.assertNotIn('\n', title)
+        self.assertNotIn('@everyone', title)
+        self.assertIn('［Сюрприз］', title)
+
+    def test_long_materials_and_many_essays_use_complete_card_link_without_broken_urls(self):
+        source = 'https://example.org/' + 'long-path-' * 200 + '.epub'
+        book = self.book('Большие материалы', 'reading', materials=source)
+        for index in range(30):
+            self.store.register_essay(1, book['id'], 500 + index, 500 + index, 50 + index,
+                                      'Длинное название эссе ' * 7, f'https://example.org/essay/{index}')
+        result = town_guide(self.store, 1, dict(plan='https://example.org/plan', archive='https://example.org/archive'))
+        self.assertEqual(len(result), 1)
+        self.assertLessEqual(len(result[0]), 1750)
+        self.assertIn('Опубликовано эссе: **30**', result[0])
+        self.assertIn('Все материалы и файлы — в карточке книги', result[0])
+        self.assertNotIn('long-path-', result[0])
+        publication = self.store.publication(f'book:{book["id"]}')
+        self.assertIn(f'/{publication["channel_id"]}/{publication["message_id"]}', result[0])
+        self.assertEqual(self.store.book(1, book['id'])['materials'], source)
 
     def test_missing_cards_and_section_urls_never_create_fake_links(self):
         book = self.book('Готовится', 'reading')

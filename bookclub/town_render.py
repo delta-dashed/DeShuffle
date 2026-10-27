@@ -3,7 +3,7 @@
 Only public book, essay and event fields are read. Private host plans are never
 part of these projections, even when the viewer is an organizer.
 """
-from .render import book_url, pages, plan_label, safe, time_label
+from .render import book_url, material_links, pages, plan_label, safe, time_label
 
 
 SECTION_TITLES = {
@@ -108,21 +108,42 @@ def town_sections(store, guild_id):
     }
 
 
+def pinned_title(store, guild_id):
+    """The managed forum title follows current reading, within Discord's limit."""
+    current = next((book for book in store.books(guild_id) if book['status'] == 'reading'), None)
+    return ('Текущая книга · ' + _label(current['title']))[:100] if current else 'Текущая книга'
+
+
 def town_guide(store, guild_id, section_urls):
-    """The short pinned entry point; topic titles may be renamed independently."""
-    books = store.books(guild_id)
-    current = next((book for book in books if book['status'] == 'reading'), None)
-    lines = ['## Книжный клуб · навигация',
-             ('Сейчас читаем: ' + _book_link(store, current)) if current else 'Текущая книга ещё не выбрана.']
+    """Put current reading in the sole forum pin, followed by plan and archive."""
+    current = next((book for book in store.books(guild_id) if book['status'] == 'reading'), None)
+    lines = ['## Текущая книга']
+    if current:
+        lines.extend([f'### {_book_link(store, current)}', f'**{plan_label(current)}**.'])
+        materials = material_links(current['materials']).strip().replace('@', '@\u200b')
+        if materials and len(materials) <= 600:
+            lines.extend(['\n**Материалы**', materials])
+        elif materials:
+            # Never shorten Markdown or a signed URL in the middle. The full
+            # original materials stay available in the persistent book card.
+            lines.append('Все материалы и файлы — в карточке книги.')
+        lines.append(f'Опубликовано эссе: **{len(store.essays(current["id"]))}**.')
+        url = book_url(store, current)
+        if url:
+            lines.append(f'[Открыть карточку книги и эссе участников]({url})')
+            lines.append('В карточке книги можно добавить своё эссе и открыть свою работу.')
+        else:
+            lines.append('Карточка книги ещё готовится.')
+    else:
+        lines.append('Текущая книга ещё не выбрана. Организатор выбирает её из очереди в плане чтения.')
     descriptions = {
-        'current': 'текущая книга, материалы и эссе',
         'plan': 'встречи, границы чтения, очередь и предложения',
         'archive': 'прочитанные книги и работы участников',
     }
-    for key, title in SECTION_TITLES.items():
+    lines.append('\n**План и прочитанное**')
+    for key in ('plan', 'archive'):
+        title = SECTION_TITLES[key]
         url = section_urls.get(key)
         label = f'[{title}]({url})' if url else title
         lines.append(f'• {label} — {descriptions[key]}.' + ('' if url else ' Тема ещё готовится.'))
-    lines.append('\nЧтобы добавить своё эссе, откройте карточку нужной книги. '
-                 'Организаторы управляют книгами и очередью через кнопки каталога.')
     return pages(lines)

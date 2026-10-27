@@ -448,7 +448,7 @@ class AutomaticBookStatusDiscordTests(AutomaticBookStatusFixture, unittest.Isola
         self.assertEqual(self.current()['status'], 'read')
         self.assertEqual({value.id for value in thread.applied_tags}, {labels['read'].id})
         forum.edit.assert_not_awaited()
-        self.assertEqual(forum.create_thread.await_count, 5)  # Book, guide and three town sections.
+        self.assertEqual(forum.create_thread.await_count, 4)  # Book, current pin, plan, archive.
         self.assertEqual({key: self.store.publication(key)['message_id'] for key in before_ids}, before_ids)
 
 
