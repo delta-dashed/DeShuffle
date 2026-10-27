@@ -36,6 +36,7 @@ class Service:
         self.view_factory = None
         self.book_view_factory = None
         self.catalog_view_factory = None
+        self.town_menu_factory = None
         self.format_view_factory = None
         self.removed_book_view_factory = None
         self.deleted_books_handler = None
@@ -511,10 +512,14 @@ class Service:
             if links:
                 first += '\n\n' + ' · '.join(links)
             root = await self.upsert(guild, key, forum_id, first, forum_name=name, view=view, known_message=known_root)
-            for old in self.store.rows('SELECT * FROM bc_publications WHERE key LIKE ?', (key + ':page:%',)):
-                if int(old['key'].rsplit(':', 1)[1]) > len(sections):
-                    await self.upsert(guild, old['key'], root['channel_id'],
-                        'Раздел обновлён. Актуальные материалы и переходы — в начале темы.', view=navigation(0, []))
+            if key.startswith('catalog:'):
+                from .town_cleanup import cleanup_town_pages
+                await cleanup_town_pages(self, guild, key, len(sections))
+            else:
+                for old in self.store.rows('SELECT * FROM bc_publications WHERE key LIKE ?', (key + ':page:%',)):
+                    if int(old['key'].rsplit(':', 1)[1]) > len(sections):
+                        await self.upsert(guild, old['key'], root['channel_id'],
+                            'Раздел обновлён. Актуальные материалы и переходы — в начале темы.', view=navigation(0, []))
             return root
 
         if len(contents) > 1:

@@ -94,8 +94,7 @@ class TownProjectionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ids()['catalog:1'], (old['channel_id'], old['message_id']))
         guide, message = self.root('catalog:1')
         self.assertTrue(guide.flags.pinned)
-        self.assertEqual({button['custom_id'] for button in self.buttons(message) if 'custom_id' in button},
-            {f'bc:catalog:1:{action}' for action in ('add', 'import', 'queue', 'deleted')})
+        self.assertFalse(any('custom_id' in button for button in self.buttons(message)))  # Plain Service has no menu factory.
         for key in KEYS:
             thread, message = self.root(key)
             self.assertEqual({tag.id for tag in thread.applied_tags}, {self.tags['catalog'].id})
@@ -165,7 +164,7 @@ class TownProjectionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
                               if thread.parent_id == forum.id]), 3)
         self.assert_clean()
 
-    async def test_old_catalog_pages_become_redirects_without_replacing_messages(self):
+    async def test_old_catalog_content_is_preserved_when_not_a_verified_obsolete_notice(self):
         old = await self.seed_catalog(pages=['Старое начало', 'Старое продолжение очереди', 'Старый архив'])
         pages = [self.store.publication(f'catalog:1:page:{index}') for index in (1, 2)]
         await self.service.refresh_catalog(self.h.guild)
@@ -175,10 +174,7 @@ class TownProjectionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
             self.assertEqual((stored['channel_id'], stored['message_id']),
                              (page['channel_id'], page['message_id']))
             message = self.h.channels[page['channel_id']].messages[page['message_id']]
-            self.assertNotIn('Старое', message.content)
-            self.assertNotIn('Старый архив', message.content)
-            self.assertIn(self.root('catalog:1')[1].jump_url,
-                          {button['url'] for button in self.buttons(message) if 'url' in button})
+            self.assertIn(message.content, ('Старое продолжение очереди', 'Старый архив'))
             message.delete.assert_not_awaited()
 
     async def test_foreign_forum_pin_is_preserved_and_does_not_block_publication(self):
@@ -310,8 +306,10 @@ class TownProjectionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(button['type'] == 2 and 'url' in button for button in first_row))
         book_actions = {button['custom_id'] for button in self.buttons(old_root)
                         if button.get('custom_id', '').startswith('bc:book:')}
-        self.assertEqual(book_actions, {f'bc:book:{self.book["id"]}:{action}'
-                                      for action in ('write', 'own', 'list', 'manage', 'meetings')})
+        self.assertEqual(book_actions, {f'bc:book:{self.book["id"]}:{action}' for action in ('write', 'own')})
+        controls = self.buttons(old_root)
+        self.assertLessEqual(len(controls), 5)
+        self.assertEqual([b['label'] for b in controls if b.get('custom_id') == 'bc:town:1:menu'], ['Ещё…'])
         before_ids = self.ids()
         before_history = {table: self.store.rows(f'SELECT * FROM {table}')
                           for table in ('bc_essays', 'bc_import_runs', 'bc_import_sources', 'bc_import_budgets')}
@@ -327,8 +325,7 @@ class TownProjectionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIn(another['title'], root.channel.name)
         book_actions = {button['custom_id'] for button in self.buttons(root)
                         if button.get('custom_id', '').startswith('bc:book:')}
-        self.assertEqual(book_actions, {f'bc:book:{another["id"]}:{action}'
-                                      for action in ('write', 'own', 'list', 'manage', 'meetings')})
+        self.assertEqual(book_actions, {f'bc:book:{another["id"]}:{action}' for action in ('write', 'own')})
         self.assertEqual(before_history, {table: self.store.rows(f'SELECT * FROM {table}')
                                          for table in before_history})
         self.assertIsNone(self.store.publication('catalog:1:current'))

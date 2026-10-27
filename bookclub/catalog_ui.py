@@ -31,9 +31,9 @@ class CatalogGuardedModal(discord.ui.Modal):
         await interaction_error(interaction, error)
 
 
-async def catalog_access(service, guild, user_id, *, organizer=False, write=True):
-    """Honor the current member and the forum's manually configured access."""
-    member, is_organizer = await service.actor(guild, user_id)
+async def _catalog_context(service, guild, user_id, *, organizer=False, write=True):
+    """Read current identity and forum access once for a menu or write."""
+    member, is_organizer = await service.actor(guild, user_id, require_access=False)
     if organizer and not is_organizer:
         raise ClubError('Загружать список книг может организатор клуба.')
     forum_id = service.store.settings(guild.id)['books']
@@ -41,10 +41,16 @@ async def catalog_access(service, guild, user_id, *, organizer=False, write=True
     if not isinstance(forum, discord.ForumChannel) or forum.guild.id != guild.id:
         raise ClubError('Форум книг недоступен. Организатору: проверьте /club diagnose.')
     permissions = forum.permissions_for(member)
-    if not permissions.view_channel:
+    if not (permissions.view_channel and permissions.read_message_history):
         raise ClubError('У вас нет доступа к форуму книг. Попросите организатора настроить доступ в Discord.')
     if write and not permissions.send_messages:
         raise ClubError('Для добавления книг нужен доступ к форуму книг и право создавать в нём публикации.')
+    return forum, member, is_organizer
+
+
+async def catalog_access(service, guild, user_id, *, organizer=False, write=True):
+    """Honor the current member and the forum's manually configured access."""
+    forum, _, _ = await _catalog_context(service, guild, user_id, organizer=organizer, write=write)
     return forum
 
 
@@ -119,6 +125,73 @@ class CatalogView(CatalogGuardedView):
                 await interaction.response.send_modal(modal)
             button.callback = callback
             self.add_item(button)
+
+
+class TownActionsView(CatalogGuardedView):
+    """An actor-scoped menu; stale role or current-book changes are rechecked."""
+    def __init__(self, service, guild_id, actor_id, book, *, organizer, can_add):
+        super().__init__(timeout=300)
+        self.service, self.guild_id, self.actor_id = service, guild_id, actor_id
+        self.book_id = book['id'] if book else None
+        if book and service.book_view_factory:
+            source = service.book_view_factory(book)
+            for button in list(source.children):
+                action = button.custom_id.rsplit(':', 1)[-1]
+                if action == 'manage' and not organizer:
+                    continue
+                source.remove_item(button)
+                button.row = 0 if action in ('write', 'own', 'list') else 1
+                self._bind(button, requires_organizer=action == 'manage', current_book=True)
+        source = CatalogView(service, guild_id)
+        for button in list(source.children):
+            action = button.custom_id.rsplit(':', 1)[-1]
+            if action != 'add' and not organizer:
+                continue
+            if action == 'add' and not can_add:
+                continue
+            source.remove_item(button)
+            button.row = 2
+            self._bind(button, requires_organizer=action != 'add', current_book=False)
+
+    def _bind(self, button, *, requires_organizer, current_book):
+        callback = button.callback
+        async def guarded(interaction):
+            _same_guild(interaction, self.guild_id)
+            if interaction.user.id != self.actor_id:
+                raise ClubError('Это меню открыто другим участником. Нажмите «Ещё…» в закрепе.')
+            # Modal callbacks must respond within Discord's short deadline.
+            # Fresh member/role data accompanies this component interaction;
+            # modal submissions still run their existing REST checks.
+            self.service.interaction_access(interaction)
+            if requires_organizer and not self.service.interaction_organizer(interaction):
+                raise ClubError('Это действие доступно организатору клуба.')
+            if current_book:
+                current = next((b for b in self.service.store.books(self.guild_id) if b['status'] == 'reading'), None)
+                if not current or current['id'] != self.book_id:
+                    raise ClubError('Текущая книга изменилась. Откройте «Ещё…» заново.')
+            await callback(interaction)
+        button.callback = guarded
+        self.add_item(button)
+
+
+class TownMenuView(CatalogGuardedView):
+    """One persistent public entry point replaces a wall of advanced buttons."""
+    def __init__(self, service, guild_id):
+        super().__init__(timeout=None)
+        self.service, self.guild_id = service, guild_id
+        button = discord.ui.Button(label='Ещё…', custom_id=f'bc:town:{guild_id}:menu')
+        button.callback = self.open_menu
+        self.add_item(button)
+
+    async def open_menu(self, interaction):
+        _same_guild(interaction, self.guild_id)
+        await interaction.response.defer(ephemeral=True)
+        forum, member, organizer = await _catalog_context(self.service, interaction.guild, interaction.user.id, write=False)
+        current = next((b for b in self.service.store.books(self.guild_id) if b['status'] == 'reading'), None)
+        view = TownActionsView(self.service, self.guild_id, interaction.user.id, current,
+                               organizer=organizer, can_add=forum.permissions_for(member).send_messages)
+        title = f'**Действия · {safe(current["title"])}**' if current else '**Действия клуба**'
+        await _reply(interaction, title, view=view)
 
 
 class BookListPreview(CatalogGuardedView):

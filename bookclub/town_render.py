@@ -117,9 +117,9 @@ def pinned_title(store, guild_id):
 def town_guide(store, guild_id, section_urls):
     """Put current reading in the sole forum pin, followed by plan and archive."""
     current = next((book for book in store.books(guild_id) if book['status'] == 'reading'), None)
-    lines = ['## Текущая книга']
+    lines = []
     if current:
-        lines.extend([f'### {_book_link(store, current)}', f'**{plan_label(current)}**.'])
+        lines.extend([f'## {_label(current["title"])}', _label(current['author']), f'\n{plan_label(current)}.'])
         materials = material_links(current['materials']).strip().replace('@', '@\u200b')
         if materials and len(materials) <= 600:
             lines.extend(['\n**Материалы**', materials])
@@ -127,23 +127,12 @@ def town_guide(store, guild_id, section_urls):
             # Never shorten Markdown or a signed URL in the middle. The full
             # original materials stay available in the persistent book card.
             lines.append('Все материалы и файлы — в карточке книги.')
-        lines.append(f'Опубликовано эссе: **{len(store.essays(current["id"]))}**.')
         url = book_url(store, current)
+        count = len(store.essays(current['id']))
         if url:
-            lines.append(f'[Открыть карточку книги и эссе участников]({url})')
-            lines.append('В карточке книги можно добавить своё эссе и открыть свою работу.')
+            lines.append(f'\n[Эссе участников — {count} · Карточка книги]({url})')
         else:
-            lines.append('Карточка книги ещё готовится.')
+            lines.append(f'Опубликовано эссе: **{count}**. Карточка книги ещё готовится.')
     else:
         lines.append('Текущая книга ещё не выбрана. Организатор выбирает её из очереди в плане чтения.')
-    descriptions = {
-        'plan': 'встречи, границы чтения, очередь и предложения',
-        'archive': 'прочитанные книги и работы участников',
-    }
-    lines.append('\n**План и прочитанное**')
-    for key in ('plan', 'archive'):
-        title = SECTION_TITLES[key]
-        url = section_urls.get(key)
-        label = f'[{title}]({url})' if url else title
-        lines.append(f'• {label} — {descriptions[key]}.' + ('' if url else ' Тема ещё готовится.'))
     return pages(lines)

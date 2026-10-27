@@ -159,7 +159,7 @@ class TownRenderTests(unittest.TestCase):
         self.store.delete_essay(1, source_id=503)
         self.assertIn('эссе: 1', self.text()['archive'])
 
-    def test_pin_shows_current_reading_and_two_ordered_links_without_queue_dump(self):
+    def test_pin_shows_current_reading_without_repeating_button_navigation_or_queue(self):
         book = self.book('Текущая книга', 'reading')
         for index in range(10):
             self.book(f'Будущая {index}', 'queued')
@@ -168,12 +168,9 @@ class TownRenderTests(unittest.TestCase):
         result = town_guide(self.store, 1, links)
         self.assertEqual(len(result), 1)
         self.assertLessEqual(len(result[0]), 1750)
-        for key in ('plan', 'archive'):
-            self.assertIn(links[key], result[0])
-        self.assertNotIn(links['current'], result[0])
-        for title in ('План чтения', 'Архив прочитанного'):
-            self.assertIn(f'[{title}](', result[0])
-        self.assertLess(result[0].index('[План чтения]'), result[0].index('[Архив прочитанного]'))
+        for url in links.values():
+            self.assertNotIn(url, result[0])
+        self.assertNotIn('План и прочитанное', result[0])
         self.assertIn('Текущая книга', result[0])
         self.assertNotIn('Будущая', result[0])
         publication = self.store.publication(f'book:{book["id"]}')
@@ -190,7 +187,7 @@ class TownRenderTests(unittest.TestCase):
         self.assertIn('[Читать PDF](<https://example.org/book.pdf>)', text)
         self.assertIn('[Другое издание](https://example.org/edition)', text)
         self.assertIn('5 встреч по книге + обсуждение эссе', text)
-        self.assertIn('Опубликовано эссе: **1**', text)
+        self.assertIn('[Эссе участников — 1 · Карточка книги]', text)
         self.assertNotIn('Эссе до:', text)
         self.assertNotIn('18.05.2033', text)
 
@@ -229,7 +226,7 @@ class TownRenderTests(unittest.TestCase):
         result = town_guide(self.store, 1, dict(plan='https://example.org/plan', archive='https://example.org/archive'))
         self.assertEqual(len(result), 1)
         self.assertLessEqual(len(result[0]), 1750)
-        self.assertIn('Опубликовано эссе: **30**', result[0])
+        self.assertIn('[Эссе участников — 30 · Карточка книги]', result[0])
         self.assertIn('Все материалы и файлы — в карточке книги', result[0])
         self.assertNotIn('long-path-', result[0])
         publication = self.store.publication(f'book:{book["id"]}')
@@ -241,7 +238,7 @@ class TownRenderTests(unittest.TestCase):
         self.store.forget_publication(f'book:{book["id"]}')
         self.assertIn('Карточка книги ещё готовится', self.text()['current'])
         guide = '\n'.join(town_guide(self.store, 1, {}))
-        self.assertIn('Тема ещё готовится', guide)
+        self.assertIn('Карточка книги ещё готовится', guide)
         self.assertNotIn('](None)', guide)
 
     def test_user_text_cannot_ping_or_inject_extra_heading(self):

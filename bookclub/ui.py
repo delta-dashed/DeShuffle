@@ -16,7 +16,7 @@ from .store import ClubError, STATUSES, parse_time
 from .render import pages, safe, meeting_lines, book_url, essay_lines
 from .service import NO_MENTIONS, ESSAY_WEBHOOK_NAME, Service
 from .archive_import import ArchiveImporter
-from .catalog_ui import CatalogView, catalog_access, preview_book_file
+from .catalog_ui import CatalogView, TownMenuView, catalog_access, preview_book_file
 
 log = logging.getLogger(__name__)
 HELP = '''**Архивариус · книжный клуб**
@@ -278,6 +278,7 @@ class Club(commands.Cog):
         self.service.view_factory = lambda meeting: MeetingView(self, meeting)
         self.service.book_view_factory = lambda book: BookView(self, book)
         self.service.catalog_view_factory = lambda guild_id: CatalogView(self.service, guild_id)
+        self.service.town_menu_factory = lambda guild_id: TownMenuView(self.service, guild_id)
         from .format_controls import FormatView
         self.service.format_view_factory = lambda guild_id: FormatView(self.service, guild_id)
         from .book_trash_ui import RemovedBookView, open_deleted_books
@@ -299,6 +300,7 @@ class Club(commands.Cog):
                 self.bot.add_view(BookView(self, book))
         for row in self.store.rows('SELECT guild_id FROM bc_settings'):
             self.bot.add_view(CatalogView(self.service, row['guild_id']))
+            self.bot.add_view(TownMenuView(self.service, row['guild_id']))
             from .format_controls import FormatView
             self.bot.add_view(FormatView(self.service, row['guild_id']))
         self.worker.start()

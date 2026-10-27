@@ -18,25 +18,31 @@ def _url(guild_id, pub):
 
 
 def _view(service, guild_id, links, *, actions=False):
-    view = service.catalog_view_factory(guild_id) if actions and service.catalog_view_factory else discord.ui.View(timeout=None)
+    factory = getattr(service, 'town_menu_factory', None)
+    view = factory(guild_id) if actions and factory else discord.ui.View(timeout=None)
     for label, url in links:
         view.add_item(discord.ui.Button(label=label, url=url, row=1 if actions else 0))
     return view
 
 
 def _current_view(service, guild_id, urls):
-    view = service.catalog_view_factory(guild_id) if service.catalog_view_factory else discord.ui.View(timeout=None)
-    for button in list(view.children):
-        view.remove_item(button)
-        button.row = 3
-        view.add_item(button)
+    from .catalog_ui import CatalogGuardedView
+    view = CatalogGuardedView(timeout=None)
     book = next((b for b in service.store.books(guild_id) if b['status'] == 'reading'), None)
     if book and service.book_view_factory:
         actions = service.book_view_factory(book)
         for button in list(actions.children):
-            row = button.row or 0
+            if not button.custom_id.endswith((':write', ':own')):
+                continue
             actions.remove_item(button)
-            button.row = row + 1
+            button.row = 1
+            view.add_item(button)
+    menu_factory = getattr(service, 'town_menu_factory', None)
+    if menu_factory:
+        menu = menu_factory(guild_id)
+        for button in list(menu.children):
+            menu.remove_item(button)
+            button.row = 1
             view.add_item(button)
     for purpose, label in (('plan', 'План чтения'), ('archive', 'Архив')):
         if purpose in urls:
