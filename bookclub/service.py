@@ -595,14 +595,19 @@ class Service:
                 if not self.owns_starter(message):
                     raise ClubError('Сохранённая карточка принадлежит другому автору.')
                 view = self.removed_book_view_factory(b) if self.removed_book_view_factory else None
-                archived = thread.archived
-                if archived:
+                from .book_notice_archive import remember_notice_archive, finish_notice_archive
+                journal = remember_notice_archive(self.store, guild.id, book_id, pub, thread.archived)
+                archived = journal['pending']['original_archived']
+                if thread.archived:
                     thread = await thread.edit(archived=False)
                 try:
                     await message.edit(content=content, view=view, allowed_mentions=NO_MENTIONS)
                 finally:
                     if archived:
-                        await thread.edit(archived=True)
+                        restored = await thread.edit(archived=True)
+                        if not restored.archived:
+                            raise ClubError('Discord не подтвердил восстановление архива темы книги. Повторите обновление.')
+                finish_notice_archive(self.store, guild.id, book_id, pub, journal)
                 self.store.save_publication(key, thread.id, message.id, digest)
             self.book_updates.failures.pop((guild.id, book_id), None)
             return pub
