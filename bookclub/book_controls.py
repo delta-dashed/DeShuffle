@@ -21,7 +21,7 @@ def _bound(interaction, book, actor_id):
 
 
 def _current(cog, book):
-    current = cog.store.book(book['guild_id'], book['id'])
+    current = cog.store.require_active_book(book['guild_id'], book['id'])
     if current['revision'] != book['revision']:
         raise ClubError('Книга уже изменена. Откройте «Управление книгой» заново.')
     return current
@@ -54,7 +54,7 @@ def panel_content(cog, book):
 async def _show_updated(cog, interaction, book_id):
     book = cog.store.book(interaction.guild_id, book_id)
     view = BookControlsView(cog, book, interaction.user.id)
-    await interaction.edit_original_response(content=panel_content(cog, book), view=view,
+    await interaction.edit_original_response(content='Сохранено. Карточки обновляются.\n\n' + panel_content(cog, book), view=view,
                                              allowed_mentions=NO_MENTIONS)
     return view
 
@@ -65,12 +65,12 @@ async def open_book_controls(cog, interaction, book_id):
     await interaction.response.defer(ephemeral=True)
     # Opening only reads a book snapshot. The current interaction member and
     # gateway channel permissions suffice, just as when opening a modal; do not
-    # wait behind a full Discord refresh. Every submission takes the guild lock
-    # and repeats REST authorization and the snapshot revision check.
+    # wait behind a full Discord refresh. Submissions repeat REST authorization
+    # and check the snapshot revision atomically before queueing publication.
     cog.service.interaction_access(interaction)
     if not cog.service.interaction_organizer(interaction):
         raise ClubError('Управлять книгой может только организатор клуба.')
-    book = cog.store.book(interaction.guild_id, book_id)
+    book = cog.store.require_active_book(interaction.guild_id, book_id)
     view = BookControlsView(cog, book, interaction.user.id)
     await reply(interaction, panel_content(cog, book), view=view)
     return view
@@ -91,16 +91,15 @@ class BookControlsView(GuardedView):
     async def change_status(self, interaction):
         _bound(interaction, self.book, self.actor_id)
         await interaction.response.defer(ephemeral=True)
-        async with self.cog.service.locks[interaction.guild_id]:
-            current = await _authorized(self.cog, interaction, self.book, self.actor_id)
-            if len(self.status.values) != 1 or self.status.values[0] not in STATUSES:
-                raise ClubError('Выберите один из предложенных статусов книги.')
-            status = self.status.values[0]
-            if status != current['status'] or current.get('status_automation'):
-                self.cog.store.update_book(interaction.guild_id, current['id'], status=status,
-                                           expected_revision=current['revision'], status_actor_id=self.actor_id)
-                await self.cog.service.refresh(interaction.guild)
-            await _show_updated(self.cog, interaction, current['id'])
+        current = await _authorized(self.cog, interaction, self.book, self.actor_id)
+        if len(self.status.values) != 1 or self.status.values[0] not in STATUSES:
+            raise ClubError('Выберите один из предложенных статусов книги.')
+        status = self.status.values[0]
+        if status != current['status'] or current.get('status_automation'):
+            self.cog.store.update_book(interaction.guild_id, current['id'], status=status,
+                                       expected_revision=current['revision'], status_actor_id=self.actor_id)
+            self.cog.service.request_book_refresh(interaction.guild, current['id'])
+        await _show_updated(self.cog, interaction, current['id'])
         self.stop()
 
     @discord.ui.button(label='Изменить описание', style=discord.ButtonStyle.secondary, row=1)
@@ -113,6 +112,13 @@ class BookControlsView(GuardedView):
             raise ClubError('Управлять книгой может только организатор клуба.')
         current = _current(self.cog, self.book)
         await interaction.response.send_modal(BookDetailsModal(self.cog, current, self.actor_id))
+
+    @discord.ui.button(label='Удалить книгу', style=discord.ButtonStyle.danger, row=2)
+    async def remove(self, interaction, button):
+        _bound(interaction, self.book, self.actor_id)
+        _current(self.cog, self.book)
+        from .book_trash_ui import open_delete_book
+        await open_delete_book(self.cog, interaction, self.book['id'])
 
     @discord.ui.button(label='План встреч', style=discord.ButtonStyle.secondary, row=1)
     async def edit_plan(self, interaction, button):
@@ -134,26 +140,26 @@ class BookControlsView(GuardedView):
     async def automation(self, interaction, button):
         _bound(interaction, self.book, self.actor_id)
         await interaction.response.defer(ephemeral=True)
-        async with self.cog.service.locks[interaction.guild_id]:
-            current = await _authorized(self.cog, interaction, self.book, self.actor_id)
-            if current.get('status_automation'):
-                self.cog.store.set_book_status_automation(
-                    interaction.guild_id, current['id'], False,
-                    expected_revision=current['revision'], actor_id=self.actor_id)
-                await _show_updated(self.cog, interaction, current['id'])
-                self.stop()
-                return
-            reading = reading_count(current)
-            text = (
-                f'**Автостатус · {safe(current["title"])}**\n'
-                f'Проверьте правило: {reading} встреч по книге + 1 обсуждение эссе. '
-                'В управлении каждой встречей явно укажите её роль в плане.\n'
-                'После нового фактического старта встречи книга станет «Читаем». '
-                'Когда завершатся все встречи плана, включая одну по эссе, — «Прочитано». '
-                'Отменённые встречи не считаются завершёнными; назначение даты статус не меняет.\n'
-                'Включение сохранит текущий статус. Уже известные события повторно его не изменят. '
-                'Ручной выбор статуса выключит автоматику.')
-            await reply(interaction, text, view=BookAutomationConfirmation(self.cog, current, self.actor_id))
+        current = await _authorized(self.cog, interaction, self.book, self.actor_id)
+        if current.get('status_automation'):
+            self.cog.store.set_book_status_automation(
+                interaction.guild_id, current['id'], False,
+                expected_revision=current['revision'], actor_id=self.actor_id)
+            self.cog.service.request_book_refresh(interaction.guild, current['id'])
+            await _show_updated(self.cog, interaction, current['id'])
+            self.stop()
+            return
+        reading = reading_count(current)
+        text = (
+            f'**Автостатус · {safe(current["title"])}**\n'
+            f'Проверьте правило: {reading} встреч по книге + 1 обсуждение эссе. '
+            'В управлении каждой встречей явно укажите её роль в плане.\n'
+            'После нового фактического старта встречи книга станет «Читаем». '
+            'Когда завершатся все встречи плана, включая одну по эссе, — «Прочитано». '
+            'Отменённые встречи не считаются завершёнными; назначение даты статус не меняет.\n'
+            'Включение сохранит текущий статус. Уже известные события повторно его не изменят. '
+            'Ручной выбор статуса выключит автоматику.')
+        await reply(interaction, text, view=BookAutomationConfirmation(self.cog, current, self.actor_id))
 
 
 class BookAutomationConfirmation(GuardedView):
@@ -165,12 +171,12 @@ class BookAutomationConfirmation(GuardedView):
     async def confirm(self, interaction, button):
         _bound(interaction, self.book, self.actor_id)
         await interaction.response.defer(ephemeral=True)
-        async with self.cog.service.locks[interaction.guild_id]:
-            current = await _authorized(self.cog, interaction, self.book, self.actor_id)
-            self.cog.store.set_book_status_automation(
-                interaction.guild_id, current['id'], True,
-                expected_revision=current['revision'], actor_id=self.actor_id)
-            await _show_updated(self.cog, interaction, current['id'])
+        current = await _authorized(self.cog, interaction, self.book, self.actor_id)
+        self.cog.store.set_book_status_automation(
+            interaction.guild_id, current['id'], True,
+            expected_revision=current['revision'], actor_id=self.actor_id)
+        self.cog.service.request_book_refresh(interaction.guild, current['id'])
+        await _show_updated(self.cog, interaction, current['id'])
         self.stop()
 
     @discord.ui.button(label='Назад', style=discord.ButtonStyle.secondary)
@@ -199,19 +205,18 @@ class BookDetailsModal(GuardedModal):
     async def on_submit(self, interaction):
         _bound(interaction, self.book, self.actor_id)
         await interaction.response.defer(ephemeral=True)
-        async with self.cog.service.locks[interaction.guild_id]:
-            current = await _authorized(self.cog, interaction, self.book, self.actor_id)
-            fields = {key: str(field.value).strip() for key, field in self.fields.items()}
-            raw_position = fields['position']
-            if not re.fullmatch(r'[+-]?[0-9]+', raw_position):
-                raise ClubError('Порядок в очереди: целое число от -1000000 до 1000000. Меньшее число идёт раньше.')
-            fields['position'] = int(raw_position)
-            if abs(fields['position']) > 1_000_000 and fields['position'] != current['position']:
-                raise ClubError('Новый порядок в очереди: целое число от -1000000 до 1000000.')
-            self.cog.store.update_book(interaction.guild_id, current['id'], **fields,
-                                       expected_revision=current['revision'])
-            await self.cog.service.refresh(interaction.guild)
-            await _show_updated(self.cog, interaction, current['id'])
+        current = await _authorized(self.cog, interaction, self.book, self.actor_id)
+        fields = {key: str(field.value).strip() for key, field in self.fields.items()}
+        raw_position = fields['position']
+        if not re.fullmatch(r'[+-]?[0-9]+', raw_position):
+            raise ClubError('Порядок в очереди: целое число от -1000000 до 1000000. Меньшее число идёт раньше.')
+        fields['position'] = int(raw_position)
+        if abs(fields['position']) > 1_000_000 and fields['position'] != current['position']:
+            raise ClubError('Новый порядок в очереди: целое число от -1000000 до 1000000.')
+        self.cog.store.update_book(interaction.guild_id, current['id'], **fields,
+                                   expected_revision=current['revision'])
+        self.cog.service.request_book_refresh(interaction.guild, current['id'])
+        await _show_updated(self.cog, interaction, current['id'])
         self.stop()
 
 
@@ -228,14 +233,13 @@ class PlanMeetingsModal(GuardedModal):
     async def on_submit(self, interaction):
         _bound(interaction, self.book, self.actor_id)
         await interaction.response.defer(ephemeral=True)
-        async with self.cog.service.locks[interaction.guild_id]:
-            current = await _authorized(self.cog, interaction, self.book, self.actor_id)
-            raw = str(self.count.value).strip()
-            if raw and (not raw.isascii() or not raw.isdecimal() or not 1 <= int(raw) <= 100):
-                raise ClubError('План: от 1 до 100 встреч по книге; ещё одна встреча посвящена эссе. Пустое поле возвращает 3 встречи.')
-            reading_meetings = int(raw) if raw else None
-            self.cog.store.update_book(interaction.guild_id, current['id'], reading_meetings=reading_meetings,
-                                       expected_revision=current['revision'])
-            await self.cog.service.refresh(interaction.guild)
-            await _show_updated(self.cog, interaction, current['id'])
+        current = await _authorized(self.cog, interaction, self.book, self.actor_id)
+        raw = str(self.count.value).strip()
+        if raw and (not raw.isascii() or not raw.isdecimal() or not 1 <= int(raw) <= 100):
+            raise ClubError('План: от 1 до 100 встреч по книге; ещё одна встреча посвящена эссе. Пустое поле возвращает 3 встречи.')
+        reading_meetings = int(raw) if raw else None
+        self.cog.store.update_book(interaction.guild_id, current['id'], reading_meetings=reading_meetings,
+                                   expected_revision=current['revision'])
+        self.cog.service.request_book_refresh(interaction.guild, current['id'])
+        await _show_updated(self.cog, interaction, current['id'])
         self.stop()

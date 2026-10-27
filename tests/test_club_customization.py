@@ -124,7 +124,7 @@ class ClubCustomizationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         view = call.kwargs['view']
         self.assertIsInstance(view, CatalogView)
         self.assertTrue(view.is_persistent())
-        self.assertEqual([button.label for button in view.children], ['Добавить книгу', 'Загрузить список', 'Порядок чтения'])
+        self.assertEqual([button.label for button in view.children], ['Добавить книгу', 'Загрузить список', 'Порядок чтения', 'Удалённые книги'])
         pub = self.store.publication('catalog:1')
         content = self.h.channels[pub['channel_id']].messages[pub['message_id']].content
         self.assertIn('Сейчас читаем', content)

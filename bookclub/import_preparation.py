@@ -182,7 +182,7 @@ class ImportPreparation:
             if book_id is not None:
                 if title is not None or author is not None:
                     raise ClubError('Укажите либо существующую книгу, либо название и автора.')
-                book = self.importer.store.book(guild.id, book_id)
+                book = self.importer.store.require_active_book(guild.id, book_id)
                 book_id, title, author = book['id'], book['title'], book['author']
             else:
                 if not isinstance(title, str) or not isinstance(author, str):

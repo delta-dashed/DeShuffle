@@ -23,6 +23,7 @@ HELP = '''**Архивариус · книжный клуб**
 Участнику: `/club books`, `/club book_add`, `/club join`, `/club essay`.
 В каталоге и `/club books`: «Добавить книгу» создаёт книгу и её тему. Организатору: «Загрузить список» или `/club library import` с файлом TXT, CSV, JSON.
 В карточке книги: «Управление книгой» — статус, данные и план N + 1; «Встречи» — конкретные даты и переносы.
+«Удалить книгу» предлагает сохранить материалы, удалить тему или перенести эссе в другую книгу. Необратимое удаление подтверждается названием книги. Статус и восстановление — «Удалённые книги» или `/club library deleted`.
 Ведущему: откройте `/club meeting`, нажмите «Провести встречу» и подтвердите. Кнопка «Мой план» открывает личный черновик.
 Организатору: `/club book_edit`, `/club participant`, `/club meeting_add`, `/club meeting_attach`, `/club move`, `/club cancel`, `/club offer`, `/club replace`, `/club handover`.
 Настройка сервера: `/club setup` создаёт недостающие каналы и проверяет существующие; `check_only=True` — только проверка.
@@ -279,6 +280,9 @@ class Club(commands.Cog):
         self.service.catalog_view_factory = lambda guild_id: CatalogView(self.service, guild_id)
         from .format_controls import FormatView
         self.service.format_view_factory = lambda guild_id: FormatView(self.service, guild_id)
+        from .book_trash_ui import RemovedBookView, open_deleted_books
+        self.service.removed_book_view_factory = lambda book: RemovedBookView(self, book)
+        self.service.deleted_books_handler = lambda interaction: open_deleted_books(self, interaction)
         self.importer = ArchiveImporter(self.service, import_config)
 
     async def cog_load(self):
@@ -289,7 +293,10 @@ class Club(commands.Cog):
         for m in self.store.rows('SELECT * FROM bc_meetings WHERE event_id IS NOT NULL'):
             self.bot.add_view(MeetingView(self, m))
         for book in self.store.rows('SELECT * FROM bc_books'):
-            self.bot.add_view(BookView(self, book))
+            if book.get('deleted'):
+                self.bot.add_view(self.service.removed_book_view_factory(book))
+            else:
+                self.bot.add_view(BookView(self, book))
         for row in self.store.rows('SELECT guild_id FROM bc_settings'):
             self.bot.add_view(CatalogView(self.service, row['guild_id']))
             from .format_controls import FormatView
@@ -298,6 +305,7 @@ class Club(commands.Cog):
 
     async def cog_unload(self):
         self.worker.cancel()
+        await self.service.close()
         await self.importer.close()
 
     @tasks.loop(seconds=30)
@@ -355,6 +363,7 @@ class Club(commands.Cog):
             raise ClubError('Откройте карточку на сервере клуба.')
         await interaction.response.defer(ephemeral=True)
         if action == 'write':
+            self.store.require_active_book(interaction.guild_id, book['id'])
             essay = await self.service.create_essay_space(interaction.guild, book['id'], interaction.user.id)
             view = discord.ui.View(timeout=180)
             view.add_item(discord.ui.Button(label='Открыть моё эссе', url=essay['url']))
@@ -417,6 +426,13 @@ class Club(commands.Cog):
         await self.say(ctx, 'Нажмите «Загрузить список» в каталоге или прикрепите файл к /club library import. '
                        'Формат TXT: Название | Автор, по одной книге в строке. Также поддерживаются CSV и JSON.')
 
+    @library.command(name='deleted', description='Удалённые книги и восстановление')
+    async def deleted_books(self, ctx):
+        if ctx.interaction is None:
+            raise ClubError('Используйте /club library deleted: список удалённых книг виден только организатору.')
+        from .book_trash_ui import open_deleted_books
+        await open_deleted_books(self, ctx.interaction)
+
     @library.command(name='import', description='Разобрать файл со списком книг и показать предпросмотр')
     async def library_import(self, ctx, file: discord.Attachment):
         if ctx.interaction is None:
@@ -427,23 +443,23 @@ class Club(commands.Cog):
     async def book_edit(self, ctx, book: str, status: Optional[Literal['Предложено', 'В очереди', 'Читаем', 'Прочитано']] = None,
                         position: Optional[int] = None, title: Optional[str] = None,
                         author: Optional[str] = None, materials: Optional[str] = None, reading_meetings: Optional[str] = None):
-        async with self.service.locks[ctx.guild.id]:
-            await self.organizer(ctx)
-            b = self.resolve_book(ctx.guild.id, book)
-            fields = {k: v for k, v in dict(position=position, title=title, author=author, materials=materials).items() if v is not None}
-            if status:
-                fields['status'] = next(k for k, v in STATUSES.items() if v == status)
-            if reading_meetings is not None:
-                value = reading_meetings.strip()
-                if value == '-':
-                    fields['reading_meetings'] = None
-                elif value.isdecimal() and len(value) <= 3:
-                    fields['reading_meetings'] = int(value)
-                else:
-                    raise ClubError('План: целое число встреч по книге от 1 до 100; «-» возвращает стандартные 3. Разбор эссе добавляется отдельно: +1.')
-            self.store.update_book(ctx.guild.id, b['id'], status_actor_id=ctx.author.id, **fields)
-            await self.service.refresh(ctx.guild)
-        await self.say(ctx, 'Книга обновлена; обсуждение и история сохранены.')
+        await self.organizer(ctx)
+        b = self.resolve_book(ctx.guild.id, book)
+        fields = {k: v for k, v in dict(position=position, title=title, author=author, materials=materials).items() if v is not None}
+        if status:
+            fields['status'] = next(k for k, v in STATUSES.items() if v == status)
+        if reading_meetings is not None:
+            value = reading_meetings.strip()
+            if value == '-':
+                fields['reading_meetings'] = None
+            elif value.isdecimal() and len(value) <= 3:
+                fields['reading_meetings'] = int(value)
+            else:
+                raise ClubError('План: целое число встреч по книге от 1 до 100; «-» возвращает стандартные 3. Разбор эссе добавляется отдельно: +1.')
+        self.store.update_book(ctx.guild.id, b['id'], expected_revision=b['revision'],
+                               status_actor_id=ctx.author.id, **fields)
+        self.service.request_book_refresh(ctx.guild, b['id'])
+        await self.say(ctx, 'Сохранено. Карточки обновляются; обсуждение и история сохранены.')
 
     @club.command(name='join', description='Участвовать в чтении и указать готовность вести')
     async def join(self, ctx, book: str, willing: bool = False, leave: bool = False):
@@ -1024,8 +1040,10 @@ class Club(commands.Cog):
     async def on_raw_thread_delete(self, payload):
         async with self.service.locks[payload.guild_id]:
             self.store.delete_essay(payload.guild_id, channel_id=payload.thread_id)
-            with self.store.tx() as db:
-                db.execute('DELETE FROM bc_publications WHERE guild_id=? AND channel_id=?', (payload.guild_id, payload.thread_id))
+            from .book_removal_projection import retained_removal_publication
+            if not retained_removal_publication(self.store, payload.guild_id, channel_id=payload.thread_id):
+                with self.store.tx() as db:
+                    db.execute('DELETE FROM bc_publications WHERE guild_id=? AND channel_id=?', (payload.guild_id, payload.thread_id))
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -1054,8 +1072,12 @@ class Club(commands.Cog):
         if payload.guild_id:
             async with self.service.locks[payload.guild_id]:
                 self.store.delete_essay(payload.guild_id, source_id=payload.message_id)
-                with self.store.tx() as db:
-                    db.execute('DELETE FROM bc_publications WHERE guild_id=? AND message_id=?', (payload.guild_id, payload.message_id))
+                from .book_removal_projection import retained_removal_publication
+                if not retained_removal_publication(self.store, payload.guild_id,
+                                                     channel_id=getattr(payload, 'channel_id', None),
+                                                     message_id=payload.message_id):
+                    with self.store.tx() as db:
+                        db.execute('DELETE FROM bc_publications WHERE guild_id=? AND message_id=?', (payload.guild_id, payload.message_id))
             if getattr(payload, 'channel_id', None) is not None:
                 await self.refresh_essay_message(payload)
 

@@ -15,7 +15,7 @@ def move_book(store, guild_id, snapshot, book_id, action, actor_id):
     settings = store.settings(guild_id)
     with store.tx() as db:
         rows = [dict(row) for row in db.execute(
-            "SELECT * FROM bc_books WHERE guild_id=? AND status IN ('queued','proposed') ORDER BY position,id", (guild_id,))]
+            "SELECT * FROM bc_books WHERE guild_id=? AND deleted=0 AND status IN ('queued','proposed') ORDER BY position,id", (guild_id,))]
         if {b['id']: b['revision'] for b in rows} != {b['id']: b['revision'] for b in snapshot}:
             raise ClubError('Очередь уже изменилась. Откройте управление заново.')
         book = next((b for b in rows if b['id'] == book_id), None)

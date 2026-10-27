@@ -159,6 +159,10 @@ class ArchiveImporter:
                 raise ClubError('В этом фрагменте нет новых сообщений для анализа. Продолжите preview по cursor, если он указан.')
             if not await self.runner.login_status():
                 raise ClubError('Сначала выполните /club import login и войдите в Codex.')
+            # A removal can arrive while login status is checked. Refuse the
+            # stale snapshot before reserving quota or starting the model.
+            for candidate in snapshot['books']:
+                self.active_snapshot_book(guild.id, candidate)
             schema = plan_schema(snapshot)
             payload = {'books': snapshot['books'], 'messages': [{k: m[k] for k in
                        ('id', 'author_id', 'content', 'attachments', 'context_ref')} for m in snapshot['messages']]}
@@ -264,6 +268,15 @@ class ArchiveImporter:
         lines.append('Проверьте полный план в приложенном JSON. Подтверждение: /club import apply run:' + run['id'] + ' confirm:true')
         return lines
 
+    def active_snapshot_book(self, guild_id, candidate):
+        """Resolve historical request keys without resurrecting removed books."""
+        book_id = candidate['book_id']
+        if not book_id:
+            existing = self.store.one('SELECT id FROM bc_books WHERE guild_id=? AND request_key=?',
+                                      (guild_id, 'archive:' + candidate['ref']))
+            book_id = existing['id'] if existing else None
+        return self.store.require_active_book(guild_id, book_id) if book_id else None
+
     async def apply(self, guild, actor_id, run_id, *, confirm=False):
         actor = await self.guard(guild, actor_id)
         if not confirm:
@@ -300,11 +313,17 @@ class ArchiveImporter:
                     if message.author.id != old['author_id'] or message.author.bot or message.webhook_id is not None or fingerprint(message) != old['fingerprint']:
                         raise ClubError('Исходное сообщение изменено после анализа. Старый план не применяется.')
                     originals[ident] = message
+            for item in run['plan']['essays']:
+                self.active_snapshot_book(guild.id, books[item['book_ref']])
             if not self.ledger.claim_apply(guild.id, run_id):
                 return ['Этот план уже перенесён.']
             results = []
             try:
                 for item in run['plan']['essays']:
+                    candidate = books[item['book_ref']]
+                    # Earlier items awaited Discord. Repeat this check before
+                    # claiming the next source or creating its forum post.
+                    book = self.active_snapshot_book(guild.id, candidate)
                     ids = item['message_ids']
                     key = f'essay-import:{guild.id}:{min(ids, key=int)}'
                     if not self.ledger.claim_sources(guild.id, run_id, key, list(map(int, ids))):
@@ -313,10 +332,7 @@ class ArchiveImporter:
                     if binding['thread_id']:
                         results.append(f'Уже перенесено: <#{binding["thread_id"]}>.')
                         continue
-                    candidate = books[item['book_ref']]
-                    if candidate['book_id']:
-                        book = self.store.book(guild.id, candidate['book_id'])
-                    else:
+                    if book is None:
                         book = self.store.create_book(guild.id, candidate['title'], candidate['author'],
                                                       '', 'archive:' + item['book_ref'])
                     first = snapshots[ids[0]]
@@ -335,12 +351,14 @@ class ArchiveImporter:
                         await self.service.finish_import_header(thread, starter,
                             starter.content.removesuffix('\n-# bc:' + key), pub)
                     else:
+                        self.store.require_active_book(guild.id, book['id'])
                         pub = await self.service.publish_essay_starter(guild, forum, key, name, header, member)
                         thread = await self.service.channel(guild, pub['channel_id'], discord.Thread)
                     for ident in ids:
                         message, old = originals[ident], snapshots[ident]
                         chunks = publication_chunks(self.store, guild.id, key, old, persist=True)
                         for index, chunk in enumerate(chunks):
+                            self.store.require_active_book(guild.id, book['id'])
                             legacy_key = f'{key}:message:{ident}:{index}'
                             copy_key = legacy_key + ':v2'
                             existing = self.store.publication(copy_key)
@@ -358,8 +376,14 @@ class ArchiveImporter:
                                         if str(attachment.id) in copy_ids:
                                             files.append(await asyncio.wait_for(attachment.to_file(), timeout=30))
                                 expected_files = [(a['filename'], a['size']) for a in old['attachments'] if a['copy']] if index == 0 else []
+                                # File downloads and existing-message checks can
+                                # yield long enough for an organizer to remove it.
+                                self.store.require_active_book(guild.id, book['id'])
                                 copy = await self.publisher.upsert(guild, thread, copy_key, chunk, member, files=files,
                                                                   expected_attachments=expected_files)
+                                # upsert has durably saved its returned ID. Stop
+                                # further edits without losing that recovery link.
+                                self.store.require_active_book(guild.id, book['id'])
                                 # A partially applied pre-upgrade run can finish
                                 # without leaving its old bot copies alongside v2.
                                 legacy_chunks = archive_chunks(old, legacy=True)
