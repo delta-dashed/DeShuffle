@@ -11,3 +11,5 @@ bookclub-codex-profile/
 **/bookclub-codex-profile/
 *.sqlite3
 *.sqlite3-*
+**/runtime-health.json
+**/.runtime-health-*

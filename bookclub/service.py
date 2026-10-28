@@ -1148,6 +1148,9 @@ class Service:
         self.store.finish_job(job['key'], 'failed' if failures else 'sent', '; '.join(failures) or None)
 
     async def tick(self, guild):
+        # Continue independent reminders after a projection error, but expose
+        # the degraded pass to the local deployment health check.
+        errors = []
         async with self.locks[guild.id]:
             await self.book_updates.drain(guild)
             await self.reconcile(guild)
@@ -1155,7 +1158,7 @@ class Service:
             live = await self.live_participants(guild)
             self.store.expire_offers(guild.id, live)
             if not self.store.settings(guild.id)['published']:
-                return
+                return ()
             due = self.store.due_jobs(guild.id)
             essays_ready = True
             try:
@@ -1163,12 +1166,14 @@ class Service:
                         or any(j['kind'].startswith('essay') for j in due)):
                     await self.scan_essays(guild)
                 await self.check_essays(guild)
-            except Exception:
+            except Exception as exc:
+                errors.append('essays.' + type(exc).__name__)
                 essays_ready = False
                 log.exception('Essay reconciliation failed for guild %s; essay reminders deferred', guild.id)
             try:
                 await self.refresh(guild)
-            except Exception:
+            except Exception as exc:
+                errors.append('cards.' + type(exc).__name__)
                 log.exception('Book club cards failed for guild %s; meeting reminders remain enabled', guild.id)
             for job in self.store.due_jobs(guild.id):
                 await self.book_updates.drain(guild)
@@ -1178,12 +1183,15 @@ class Service:
                 else:
                     try:
                         await self.sync_one(guild, self.store.meeting(guild.id, job['entity_id']))
-                    except Exception:
+                    except Exception as exc:
+                        errors.append('meeting.' + type(exc).__name__)
                         log.exception('Meeting %s could not be checked; its reminder deferred', job['entity_id'])
                         continue
                 if self.store.claim_job(job['key']):
                     try:
                         await self.deliver(guild, job)
-                    except Exception:
+                    except Exception as exc:
+                        errors.append('delivery.' + type(exc).__name__)
                         self.store.finish_job(job['key'], 'unknown', 'Не удалось подтвердить отправку; проверьте журнал бота.')
                         log.exception('Book club delivery %s failed', job['key'])
+        return tuple(errors)
