@@ -13,6 +13,7 @@ from itertools import combinations
 from typing import Any, Optional, Union
 from dotenv import load_dotenv
 from contextlib import contextmanager
+from bookclub.runtime_health import RuntimeHealth, bot_health
 
 load_dotenv()
 
@@ -30,7 +31,15 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 @bot.event
 async def setup_hook():
-    if os.getenv('BOOKCLUB_ENABLED', '').lower() in ('1', 'true', 'yes'):
+    club_enabled = os.getenv('BOOKCLUB_ENABLED', '').lower() in ('1', 'true', 'yes')
+    previous_health = bot_health(bot)
+    if previous_health is not None:
+        previous_health.stop()
+    bot.runtime_health = RuntimeHealth(
+        os.getenv('RESHUFFLE_HEALTH_FILE') or os.path.join(os.path.dirname(VOICE_STATS_DB_FILE), 'runtime-health.json'),
+        deploy_sha=os.getenv('RESHUFFLE_DEPLOY_SHA', ''), club_enabled=club_enabled)
+    bot.runtime_health.start(bot)
+    if club_enabled:
         from bookclub.config import load_config
         from bookclub.import_config import load_import_config
         from bookclub.store import Store
@@ -1922,6 +1931,9 @@ init_voice_tracking_db()
 
 @bot.event
 async def on_ready():
+    health = bot_health(bot)
+    if health is not None:
+        health.set_connected(True)
     print(f'{bot.user} connected. Guilds: {len(bot.guilds)}')
     print(f"Runtime data dir: {DATA_DIR}")
     print(
@@ -1988,6 +2000,20 @@ async def on_ready():
                 await schedule_event_lifecycle_for_event(ev)
 
     await reconcile_active_voice_sessions()
+
+
+@bot.event
+async def on_disconnect():
+    health = bot_health(bot)
+    if health is not None:
+        health.set_connected(False)
+
+
+@bot.event
+async def on_resumed():
+    health = bot_health(bot)
+    if health is not None:
+        health.set_connected(True)
 
 
 @bot.event

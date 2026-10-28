@@ -1,0 +1,19 @@
+{
+  "enabled": false,
+  "repo": "/srv/reshuffle",
+  "remote": "origin",
+  "branch": "main",
+  "service": "reshuffle",
+  "compose_files": [
+    "/srv/reshuffle/docker-compose.yml"
+  ],
+  "project": "reshuffle",
+  "env_file": "/srv/reshuffle/.env",
+  "backup_dir": "/var/backups/reshuffle",
+  "state_dir": "/var/lib/reshuffle-updater",
+  "health_timeout": 300,
+  "command_timeout": 900,
+  "database_path": "/data/voice_activity.sqlite3",
+  "build_args": {},
+  "external_config_files": []
+}

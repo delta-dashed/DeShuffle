@@ -122,3 +122,7 @@ docker build --build-arg INSTALL_CODEX=true --build-arg CODEX_VERSION=0.152.1 -t
 ```
 
 Run that image with the same persistent `/data` volume and set `BOOKCLUB_IMPORT_CONFIG_FILE=/data/bookclub.import.json`. A Codex installation or login on the Docker host is not automatically available inside the container. The importer keeps its separate login under `/data/bookclub-codex-profile`; keep this volume private and persistent. Do not include authentication files in the image or repository. CLI timeouts and launch quotas limit importer activity; `max_accounted_tokens` is accounting protection, not a hard token ceiling for one response.
+
+## Server updates
+
+After a one-time server setup, `sudo systemctl start reshuffle-update` updates from `main` with a private backup and startup checks. Updates run only on this manual command. See [server update setup and recovery](docs/SERVER_UPDATE.md) for configuration, preserving Compose overrides and optional Codex CLI, and rollback limits.

@@ -46,5 +46,9 @@ USER botuser
 ENV PATH=/home/botuser/.local/bin:$PATH
 ENV RESHUFFLE_DATA_DIR=/data
 
+# Read-only local readiness: Discord connection and the last club reconciliation.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["python", "-c", "import os; from bookclub.runtime_health import main; raise SystemExit(main(['--check', os.getenv('RESHUFFLE_HEALTH_FILE') or os.path.join(os.getenv('RESHUFFLE_DATA_DIR', '/data'), 'runtime-health.json')]))"]
+
 # Run the bot
 CMD ["python", "-u", "Shuffle.py"]

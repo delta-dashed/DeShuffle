@@ -17,6 +17,7 @@ from .render import pages, safe, meeting_lines, book_url, essay_lines
 from .service import NO_MENTIONS, ESSAY_WEBHOOK_NAME, Service
 from .archive_import import ArchiveImporter
 from .catalog_ui import CatalogView, TownMenuView, catalog_access, preview_book_file
+from .runtime_health import bot_health
 
 log = logging.getLogger(__name__)
 HELP = '''**Архивариус · книжный клуб**
@@ -303,6 +304,7 @@ class Club(commands.Cog):
             self.bot.add_view(TownMenuView(self.service, row['guild_id']))
             from .format_controls import FormatView
             self.bot.add_view(FormatView(self.service, row['guild_id']))
+        self.sync_runtime_health()
         self.worker.start()
 
     async def cog_unload(self):
@@ -312,15 +314,33 @@ class Club(commands.Cog):
 
     @tasks.loop(seconds=30)
     async def worker(self):
-        for row in self.store.rows('SELECT guild_id FROM bc_settings'):
-            if self.service.guild_ids is not None and row['guild_id'] not in self.service.guild_ids:
-                continue
+        rows, health = self.sync_runtime_health()
+        for row in rows:
+            if health is not None:
+                health.begin_reconciliation(row['guild_id'])
             guild = self.bot.get_guild(row['guild_id'])
             if guild:
                 try:
-                    await self.service.tick(guild)
-                except Exception:
+                    errors = await self.service.tick(guild)
+                except Exception as exc:
+                    if health is not None:
+                        health.finish_reconciliation(guild.id, exc)
                     log.exception('Book club reconciliation failed for guild %s; will retry', guild.id)
+                else:
+                    if health is not None:
+                        health.finish_reconciliation(guild.id, errors[0] if errors else None)
+            elif health is not None:
+                health.finish_reconciliation(row['guild_id'], 'GuildUnavailable')
+
+    def sync_runtime_health(self):
+        rows = [row for row in self.store.rows('SELECT guild_id FROM bc_settings')
+                if self.service.guild_ids is None or row['guild_id'] in self.service.guild_ids]
+        health = bot_health(self.bot)
+        if health is not None:
+            published = [row['guild_id'] for row in rows if self.store.settings(row['guild_id'])['published']]
+            schema = self.store.one('SELECT MAX(version) AS version FROM bc_migrations')['version']
+            health.configure_club(published, schema)
+        return rows, health
 
     @worker.before_loop
     async def before_worker(self):
