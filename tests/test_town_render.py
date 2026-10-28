@@ -5,7 +5,8 @@ import unittest
 
 from bookclub.store import Store
 from bookclub.render import book_pages
-from bookclub.town_render import archive_entries, legacy_archive_pages, pinned_title, town_guide, town_sections
+from bookclub.town_render import (archive_entries, legacy_archive_pages, legacy_plan_pages,
+                                  pinned_title, plan_entries, town_guide, town_sections)
 
 
 class TownRenderTests(unittest.TestCase):
@@ -57,18 +58,21 @@ class TownRenderTests(unittest.TestCase):
         self.store.configure(2, dict(news=21, chat=22, books=23, essays=24, voice=25))
         self.store.create_book(2, 'Чужой сервер', 'Другой автор', '', 'foreign')
         result = self.text()
+        plan = '\n'.join(plan_entries(self.store, 1).values())
         self.assertIn('Текущее чтение', result['current'])
         self.assertNotIn('Текущее чтение', result['plan'])
         self.assertNotIn('Текущее чтение', result['archive'])
         for title in ('Очередная книга', 'Книга предложение'):
-            self.assertIn(title, result['plan'])
+            self.assertIn(title, plan)
+            self.assertNotIn(title, result['plan'])
             self.assertNotIn(title, result['current'] + result['archive'])
         archived = '\n'.join(archive_entries(self.store, 1).values())
         self.assertIn('Завершённая книга', archived)
         self.assertNotIn('Завершённая книга', result['archive'])
         self.assertNotIn('Завершённая книга', result['current'] + result['plan'])
         self.assertNotIn('Удалённый архив', str(result) + archived)
-        self.assertNotIn('Чужой сервер', str(result) + archived)
+        self.assertNotIn('Чужой сервер', str(result) + archived + plan)
+        self.assertNotIn('Удалённый архив', plan)
         for title in ('Текущее чтение', 'Очередная книга', 'Книга предложение'):
             self.assertNotIn(title, archived)
 
@@ -102,31 +106,94 @@ class TownRenderTests(unittest.TestCase):
         self.book('Вторая очередь', 'queued', position=20)
         self.book('Первая очередь', 'queued', position=10)
         self.book('Не утверждено', 'proposed', position=1)
-        text = self.text()['plan']
+        before = self.store.books(1)
+        entries = plan_entries(self.store, 1)
+        text = '\n'.join(entries.values())
+        self.assertEqual(list(entries), [1, 2, 3])
         self.assertLess(text.index('Первая очередь'), text.index('Вторая очередь'))
-        self.assertLess(text.index('Вторая очередь'), text.index('Предложения'))
-        self.assertLess(text.index('Предложения'), text.index('Не утверждено'))
-        self.assertIn('**1.** [Первая очередь', text)
+        self.assertLess(text.index('Вторая очередь'), text.index('Предложено'))
+        self.assertLess(text.index('Предложено'), text.index('Не утверждено'))
+        self.assertIn('1. [Первая очередь', text)
+        self.assertEqual(before, self.store.books(1))
 
-    def test_long_queue_is_complete_paginated_and_keeps_links_intact(self):
+    def test_long_queue_is_one_message_per_book_without_pages_and_keeps_links_intact(self):
         titles = []
         for index in range(40):
             title = f'Книга {index:03} ' + 'Длинное название ' * 9
             titles.append(title.strip())
             self.book(title, 'queued', author='Автор ' * 25)
         result = town_sections(self.store, 1)
-        self.assertGreater(len(result['plan']), 5)
-        text = '\n'.join(result['plan'])
+        self.assertEqual(len(result['plan']), 1)
+        entries = plan_entries(self.store, 1)
+        self.assertEqual(list(entries), list(range(1, 41)))
+        text = '\n'.join(entries.values())
         for title in titles:
             self.assertEqual(text.count(title), 1)
-        for page in result['plan']:
+        for page in entries.values():
             self.assertLessEqual(len(page), 1750)
-            self.assertTrue(page.startswith('## План чтения'))
+            self.assertNotIn('## ', page)
+            self.assertNotIn('\n', page)
             self.assertEqual(page.count('](https://discord.com/channels/'), page.count('https://discord.com/channels/'))
             for line in page.splitlines():
                 if 'https://discord.com/channels/' in line:
                     self.assertTrue(line.endswith(')'))
-        self.assertIn('**40.**', text)
+        self.assertIn('40. [', text)
+        self.assertNotIn('1/', result['plan'][0])
+
+    def test_plan_empty_proposals_do_not_create_a_section_or_message(self):
+        self.book('Только очередь', 'queued')
+        intro = town_sections(self.store, 1)['plan']
+        self.assertEqual(len(intro), 1)
+        self.assertNotIn('Предложени', intro[0])
+        entries = plan_entries(self.store, 1)
+        self.assertEqual(len(entries), 1)
+        self.assertFalse(any('Предложено' in line for line in entries.values()))
+
+    def test_plan_reorder_and_status_changes_follow_current_saved_queue_without_mutation(self):
+        first = self.book('Первая', 'queued', position=10)
+        second = self.book('Вторая', 'queued', position=20)
+        proposed = self.book('Предложение', 'proposed', position=1)
+        self.store.update_book(1, second['id'], position=5)
+        snapshot = self.store.books(1)
+        entries = plan_entries(self.store, 1)
+        self.assertIn('1. [Вторая', entries[1])
+        self.assertIn('2. [Первая', entries[2])
+        self.assertTrue(entries[3].startswith('Предложено · [Предложение'))
+        self.assertEqual(snapshot, self.store.books(1))
+        self.store.update_book(1, first['id'], status='read')
+        self.store.update_book(1, proposed['id'], status='queued', position=7)
+        changed = plan_entries(self.store, 1)
+        self.assertEqual(list(changed), [1, 2])
+        self.assertIn('1. [Вторая', changed[1])
+        self.assertIn('2. [Предложение', changed[2])
+        self.assertNotIn('Первая', '\n'.join(changed.values()))
+
+    def test_plan_entry_labels_are_safe_and_missing_cards_never_make_fake_links(self):
+        book = self.book('@everyone\n[Сюрприз]', 'queued', author='@here\nАвтор')
+        entry = plan_entries(self.store, 1)[1]
+        self.assertNotIn('@everyone', entry)
+        self.assertNotIn('@here', entry)
+        self.assertNotIn('\n', entry)
+        self.assertIn('［Сюрприз］', entry)
+        self.store.forget_publication(f'book:{book["id"]}')
+        self.assertNotIn('https://', plan_entries(self.store, 1)[1])
+        self.assertNotIn('](None)', plan_entries(self.store, 1)[1])
+
+    def test_legacy_plan_pages_reproduce_old_renderer_without_changing_short_intro(self):
+        first = self.book('Очередь', 'queued')
+        self.book('Идея', 'proposed')
+        first_pub = self.store.publication(f'book:{first["id"]}')
+        legacy = legacy_plan_pages(self.store, 1)
+        self.assertEqual(legacy, ['## План чтения\n### Очередь чтения\nЧитаем по порядку сверху вниз.\n'
+            f'**1.** [Очередь · Автор](https://discord.com/channels/1/{first_pub["channel_id"]}/{first_pub["message_id"]})'
+            '\n\n### Предложения · ещё не в очереди\n'
+            + next(line.replace('Предложено · ', '• ') for line in plan_entries(self.store, 1).values() if line.startswith('Предложено'))])
+        for index in range(25):
+            self.book(f'Длинная очередь {index:02} ' + 'Название ' * 12, 'queued')
+        legacy = legacy_plan_pages(self.store, 1)
+        self.assertGreater(len(legacy), 1)
+        self.assertTrue(legacy[0].startswith(f'## План чтения · 1/{len(legacy)}\n'))
+        self.assertEqual(len(town_sections(self.store, 1)['plan']), 1)
 
     def test_plan_omits_meetings_and_syncs_while_current_book_card_retains_them(self):
         book = self.book('План встреч', 'reading')

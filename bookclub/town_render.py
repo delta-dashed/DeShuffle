@@ -43,7 +43,7 @@ def _current_lines(store, current):
             lines.append('Карточка книги ещё готовится.')
         lines.append(f'Опубликовано эссе: **{len(store.essays(book["id"]))}**.')
         lines.append('Откройте карточку книги, чтобы добавить своё эссе или управлять книгой. '
-                     'Порядок чтения и ближайшие встречи — в теме «План чтения».')
+                     'Расписание — в карточке книги, очередь — в теме «План чтения».')
     return lines
 
 
@@ -64,19 +64,44 @@ def _plan_lines(store, current, queued, proposed):
 
 
 def town_sections(store, guild_id):
-    """Return current/plan pages and a short archive introduction."""
+    """Return the current card and short introductions for the book lists."""
     books = store.books(guild_id)
     current = [book for book in books if book['status'] == 'reading']
     queued = [book for book in books if book['status'] == 'queued']
-    proposed = [book for book in books if book['status'] == 'proposed']
     archived_lines = ['Прочитанные книги, их материалы и эссе участников.']
+    plan_lines = ['Читаем по порядку сверху вниз.']
+    if current:
+        url = book_url(store, current[0])
+        plan_lines.append(f'[Встречи и синки — в карточке текущей книги]({url})' if url
+                          else 'Встречи и синки — в карточке текущей книги.')
+    if not queued:
+        plan_lines.append('Очередь пока пуста.')
     if not any(book['status'] == 'read' for book in books):
         archived_lines.append('Прочитанных книг пока нет.')
     return {
         'current': _section_pages('current', _current_lines(store, current)),
-        'plan': _section_pages('plan', _plan_lines(store, current, queued, proposed)),
+        'plan': _section_pages('plan', plan_lines),
         'archive': _section_pages('archive', archived_lines),
     }
+
+
+def plan_entries(store, guild_id):
+    """Ordered plain messages; slot numbers preserve the displayed queue order."""
+    books = store.books(guild_id)
+    queued = [book for book in books if book['status'] == 'queued']
+    proposed = [book for book in books if book['status'] == 'proposed']
+    lines = [f'{index}. {_book_link(store, book)}' for index, book in enumerate(queued, 1)]
+    lines.extend(f'Предложено · {_book_link(store, book)}' for book in proposed)
+    return dict(enumerate(lines, 1))
+
+
+def legacy_plan_pages(store, guild_id):
+    """Reproduce the former paginated plan for conservative page migration."""
+    books = store.books(guild_id)
+    current = [book for book in books if book['status'] == 'reading']
+    queued = [book for book in books if book['status'] == 'queued']
+    proposed = [book for book in books if book['status'] == 'proposed']
+    return _section_pages('plan', _plan_lines(store, current, queued, proposed))
 
 
 def archive_entries(store, guild_id):
