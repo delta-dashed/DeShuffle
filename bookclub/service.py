@@ -44,6 +44,8 @@ class Service:
         self.delivery = DeliveryJournal(self)
         self.last_essay_scan = {}
         self.missing_format_pin = set()
+        self.topic_cleanup_checked = set()
+        self.topic_cleanup_retry_after = {}
         self.town_cache = {}
         self.town_pin_checked = set()
         self.town_pin_warning = {}
@@ -652,6 +654,8 @@ class Service:
         settings = self.store.settings(guild.id)
         if not settings['published']:
             return
+        from .provision import Provisioner
+        await Provisioner(self).cleanup_topics(guild)
         await self.book_updates.drain(guild)
         for b in self.store.books(guild.id, include_deleted=True):
             await self.book_updates.drain(guild)
