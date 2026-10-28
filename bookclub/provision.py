@@ -1,7 +1,8 @@
-"""Explicit, restartable server setup. Never runs from the background worker."""
+"""Explicit setup and narrow cleanup of descriptions for already bound channels."""
 from __future__ import annotations
 
 import logging
+import time
 
 import discord
 
@@ -54,6 +55,74 @@ class Provisioner:
     @staticmethod
     def marker(resource):
         return f'bookclub:{resource["guild_id"]}:{resource["purpose"]}:{resource["token"]}'
+
+    @staticmethod
+    def clean_description(topic, resource):
+        """Remove only our exact marker line, preserving custom text/spacing."""
+        marker = Provisioner.marker(resource)
+        lines = topic.splitlines(keepends=True)
+        if not any(line.rstrip('\r\n') == marker for line in lines):
+            return topic
+        kept = [line for line in lines if line.rstrip('\r\n') != marker]
+        if lines[-1].rstrip('\r\n') == marker and kept:
+            # The separator before a final service line belongs to that line.
+            if kept[-1].endswith('\r\n'):
+                kept[-1] = kept[-1][:-2]
+            elif kept[-1].endswith(('\n', '\r')):
+                kept[-1] = kept[-1][:-1]
+        cleaned = ''.join(kept)
+        purpose = resource['purpose']
+        if purpose in OLD_DESCRIPTIONS and cleaned == OLD_DESCRIPTIONS[purpose]:
+            cleaned = DESCRIPTIONS[purpose]
+        return cleaned
+
+    async def clean_topic(self, guild, channel, purpose, resource, *, fresh=False):
+        """Identity is durable before the recovery marker becomes dispensable."""
+        if (purpose not in DESCRIPTIONS or not resource or not resource['managed']
+                or resource['guild_id'] != guild.id or resource['purpose'] != purpose
+                or resource['channel_id'] != channel.id):
+            return channel
+        if not fresh:
+            channel = await self.service.bot.fetch_channel(channel.id)
+        if (not isinstance(channel, SLOTS[purpose][1])
+                or getattr(channel, 'guild', None) is None or channel.guild.id != guild.id):
+            raise ClubError('Канал для очистки описания не соответствует сохранённой привязке.')
+        topic = channel.topic
+        if not isinstance(topic, str):
+            return channel
+        cleaned = self.clean_description(topic, resource)
+        if cleaned != topic:
+            channel = await channel.edit(topic=cleaned or None, reason='Удаление служебной метки из описания канала')
+        return channel
+
+    async def cleanup_topics(self, guild):
+        """One bounded pass after startup; no provisioning, renames or ACL writes."""
+        if self.service.guild_ids is not None and guild.id not in self.service.guild_ids:
+            return
+        settings = self.store.settings(guild.id)
+        if not settings['published']:
+            return
+        for resource in self.store.setup_resources(guild.id):
+            purpose = resource['purpose']
+            if (purpose not in DESCRIPTIONS or not resource['managed'] or resource['state'] != 'ready'
+                    or not resource['channel_id'] or settings.get(purpose) != resource['channel_id']):
+                continue
+            key = (guild.id, purpose, resource['channel_id'], resource['token'])
+            if key in self.service.topic_cleanup_checked:
+                continue
+            if self.service.topic_cleanup_retry_after.get(key, 0) > time.monotonic():
+                continue
+            try:
+                # Fresh REST data avoids overwriting a description edited since the gateway cache update.
+                channel = await self.service.bot.fetch_channel(resource['channel_id'])
+                await self.clean_topic(guild, channel, purpose, resource, fresh=True)
+            except (discord.HTTPException, ClubError, OSError) as exc:
+                log.warning('Channel topic cleanup deferred guild=%s channel=%s (%s)',
+                            guild.id, resource['channel_id'], type(exc).__name__)
+                self.service.topic_cleanup_retry_after[key] = time.monotonic() + 300
+            else:
+                self.service.topic_cleanup_checked.add(key)
+                self.service.topic_cleanup_retry_after.pop(key, None)
 
     async def check_publications(self, guild, *, repair=False):
         result = []
@@ -285,6 +354,19 @@ class Provisioner:
                     elif not resource or resource['channel_id'] != channel.id:
                         self.store.bind_setup_resource(guild.id, purpose, channel.id, managed=False, state='created')
                         resource = self.store.setup_resource(guild.id, purpose)
+                    # The saved ID now handles retries even if cleaning/renaming succeeds
+                    # but its Discord response is lost. Unbound creations retain recovery metadata.
+                    try:
+                        channel = await self.clean_topic(guild, channel, purpose, resource)
+                    except (discord.HTTPException, ClubError, OSError) as exc:
+                        if resource['state'] != 'ready':
+                            raise
+                        # Existing clubs remain operable if this cosmetic edit is
+                        # forbidden; requested permission repairs below must still run.
+                        report.append(f'<#{channel.id}>: очистка описания отложена; '
+                                      'проверьте доступ бота и право Manage Channels.')
+                        log.warning('Setup topic cleanup deferred guild=%s channel=%s (%s)',
+                                    guild.id, channel.id, type(exc).__name__)
                     if resource['managed'] and resource['state'] != 'ready' and channel.name == self.temporary_name(resource):
                         channel = await channel.edit(name=resource.get('name') or SLOTS[purpose][0], reason=REASON)
                     self.store.remember_setup_name(guild.id, purpose, channel.name)
@@ -307,10 +389,6 @@ class Provisioner:
                         resolved[purpose] = channel.id
                     if purpose in ('books', 'essays'):
                         report.extend(await self.service.forum_tags.ensure(guild, channel, purpose))
-                    if purpose in OLD_DESCRIPTIONS and resource['managed']:
-                        old_topic = OLD_DESCRIPTIONS[purpose] + '\n' + self.marker(resource)
-                        if channel.topic == old_topic:
-                            await channel.edit(topic=DESCRIPTIONS[purpose] + '\n' + self.marker(resource), reason=REASON)
 
                 # Keep the initiating administrator able to operate the new club; existing organizers remain unchanged.
                 self.store.configure(guild.id, {**settings, **resolved})
