@@ -47,7 +47,7 @@ class ForumIntegrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
     async def test_required_book_forum_creates_tagged_catalog_and_keeps_status_current(self):
         await self.service.refresh(self.h.guild)
         forum = self.h.channels[13]
-        self.assertEqual(forum.create_thread.await_count, 2)
+        self.assertEqual(forum.create_thread.await_count, 4)  # Book, current pin, plan, archive.
         sent = [call.kwargs['applied_tags'] for call in forum.create_thread.await_args_list]
         self.assertIn([self.labels['catalog']], sent)
         self.assertIn([self.labels['proposed']], sent)
@@ -59,7 +59,7 @@ class ForumIntegrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
                 self.store.update_book(1, self.book['id'], status=status)
                 await self.service.refresh(self.h.guild)
                 self.assertEqual(self.ids(book_thread), {self.labels[status].id})
-        self.assertEqual(forum.create_thread.await_count, 2)
+        self.assertEqual(forum.create_thread.await_count, 4)
 
     async def test_book_status_transition_preserves_foreign_tag_and_manual_tag_rename(self):
         await self.service.refresh(self.h.guild)

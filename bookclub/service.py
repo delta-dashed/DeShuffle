@@ -19,7 +19,7 @@ from .forum_tags import ForumTags
 from .publication_delivery import DeliveryJournal
 from .single_delivery import channel_send_once, create_thread_once, webhook_send_once, create_event_once
 from .event_delivery import event_description, find_draft_events
-from .render import book_pages, catalog_pages, news_content, meeting_lines, pages, safe, book_url
+from .render import book_pages, news_content, meeting_lines, pages, safe, book_url
 from .club_format import format_content, get_format
 from .book_refresh import BookRefreshQueue
 
@@ -36,6 +36,7 @@ class Service:
         self.view_factory = None
         self.book_view_factory = None
         self.catalog_view_factory = None
+        self.town_menu_factory = None
         self.format_view_factory = None
         self.removed_book_view_factory = None
         self.deleted_books_handler = None
@@ -43,6 +44,9 @@ class Service:
         self.delivery = DeliveryJournal(self)
         self.last_essay_scan = {}
         self.missing_format_pin = set()
+        self.town_cache = {}
+        self.town_pin_checked = set()
+        self.town_pin_warning = {}
         self.book_updates = BookRefreshQueue(self)
 
     def request_book_refresh(self, guild, book_id):
@@ -219,6 +223,9 @@ class Service:
         result.extend(f'Событие не подтверждено: {safe(m["name"])}. /club recover_event.' for m in drafts)
         failures = self.store.rows("SELECT kind,state,detail FROM bc_jobs WHERE guild_id=? AND state IN ('failed','unknown') ORDER BY due DESC LIMIT 10", (guild.id,))
         result.extend(f'Напоминание {j["kind"]}: {j["state"]} · {j["detail"]}' for j in failures)
+        if guild.id in self.town_pin_warning:
+            result.append('Карточка текущей книги опубликована без закрепления. Проверьте Manage Threads и текущее закрепление форума: '
+                          'Discord допускает только одну закреплённую тему. Чужое закрепление бот не заменяет.')
         for binding in self.store.rows('SELECT * FROM bc_webhooks WHERE guild_id=?', (guild.id,)):
             if binding['webhook_id'] is None:
                 result.append('Создание вебхука эссе не подтверждено. Проверьте интеграции форума, затем /club repair.')
@@ -505,10 +512,14 @@ class Service:
             if links:
                 first += '\n\n' + ' · '.join(links)
             root = await self.upsert(guild, key, forum_id, first, forum_name=name, view=view, known_message=known_root)
-            for old in self.store.rows('SELECT * FROM bc_publications WHERE key LIKE ?', (key + ':page:%',)):
-                if int(old['key'].rsplit(':', 1)[1]) > len(sections):
-                    await self.upsert(guild, old['key'], root['channel_id'],
-                        'Каталог обновлён. Текущая книга и очередь — в начале темы.', view=navigation(0, []))
+            if key.startswith('catalog:'):
+                from .town_cleanup import cleanup_town_pages
+                await cleanup_town_pages(self, guild, key, len(sections))
+            else:
+                for old in self.store.rows('SELECT * FROM bc_publications WHERE key LIKE ?', (key + ':page:%',)):
+                    if int(old['key'].rsplit(':', 1)[1]) > len(sections):
+                        await self.upsert(guild, old['key'], root['channel_id'],
+                            'Раздел обновлён. Актуальные материалы и переходы — в начале темы.', view=navigation(0, []))
             return root
 
         if len(contents) > 1:
@@ -619,26 +630,9 @@ class Service:
         self.book_updates.failures.pop((guild.id, book_id), None)
         return root
 
-    async def refresh_catalog(self, guild):
-        settings = self.store.settings(guild.id)
-        if not settings['published']:
-            return
-        catalog_view = self.catalog_view_factory(guild.id) if self.catalog_view_factory else None
-        catalog = await self.paged_post(guild, f'catalog:{guild.id}', settings['books'], 'Каталог книжного клуба',
-                                        catalog_pages(self.store, guild.id), view=catalog_view, inline_first=True)
-        thread = await self.channel(guild, catalog['channel_id'], discord.Thread)
-        await self.forum_tags.sync_thread_tags(guild, thread, ['catalog'])
-        if not thread.flags.pinned:
-            # Never replace somebody else's forum pin implicitly.
-            threads = await guild.active_threads()
-            forum = await self.channel(guild, settings['books'], discord.ForumChannel)
-            threads.extend([t async for t in forum.archived_threads(limit=None)])
-            other_pin = any(t.parent_id == settings['books'] and t.id != thread.id and t.flags.pinned for t in threads)
-            if other_pin:
-                raise ClubError('В форуме уже закреплён другой пост. Организатор должен освободить закрепление каталога.')
-            await thread.edit(pinned=True)
-        self.book_updates.failures.pop((guild.id, 'catalog'), None)
-        return catalog
+    async def refresh_catalog(self, guild, *, verify=False):
+        from .town_projection import refresh_town
+        return await refresh_town(self, guild, verify=verify)
 
     async def refresh(self, guild):
         settings = self.store.settings(guild.id)
@@ -659,7 +653,7 @@ class Service:
                 view = self.view_factory(m) if self.view_factory else None
                 await self.upsert(guild, f'meeting:{m["id"]}', root['channel_id'], '\n'.join(meeting_lines(self.store, m, settings)), view=view)
         await self.book_updates.drain(guild)
-        await self.refresh_catalog(guild)
+        await self.refresh_catalog(guild, verify=True)
         await self.upsert(guild, f'news:{guild.id}', settings['news'], news_content(self.store, guild.id, settings))
         await self.upsert(guild, f'chat:{guild.id}', settings['chat'],
                           '**Площадь клуба**\nМесто для флуда, свободного общения и разговоров о книгах и обо всём остальном.\n'

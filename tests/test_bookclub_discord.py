@@ -208,7 +208,7 @@ class DiscordIntegrationTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.store.set_published(1)
         await self.service.refresh(self.h.guild)
         await self.service.refresh(self.h.guild)
-        self.assertEqual(self.h.channels[13].create_thread.await_count, 2)
+        self.assertEqual(self.h.channels[13].create_thread.await_count, 4)  # Book, current pin, plan, archive.
         self.assertEqual(self.h.channels[11].send.await_count, 2)
         root = self.store.publication(f'book:{self.book["id"]}')
         self.assertEqual(self.h.channels[root['channel_id']].send.await_count, 1)
