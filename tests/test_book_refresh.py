@@ -309,7 +309,8 @@ class BookRefreshTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         message.attachments = [SimpleNamespace(id=8900, filename='book.epub', size=456)]
         attachments = list(message.attachments)
         archive = self.archive_state()
-        ids = {row['key']: row['message_id'] for row in self.store.rows('SELECT * FROM bc_publications')}
+        ids = {row['key']: row['message_id'] for row in self.store.rows('SELECT * FROM bc_publications')
+               if ':plan:row:' not in row['key']}
         tags = list(message.channel.applied_tags)
         interaction = self.interaction()
         confirmation = RemoveBookConfirmation(self.cog, self.current(), 99)
@@ -341,7 +342,10 @@ class BookRefreshTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(message.edit.await_args.kwargs['view'], BookView)
         self.assertEqual(message.attachments, attachments)
         self.assertEqual(self.archive_state(), archive)
-        self.assertEqual({row['key']: row['message_id'] for row in self.store.rows('SELECT * FROM bc_publications')}, ids)
+        # Removing the sole queue/proposal row and restoring the book creates
+        # a fresh list row. Source cards, essays and permanent topic IDs stay.
+        self.assertEqual({row['key']: row['message_id'] for row in self.store.rows('SELECT * FROM bc_publications')
+                          if ':plan:row:' not in row['key']}, ids)
         self.assertIn(message.channel.jump_url, catalog_text())
         self.h.events[self.meeting['event_id']].cancel.assert_not_awaited()
 

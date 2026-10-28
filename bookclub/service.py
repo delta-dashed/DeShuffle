@@ -451,7 +451,8 @@ class Service:
                 'imported' if key.startswith('essay-import:') else 'draft')
         return self.forum_tags.creation_tags(guild.id, forum, kind)
 
-    async def paged_post(self, guild, key, forum_id, name, contents, *, view=None, inline_first=False):
+    async def paged_post(self, guild, key, forum_id, name, contents, *, view=None, inline_first=False,
+                         cleanup_obsolete=True):
         # One forum post; pages are ordinary bot replies inside it. Only catalog is pinned.
         async def write(*args, **kwargs):
             if key.startswith('catalog:') and key.endswith(':plan'):
@@ -525,10 +526,10 @@ class Service:
             if links:
                 first += '\n\n' + ' · '.join(links)
             root = await write(guild, key, forum_id, first, forum_name=name, view=view, known_message=known_root)
-            if key.startswith('catalog:'):
+            if key.startswith('catalog:') and cleanup_obsolete:
                 from .town_cleanup import cleanup_town_pages
                 await cleanup_town_pages(self, guild, key, len(sections))
-            else:
+            elif not key.startswith('catalog:'):
                 for old in self.store.rows('SELECT * FROM bc_publications WHERE key LIKE ?', (key + ':page:%',)):
                     if int(old['key'].rsplit(':', 1)[1]) > len(sections):
                         await write(guild, old['key'], root['channel_id'],

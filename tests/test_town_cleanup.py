@@ -180,7 +180,9 @@ class TownCleanupTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         plan = await self.service.paged_post(self.h.guild, 'catalog:1:plan', 13,
             'План чтения', town_sections(self.store, 1)['plan'], inline_first=True)
         plan_thread = self.h.channels[plan['channel_id']]
-        active_pages = self.store.rows("SELECT * FROM bc_publications WHERE key LIKE 'catalog:1:plan:page:%'")
+        from bookclub.plan_entries import publish_plan
+        await publish_plan(self.service, self.h.guild, plan, verify=True)
+        active_pages = self.store.rows("SELECT * FROM bc_publications WHERE key LIKE 'catalog:1:plan:row:%'")
         self.assertTrue(active_pages)
 
         with self.assertLogs('bookclub.town_cleanup', level='WARNING'):
