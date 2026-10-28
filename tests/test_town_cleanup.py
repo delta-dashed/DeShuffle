@@ -207,3 +207,56 @@ class TownCleanupTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
         await self.service.refresh_catalog(self.h.guild)
         self.assertEqual({channel.id: channel.send.await_count for channel in self.h.channels.values()}, sends)
         self.assertEqual(self.h.channels[13].create_thread.await_count, created)
+
+    async def test_shortened_plan_removes_only_verified_old_page_with_obsolete_sync_date(self):
+        key = 'catalog:1:plan'
+        old_page = '## План чтения · 2/2\n[Прошлый синк](https://discord.com/events/1/999) · старая дата'
+        root = await self.service.paged_post(self.h.guild, key, 13, 'План чтения',
+            ['## План чтения · 1/2\nСтарая очередь', old_page], inline_first=True)
+        self.assertTrue(self.h.channels[13].create_thread.await_args.kwargs['suppress_embeds'])
+        pub = self.store.publication(key + ':page:1')
+        thread = self.h.channels[root['channel_id']]
+        old = thread.messages[pub['message_id']]
+        old.edit.reset_mock()
+        self.assertEqual(self.service.delivery.intent(pub['key'])['content'], old_page)
+        updated = await self.service.paged_post(self.h.guild, key, 13, 'План чтения',
+            ['## План чтения\nОчередь книг без расписания'], inline_first=True)
+        self.assertEqual(updated['message_id'], root['message_id'])
+        self.assertTrue(thread.messages[root['message_id']].edit.await_args.kwargs['suppress'])
+        self.assertIsNone(self.store.publication(pub['key']))
+        self.assertNotIn(old.id, thread.messages)
+        old.delete.assert_awaited_once()
+        old.edit.assert_not_awaited()
+        sends = thread.send.await_count
+        await self.service.paged_post(self.h.guild, key, 13, 'План чтения',
+            ['## План чтения\nОчередь книг без расписания'], inline_first=True)
+        self.assertEqual(thread.send.await_count, sends)
+        self.assertNotIn('https://discord.com/events/', '\n'.join(m.content for m in thread.messages.values()))
+
+    async def test_shortened_plan_preserves_manual_text_files_and_active_pages(self):
+        key = 'catalog:1:plan'
+        contents = ['## План чтения · 1/4\nОчередь', '## План чтения · 2/4\nАктивная очередь',
+                    '## План чтения · 3/4\nПрежнее расписание', '## План чтения · 4/4\nМатериалы']
+        root = await self.service.paged_post(self.h.guild, key, 13, 'План чтения', contents, inline_first=True)
+        thread = self.h.channels[root['channel_id']]
+        active_pub = self.store.publication(key + ':page:1')
+        manual_pub = self.store.publication(key + ':page:2')
+        attached_pub = self.store.publication(key + ':page:3')
+        active = thread.messages[active_pub['message_id']]
+        manual = thread.messages[manual_pub['message_id']]
+        attached = thread.messages[attached_pub['message_id']]
+        manual.content = 'Ручные заметки организатора'
+        attached.attachments = [SimpleNamespace(id=4567, filename='schedule.pdf')]
+        manual.edit.reset_mock()
+        attached.edit.reset_mock()
+        with self.assertLogs('bookclub.town_cleanup', level='WARNING'):
+            await self.service.paged_post(self.h.guild, key, 13, 'План чтения',
+                ['## План чтения · 1/2\nОчередь', '## План чтения · 2/2\nСледующие книги'], inline_first=True)
+        self.assertIn('Следующие книги', active.content)
+        self.assertEqual(manual.content, 'Ручные заметки организатора')
+        self.assertEqual(attached.attachments[0].filename, 'schedule.pdf')
+        for message in (active, manual, attached):
+            message.delete.assert_not_awaited()
+            self.assertIn(message.id, thread.messages)
+        manual.edit.assert_not_awaited()
+        attached.edit.assert_not_awaited()

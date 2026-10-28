@@ -244,6 +244,7 @@ class TownProjectionTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
 
         current.fetch_message.side_effect = delete_during_current_fetch
         self.store.update_book(1, self.book['id'], title='Новое название текущей книги')
+        self.store.create_book(1, 'Новое предложение для изменения плана', 'Автор', '', 'change-plan')
         await self.service.refresh_catalog(self.h.guild)
 
         after = self.ids()

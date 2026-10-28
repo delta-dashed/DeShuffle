@@ -183,6 +183,15 @@ async def refresh_town(service, guild, *, verify=False):
         content = town_sections(store, guild.id)[purpose]
         sections[purpose] = await _publish(service, guild, f'{key}:{purpose}', forum_id, title, content,
             _view(service, guild.id, [('Текущая книга', old_guide_url)], actions=purpose == 'plan'), verify=verify)
+        if purpose == 'archive':
+            from .archive_entries import publish_archive
+            try:
+                await publish_archive(service, guild, sections[purpose], verify=verify)
+            except discord.NotFound:
+                sections[purpose] = await _publish(service, guild, f'{key}:{purpose}', forum_id, title,
+                    town_sections(store, guild.id)[purpose],
+                    _view(service, guild.id, [('Текущая книга', old_guide_url)]), verify=True)
+                await publish_archive(service, guild, sections[purpose], verify=True)
         await service.book_updates.drain(guild)
     urls = {purpose: _url(guild.id, pub) for purpose, pub in sections.items()}
     guide = await _publish(service, guild, key, forum_id, pinned_title(store, guild.id), town_guide(store, guild.id, urls),
@@ -195,6 +204,8 @@ async def refresh_town(service, guild, *, verify=False):
         for purpose, title in TOPICS:
             sections[purpose] = await _publish(service, guild, f'{key}:{purpose}', forum_id, title, town_sections(store, guild.id)[purpose],
                 _view(service, guild.id, [('Текущая книга', guide_url)], actions=purpose == 'plan'), verify=False)
+            if purpose == 'archive':
+                await publish_archive(service, guild, sections[purpose], verify=False)
         repaired_urls = {purpose: _url(guild.id, pub) for purpose, pub in sections.items()}
         if repaired_urls != urls:
             guide = await _publish(service, guild, key, forum_id, pinned_title(store, guild.id),

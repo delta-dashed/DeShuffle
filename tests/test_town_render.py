@@ -4,7 +4,8 @@ import tempfile
 import unittest
 
 from bookclub.store import Store
-from bookclub.town_render import pinned_title, town_guide, town_sections
+from bookclub.render import book_pages
+from bookclub.town_render import archive_entries, legacy_archive_pages, pinned_title, town_guide, town_sections
 
 
 class TownRenderTests(unittest.TestCase):
@@ -44,6 +45,7 @@ class TownRenderTests(unittest.TestCase):
         self.assertIn('Текущая книга ещё не выбрана', result['current'][0])
         self.assertIn('Очередь пока пуста', result['plan'][0])
         self.assertIn('Прочитанных книг пока нет', result['archive'][0])
+        self.assertEqual(archive_entries(self.store, 1), {})
 
     def test_statuses_deleted_and_foreign_books_are_separated(self):
         self.book('Текущее чтение', 'reading')
@@ -56,15 +58,19 @@ class TownRenderTests(unittest.TestCase):
         self.store.create_book(2, 'Чужой сервер', 'Другой автор', '', 'foreign')
         result = self.text()
         self.assertIn('Текущее чтение', result['current'])
-        self.assertIn('Текущее чтение', result['plan'])
+        self.assertNotIn('Текущее чтение', result['plan'])
         self.assertNotIn('Текущее чтение', result['archive'])
         for title in ('Очередная книга', 'Книга предложение'):
             self.assertIn(title, result['plan'])
             self.assertNotIn(title, result['current'] + result['archive'])
-        self.assertIn('Завершённая книга', result['archive'])
+        archived = '\n'.join(archive_entries(self.store, 1).values())
+        self.assertIn('Завершённая книга', archived)
+        self.assertNotIn('Завершённая книга', result['archive'])
         self.assertNotIn('Завершённая книга', result['current'] + result['plan'])
-        self.assertNotIn('Удалённый архив', str(result))
-        self.assertNotIn('Чужой сервер', str(result))
+        self.assertNotIn('Удалённый архив', str(result) + archived)
+        self.assertNotIn('Чужой сервер', str(result) + archived)
+        for title in ('Текущее чтение', 'Очередная книга', 'Книга предложение'):
+            self.assertNotIn(title, archived)
 
     def test_current_links_to_persistent_card_without_copying_materials(self):
         book = self.book('Текущая', 'reading', materials='https://example.org/a.pdf', reading_meetings=4)
@@ -78,8 +84,9 @@ class TownRenderTests(unittest.TestCase):
         self.assertNotIn('https://example.org/a.pdf', result['current'])
         self.assertNotIn('Эссе до:', result['current'])
         self.assertNotIn('18.05.2033', result['current'])
-        self.assertIn('4 встречи по книге + обсуждение эссе', result['plan'])
-        self.assertIn('Предстоящие встречи по книге ещё не назначены', result['plan'])
+        self.assertNotIn('4 встречи по книге + обсуждение эссе', result['plan'])
+        self.assertIn(f'[Встречи и синки — в карточке текущей книги]({url})', result['plan'])
+        self.assertIn('4 встречи по книге + обсуждение эссе', '\n'.join(town_guide(self.store, 1, {})))
         self.store.update_book(1, book['id'], title='Новое название')
         self.assertIn(url, self.text()['current'])
         self.assertIn('Новое название', self.text()['current'])
@@ -89,7 +96,7 @@ class TownRenderTests(unittest.TestCase):
         self.store.update_book(1, book['id'], status='read')
         result = self.text()
         self.assertNotIn('Переход статуса', result['current'] + result['plan'])
-        self.assertIn('Переход статуса', result['archive'])
+        self.assertIn('Переход статуса', archive_entries(self.store, 1)[book['id']])
 
     def test_queue_uses_saved_positions_and_proposals_stay_separate(self):
         self.book('Вторая очередь', 'queued', position=20)
@@ -121,7 +128,7 @@ class TownRenderTests(unittest.TestCase):
                     self.assertTrue(line.endswith(')'))
         self.assertIn('**40.**', text)
 
-    def test_only_public_upcoming_meetings_and_actual_schedule_are_shown(self):
+    def test_plan_omits_meetings_and_syncs_while_current_book_card_retains_them(self):
         book = self.book('План встреч', 'reading')
         first = self.meeting(book, 'Публичная встреча', event_id=401)
         self.meeting(book, 'Текущий разбор', status='active', kind='essay', event_id=402)
@@ -138,15 +145,20 @@ class TownRenderTests(unittest.TestCase):
                            (event_id, name, 2_000_086_400, status))
         result = self.text()
         text = result['plan']
-        self.assertIn('https://discord.com/events/1/401', text)
-        self.assertIn('Часть вторая · до главы 7 включительно', text)
-        self.assertIn('идёт сейчас', text)
-        self.assertIn('Обсуждаем эссе по книге', text)
-        self.assertIn('Синк из расписания', text)
-        self.assertIn('18.05.2033 06:33 (Europe/Moscow)', text)
-        for omitted in ('Отменённая встреча', 'Прошедшая встреча', 'Черновая встреча',
-                        'СЕКРЕТНЫЕ ВОПРОСЫ', 'ПРИВАТНЫЕ ЗАМЕТКИ', 'Дубликат события', 'Отменённый синк'):
+        for omitted in ('Публичная встреча', 'Текущий разбор', 'Часть вторая', 'до главы 7',
+                        'Синк из расписания', 'Ближайшие синки', 'https://discord.com/events/',
+                        '18.05.2033', 'План текущей книги', 'Отменённая встреча',
+                        'Прошедшая встреча', 'Черновая встреча', 'СЕКРЕТНЫЕ ВОПРОСЫ',
+                        'ПРИВАТНЫЕ ЗАМЕТКИ', 'Дубликат события', 'Отменённый синк'):
             self.assertNotIn(omitted, str(result))
+        self.assertIn('Встречи и синки — в карточке текущей книги', text)
+        card = '\n'.join(book_pages(self.store, book, self.store.settings(1)))
+        self.assertIn('https://discord.com/events/1/401', card)
+        self.assertIn('Публичная встреча', card)
+        self.assertIn('Синк из расписания', card)
+        self.assertIn('18.05.2033 06:33 (Europe/Moscow)', card)
+        self.assertNotIn('СЕКРЕТНЫЕ ВОПРОСЫ', card)
+        self.assertNotIn('ПРИВАТНЫЕ ЗАМЕТКИ', card)
         pinned = '\n'.join(town_guide(self.store, 1, {}))
         self.assertNotIn('СЕКРЕТНЫЕ ВОПРОСЫ', pinned)
         self.assertNotIn('ПРИВАТНЫЕ ЗАМЕТКИ', pinned)
@@ -157,7 +169,76 @@ class TownRenderTests(unittest.TestCase):
         self.store.register_essay(1, book['id'], 502, 502, 52, 'Черновик', 'https://example.org/two', submitted=False)
         self.store.register_essay(1, book['id'], 503, 503, 53, 'Удалено', 'https://example.org/three')
         self.store.delete_essay(1, source_id=503)
-        self.assertIn('эссе: 1', self.text()['archive'])
+        self.assertIn('эссе: 1', archive_entries(self.store, 1)[book['id']])
+
+    def test_archive_is_one_short_introduction_and_one_complete_message_per_book(self):
+        books = []
+        for index in range(45):
+            books.append(self.book(f'Прочитанная {index:02} ' + 'Длинное название ' * 7,
+                                   'read', author='Имя автора ' * 12, position=100 - index))
+        ordered = [book['id'] for book in self.store.books(1) if book['status'] == 'read']
+        before = self.store.books(1)
+        intro = town_sections(self.store, 1)['archive']
+        self.assertEqual(len(intro), 1)
+        self.assertEqual(intro[0], '## Архив прочитанного\nПрочитанные книги, их материалы и эссе участников.')
+        entries = archive_entries(self.store, 1)
+        self.assertEqual(list(entries), ordered)
+        self.assertEqual(len(entries), 45)
+        for book in books:
+            message = entries[book['id']]
+            publication = self.store.publication(f'book:{book["id"]}')
+            self.assertIn(' '.join(book['title'].split()), message)
+            self.assertIn(' '.join(book['author'].split()), message)
+            self.assertIn(f'/{publication["channel_id"]}/{publication["message_id"]}', message)
+            self.assertTrue(message.startswith('• ['))
+            self.assertTrue(message.endswith('· эссе: 0'))
+            self.assertNotIn('\n', message)
+            self.assertNotIn('## ', message)
+            self.assertLessEqual(len(message), 2000)
+        self.assertEqual(before, self.store.books(1))
+
+    def test_archive_entry_follows_metadata_essay_count_and_status_without_changing_key(self):
+        book = self.book('Начальное название', 'read')
+        original = archive_entries(self.store, 1)
+        self.store.update_book(1, book['id'], title='Новое название', author='Другой автор')
+        self.store.register_essay(1, book['id'], 501, 501, 51, 'Работа', 'https://example.org/one')
+        updated = archive_entries(self.store, 1)
+        self.assertEqual(list(updated), list(original))
+        self.assertIn('Новое название · Другой автор', updated[book['id']])
+        self.assertIn('эссе: 1', updated[book['id']])
+        self.assertNotIn('Начальное название', updated[book['id']])
+        self.store.update_book(1, book['id'], status='queued')
+        self.assertEqual(archive_entries(self.store, 1), {})
+        self.assertIn('Прочитанных книг пока нет.', town_sections(self.store, 1)['archive'][0])
+
+    def test_archive_entry_labels_are_single_line_safe_and_missing_cards_have_no_fake_url(self):
+        book = self.book('@everyone\n[Сюрприз]', 'read', author='@here\nАвтор')
+        entry = archive_entries(self.store, 1)[book['id']]
+        self.assertNotIn('@everyone', entry)
+        self.assertNotIn('@here', entry)
+        self.assertNotIn('\n', entry)
+        self.assertIn('［Сюрприз］', entry)
+        self.store.forget_publication(f'book:{book["id"]}')
+        entry = archive_entries(self.store, 1)[book['id']]
+        self.assertNotIn('](None)', entry)
+        self.assertNotIn('https://', entry)
+        self.assertIn('эссе: 0', entry)
+
+    def test_legacy_archive_pages_reproduce_old_renderer_for_safe_migration(self):
+        book = self.book('Прочитанная', 'read')
+        publication = self.store.publication(f'book:{book["id"]}')
+        url = f'https://discord.com/channels/1/{publication["channel_id"]}/{publication["message_id"]}'
+        self.assertEqual(legacy_archive_pages(self.store, 1),
+                         ['## Архив прочитанного\nПрочитанные книги, их материалы и эссе участников.\n'
+                          f'• [Прочитанная · Автор]({url}) · эссе: 0'])
+        for index in range(25):
+            self.book(f'Архив {index:02} ' + 'Название ' * 12, 'read')
+        legacy = legacy_archive_pages(self.store, 1)
+        self.assertGreater(len(legacy), 1)
+        self.assertTrue(legacy[0].startswith(f'## Архив прочитанного · 1/{len(legacy)}\n'))
+        for entry in archive_entries(self.store, 1).values():
+            self.assertIn(entry, '\n'.join(legacy))
+        self.assertEqual(len(town_sections(self.store, 1)['archive']), 1)
 
     def test_pin_shows_current_reading_without_repeating_button_navigation_or_queue(self):
         book = self.book('Текущая книга', 'reading')

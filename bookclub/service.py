@@ -350,11 +350,13 @@ class Service:
         return next(iter(matches.values()), None)
 
     async def upsert(self, guild, key, channel_id, content, *, forum_name=None, view=None, files=None,
-                     known_message=None):
+                     known_message=None, suppress_embeds=False):
         if len(content) > 2000:
             raise ClubError('Карточка слишком длинная; требуется разбивка на страницы.')
         managed_name = forum_name[:100] if forum_name and key.startswith(('book:', 'catalog:')) else None
         signature = 'clean-delivery-v1\n' + content + repr([(c.to_component_dict(), c.row) for c in view.children] if view else []) + repr(managed_name)
+        if suppress_embeds:
+            signature += '\nsuppress-embeds'
         digest = hashlib.sha256(signature.encode()).hexdigest()
         pub = self.store.publication(key)
         channel = None
@@ -404,13 +406,16 @@ class Service:
                 channel, message = found
             elif forum_name:
                 created = await create_thread_once(channel, name=forum_name[:100], content=content, view=view or discord.utils.MISSING,
-                                                      applied_tags=tags, allowed_mentions=NO_MENTIONS)
+                                                      applied_tags=tags, allowed_mentions=NO_MENTIONS,
+                                                      **({'suppress_embeds': True} if suppress_embeds else {}))
                 channel, message = created.thread, created.message
                 created_message = True
             else:
                 if isinstance(channel, discord.Thread) and channel.archived:
                     channel = await channel.edit(archived=False)
                 extra = {'files': files} if files else {}
+                if suppress_embeds:
+                    extra['suppress_embeds'] = True
                 message = await channel_send_once(channel, content, view=view, allowed_mentions=NO_MENTIONS,
                                                   nonce=self.delivery.intent(key)['nonce'], **extra)
                 created_message = True
@@ -433,7 +438,8 @@ class Service:
         if not created_message:
             if isinstance(channel, discord.Thread) and channel.archived:
                 channel = await channel.edit(archived=False)
-            await message.edit(content=content, view=view, allowed_mentions=NO_MENTIONS)
+            extra = {'suppress': True} if suppress_embeds else {}
+            await message.edit(content=content, view=view, allowed_mentions=NO_MENTIONS, **extra)
         self.store.save_publication(key, channel.id, message.id, digest)
         return self.store.publication(key)
 
@@ -447,6 +453,13 @@ class Service:
 
     async def paged_post(self, guild, key, forum_id, name, contents, *, view=None, inline_first=False):
         # One forum post; pages are ordinary bot replies inside it. Only catalog is pinned.
+        async def write(*args, **kwargs):
+            if key.startswith('catalog:') and key.endswith(':plan'):
+                # Queue links remain compact; remove former event previews
+                # from the old schedule when this topic becomes a book list.
+                kwargs['suppress_embeds'] = True
+            return await self.upsert(*args, **kwargs)
+
         root = self.store.publication(key)
         known_root = None
         if root:
@@ -470,7 +483,7 @@ class Service:
         heading = f'**{safe(name[:100])}**'
         if not root or not root['message_id']:
             initial = heading + '\nПодготавливаем страницы…' if len(contents) > 1 else contents[0]
-            root = await self.upsert(guild, key, forum_id, initial, forum_name=name, view=view)
+            root = await write(guild, key, forum_id, initial, forum_name=name, view=view)
 
         def url(publication):
             return f'https://discord.com/channels/{guild.id}/{publication["channel_id"]}/{publication["message_id"]}'
@@ -491,17 +504,17 @@ class Service:
             for index, content in enumerate(contents[1:], 1):
                 section = self.store.publication(f'{key}:page:{index}')
                 if not section or not section['message_id']:
-                    section = await self.upsert(guild, f'{key}:page:{index}', root['channel_id'], content)
+                    section = await write(guild, f'{key}:page:{index}', root['channel_id'], content)
                 sections.append(section)
             changed_ids = False
             for index, content in enumerate(contents[1:]):
-                section = await self.upsert(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
+                section = await write(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
                                            view=navigation(index, sections))
                 changed_ids = changed_ids or section['message_id'] != sections[index]['message_id']
                 sections[index] = section
             if changed_ids:
                 for index, content in enumerate(contents[1:]):
-                    await self.upsert(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
+                    await write(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
                                       view=navigation(index, sections))
             first = contents[0]
             links = []
@@ -511,14 +524,14 @@ class Service:
                 links.append(f'[{label}]({url(pub)})')
             if links:
                 first += '\n\n' + ' · '.join(links)
-            root = await self.upsert(guild, key, forum_id, first, forum_name=name, view=view, known_message=known_root)
+            root = await write(guild, key, forum_id, first, forum_name=name, view=view, known_message=known_root)
             if key.startswith('catalog:'):
                 from .town_cleanup import cleanup_town_pages
                 await cleanup_town_pages(self, guild, key, len(sections))
             else:
                 for old in self.store.rows('SELECT * FROM bc_publications WHERE key LIKE ?', (key + ':page:%',)):
                     if int(old['key'].rsplit(':', 1)[1]) > len(sections):
-                        await self.upsert(guild, old['key'], root['channel_id'],
+                        await write(guild, old['key'], root['channel_id'],
                             'Раздел обновлён. Актуальные материалы и переходы — в начале темы.', view=navigation(0, []))
             return root
 
@@ -528,13 +541,13 @@ class Service:
                 page_key = f'{key}:page:{index}'
                 page = self.store.publication(page_key)
                 if not page or not page['message_id']:
-                    page = await self.upsert(guild, page_key, root['channel_id'], content)
+                    page = await write(guild, page_key, root['channel_id'], content)
                 publications.append(page)
             # Forward links require every page ID. Existing pages skip the
             # provisional write above, so their navigation never toggles on ticks.
             changed_ids = False
             for index, content in enumerate(contents):
-                page = await self.upsert(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
+                page = await write(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
                                          view=navigation(index, publications))
                 changed_ids = changed_ids or page['message_id'] != publications[index]['message_id']
                 publications[index] = page
@@ -542,18 +555,18 @@ class Service:
                 # A missing page discovered during an edit got a new ID. Repair
                 # its neighbours now instead of leaving links stale until a tick.
                 for index, content in enumerate(contents):
-                    await self.upsert(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
+                    await write(guild, f'{key}:page:{index + 1}', root['channel_id'], content,
                                       view=navigation(index, publications))
             content = (heading + f'\nСтраниц: {len(contents)}. На страницах есть кнопки перехода вперёд, назад и к началу.\n'
                        + f'[Первая страница]({url(publications[0])}) · [Последняя страница]({url(publications[-1])})')
-            root = await self.upsert(guild, key, forum_id, content, forum_name=name, view=view, known_message=known_root)
+            root = await write(guild, key, forum_id, content, forum_name=name, view=view, known_message=known_root)
         else:
-            root = await self.upsert(guild, key, forum_id, contents[0], forum_name=name, view=view, known_message=known_root)
+            root = await write(guild, key, forum_id, contents[0], forum_name=name, view=view, known_message=known_root)
         old = self.store.rows("SELECT * FROM bc_publications WHERE key LIKE ?", (key + ':page:%',))
         for pub in old:
             index = int(pub['key'].rsplit(':', 1)[1])
             if index > len(contents) or (len(contents) == 1 and index == 1):
-                await self.upsert(guild, pub['key'], root['channel_id'], 'Эта страница больше не нужна. Актуальная карточка — в начале темы.', view=navigation(0, []))
+                await write(guild, pub['key'], root['channel_id'], 'Эта страница больше не нужна. Актуальная карточка — в начале темы.', view=navigation(0, []))
         return root
 
     async def refresh_book(self, guild, book_id):
