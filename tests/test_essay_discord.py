@@ -350,7 +350,8 @@ class EssayDiscordTests(ClubFixture, unittest.IsolatedAsyncioTestCase):
             await restarted.cog_load()
         restored_views = [call.args[0] for call in self.h.bot.add_view.call_args_list]
         self.assertEqual(len(restored_views), 5)  # Meeting, book, catalog, private actions menu, rules.
-        expected_ids.update({'bc:catalog:1:queue', 'bc:catalog:1:deleted', 'bc:format:1:edit', 'bc:format:1:history'})
+        expected_ids.update({'bc:catalog:1:queue', 'bc:catalog:1:deleted', 'bc:format:1:edit', 'bc:format:1:history',
+                             'bc:town:1:menu'})
         self.assertEqual({child.custom_id for view in restored_views for child in view.children}, expected_ids)
         self.assertTrue(all(view.is_persistent() for view in restored_views))
 
