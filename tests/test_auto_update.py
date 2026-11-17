@@ -121,6 +121,15 @@ class AutomaticUpdaterTests(unittest.TestCase):
         self.auto.save('failed', blocked_commit=OLD, target_commit=OLD)
         self.assertEqual(self.auto.run_once()['state'], 'updated')
 
+    def test_disabling_and_reenabling_preserves_failed_or_interrupted_release_block(self):
+        for state in ('failed', 'deploying'):
+            self.auto.save(state, target_commit=NEW, **({'blocked_commit': NEW} if state == 'failed' else {}))
+            self.config['automatic_enabled'] = False
+            self.assertEqual(self.auto.run_once()['state'], 'disabled')
+            self.config['automatic_enabled'] = True
+            self.assertEqual(self.auto.run_once()['state'], 'blocked_release')
+        self.updater.run.assert_not_called()
+
     def test_unreadable_journal_and_failed_preflight_stop_before_ci_or_deploy(self):
         self.auto.path.write_text('{broken')
         with self.assertRaises(UpdateError):

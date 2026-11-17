@@ -90,9 +90,11 @@ class AutomaticUpdater:
         return report
 
     def run_once(self, *, retry_failed=False):
-        if not self.config["enabled"] or not self.config.get("automatic_enabled", False):
-            return self.save("disabled")
         previous = self.previous()
+        if not self.config["enabled"] or not self.config.get("automatic_enabled", False):
+            blocked = previous.get("blocked_commit") or (
+                previous.get("target_commit") if previous.get("state") == "deploying" else None)
+            return self.save("disabled", **({"blocked_commit": blocked} if blocked else {}))
         updater = self.updater_factory(self.config)
         updater.preflight()  # Clean main, approved remote, same account, mounts and no active import.
         updater.git("fetch", "--prune", self.config["remote"], "main")
