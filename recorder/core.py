@@ -114,6 +114,7 @@ class Session:
         self.people: dict[int, dict] = {}
         self.empty_since: float | None = None
         self.voice_client = None
+        self.board: dict | None = None  # shared ExcaliDash board posted for this meeting
 
     def feed(self, user_id: int, name: str, pcm: bytes) -> None:
         track = self.tracks.get(user_id)
@@ -138,6 +139,9 @@ class Session:
         duration = round(time.time() - self.began)
         meta = {"channel": self.channel_name, "channel_id": self.channel_id, "guild": self.guild_name,
                 "started": self.stamp, "duration": duration, "people": {}}
+        if self.board:
+            meta.update(board=self.board.get("id"), board_url=self.board.get("url"),
+                        board_name=self.board.get("name"))
         for user_id, person in self.people.items():
             track = self.tracks.get(user_id)
             meta["people"][str(user_id)] = dict(person, spoke_sec=round(track.voiced / RATE) if track else 0,

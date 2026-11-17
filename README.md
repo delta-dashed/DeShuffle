@@ -73,6 +73,8 @@ python Shuffle.py
 - `/voice_daily [member] [days]` - show per-day totals for the last N days
 - `/question` (or `!question`) - pick a random human from your voice channel and give them a non-repeating question
 - `/ping` - test if the bot is responsive
+- `/board [name]` - create a shared ExcaliDash whiteboard and post a link that anyone can edit without an account (7 days); `/board_list` shows recent boards with live links
+- `/board_setup <url> [login] [password] [meeting_boards]`, `/board_status`, `/board_off` - Manage Server only: connect the whiteboard (a dedicated board account; the password is stored in `board.json` in the data directory with mode 600 and never shown), check it, or forget it. When a meeting recording starts, the bot also posts a fresh board in that voice chat and stores its id in the recording `meta.json` (`board`, `board_url`, `board_name`)
 - `!sync` - sync application commands to the current guild
 
 ## Configuration

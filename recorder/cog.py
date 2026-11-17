@@ -111,6 +111,26 @@ class Recorder(commands.Cog):
         except Exception:
             log.exception("could not join %s", channel.name)
             self.sessions.pop(channel.id, None)
+            return
+        await self._attach_board(session, channel)
+
+    async def _attach_board(self, session: Session, channel) -> None:
+        """Post a shared board for this meeting when the board cog is set up (optional)."""
+        boards = self.bot.get_cog("Boards")
+        if boards is None:
+            return
+        try:
+            board = await asyncio.wait_for(boards.board_for_meeting(channel), timeout=45)
+        except Exception:
+            log.exception("meeting board for %s", channel.name)
+            return
+        if not board:
+            return
+        session.board = board
+        try:
+            await channel.send(boards.meeting_message(board))
+        except discord.HTTPException:
+            log.warning("could not post the meeting board in %s", channel.name)
 
     async def _connect(self, session: Session, channel) -> None:
         from discord.ext import voice_recv

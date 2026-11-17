@@ -41,6 +41,7 @@ COPY --from=builder /root/.local /home/botuser/.local
 COPY --chown=botuser:botuser Shuffle.py ./Shuffle.py
 COPY --chown=botuser:botuser bookclub ./bookclub
 COPY --chown=botuser:botuser recorder ./recorder
+COPY --chown=botuser:botuser board ./board
 COPY --chown=botuser:botuser questions.json ./questions.json
 
 # Switch to non-root user
