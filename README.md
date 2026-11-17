@@ -125,4 +125,4 @@ Run that image with the same persistent `/data` volume and set `BOOKCLUB_IMPORT_
 
 ## Server updates
 
-After a one-time server setup, `sudo systemctl start reshuffle-update` updates from `main` with a private backup and startup checks. Updates run only on this manual command. See [server update setup and recovery](docs/SERVER_UPDATE.md) for configuration, preserving Compose overrides and optional Codex CLI, and rollback limits.
+GitHub Actions tests each PR and `main` revision and builds a Docker image without Discord credentials. After enabling `reshuffle-auto-update.timer` on the server, a successful `main` revision is deployed automatically within about five minutes: build, private backup, startup checks, then checkout advance. Failed or interrupted releases require an explicit retry; unchanged revisions do not restart the bot. The existing `sudo systemctl start reshuffle-update` remains available for deliberate manual updates. See [server update setup and recovery](docs/SERVER_UPDATE.md) for installation, preserving Compose overrides and optional Codex CLI, and rollback limits.

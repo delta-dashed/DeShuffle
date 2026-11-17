@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the manual, one-shot server updater; never starts an update."""
+"""Install the server updater; optionally enable automatic CI-gated polling."""
 from __future__ import annotations
 
 import argparse
@@ -13,6 +13,8 @@ import tempfile
 
 
 SERVICE_NAME = "reshuffle-update.service"
+AUTO_SERVICE_NAME = "reshuffle-auto-update.service"
+TIMER_NAME = "reshuffle-auto-update.timer"
 MANAGED_MARKER = "# Managed by DeShuffle ops/install_update_service.py"
 
 
@@ -79,7 +81,7 @@ def write_unit(path: Path, content: str) -> None:
 
 
 def install_service(config_path: Path, python: Path, *,
-                    unit_dir: Path = Path("/etc/systemd/system")) -> None:
+                    unit_dir: Path = Path("/etc/systemd/system"), automatic: bool = False) -> None:
     config_path = config_path.resolve(strict=True)
     python = python.resolve(strict=True)
     repo = config_repo(config_path)
@@ -90,12 +92,31 @@ def install_service(config_path: Path, python: Path, *,
         raise InstallError("Refusing to replace an unmanaged updater service")
     content = render_service((repo / "ops" / "systemd" / SERVICE_NAME).read_text(encoding="utf-8"),
                              repo, config_path, python)
+    automatic_units = {}
+    if automatic:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("enabled") is not True or config.get("automatic_enabled") is not True:
+            raise InstallError("Automatic installation requires enabled=true and automatic_enabled=true")
+        if not (repo / "ops" / "auto_update.py").is_file():
+            raise InstallError("Automatic updater is missing from the checkout")
+        for name in (AUTO_SERVICE_NAME, TIMER_NAME):
+            target = unit_dir / name
+            if target.is_symlink() or (target.exists() and MANAGED_MARKER not in target.read_text(encoding="utf-8")):
+                raise InstallError("Refusing to replace an unmanaged automatic updater unit")
+            template = (repo / "ops" / "systemd" / name).read_text(encoding="utf-8")
+            if name == AUTO_SERVICE_NAME:
+                template = template.replace("@UPDATER@", systemd_value(str(repo / "ops" / "auto_update.py"), executable=True))
+            automatic_units[target] = render_service(template, repo, config_path, python)
     # The updater owns validation of Docker, Compose overrides, paths and Git state.
     # --check must remain read-only and also accept disabled updater configs.
     subprocess.run([str(python), str(repo / "ops" / "update_bot.py"),
                     "--config", str(config_path), "--check"], check=True)
     write_unit(unit_path, content)
+    for target, rendered in automatic_units.items():
+        write_unit(target, rendered)
     subprocess.run(["systemctl", "daemon-reload"], check=True)
+    if automatic:
+        subprocess.run(["systemctl", "enable", "--now", TIMER_NAME], check=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -104,6 +125,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="existing server-local updater JSON config")
     parser.add_argument("--python", type=Path, default=Path(sys.executable),
                         help="absolute Python 3.10+ interpreter for the service")
+    parser.add_argument("--automatic", action="store_true", help="install and enable the five-minute CI-gated timer")
     args = parser.parse_args(argv)
     try:
         if sys.platform != "linux" or not hasattr(os, "geteuid") or os.geteuid() != 0:
@@ -112,12 +134,15 @@ def main(argv: list[str] | None = None) -> int:
             raise InstallError("--config and --python must be absolute paths")
         if shutil.which("systemctl") is None:
             raise InstallError("systemctl is required on this host")
-        install_service(args.config, args.python)
+        install_service(args.config, args.python, automatic=args.automatic)
     except (InstallError, OSError, subprocess.CalledProcessError) as exc:
         print("Updater service installation failed: " + str(exc), file=sys.stderr)
         return 1
-    print("Installed reshuffle-update.service. No update was started and no timer was installed.")
-    print("After configuring enabled=true: sudo systemctl start reshuffle-update")
+    if args.automatic:
+        print("Installed updater services and enabled reshuffle-auto-update.timer (five-minute polling).")
+    else:
+        print("Installed reshuffle-update.service. No update was started and no timer was installed.")
+        print("After configuring enabled=true: sudo systemctl start reshuffle-update")
     return 0
 
 

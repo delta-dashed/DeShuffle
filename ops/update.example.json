@@ -1,5 +1,6 @@
 {
   "enabled": false,
+  "automatic_enabled": false,
   "repo": "/srv/reshuffle",
   "remote": "origin",
   "branch": "main",

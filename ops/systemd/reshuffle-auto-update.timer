@@ -1,0 +1,13 @@
+@MANAGED_MARKER@
+[Unit]
+Description=Check DeShuffle main every five minutes
+
+[Timer]
+OnActiveSec=30s
+OnUnitInactiveSec=5min
+AccuracySec=15s
+RandomizedDelaySec=15s
+Unit=reshuffle-auto-update.service
+
+[Install]
+WantedBy=timers.target
