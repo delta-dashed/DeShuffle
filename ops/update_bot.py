@@ -168,7 +168,7 @@ def token_from(container: dict) -> str | None:
 
 
 class Updater:
-    def __init__(self, config: dict, runner=None, *, sleep=time.sleep, now=time.time):
+    def __init__(self, config: dict, runner=None, *, sleep=time.sleep, now=time.time, expected_commit=None):
         self.config = config
         self.repo = Path(config["repo"])
         self.runner = runner or Runner(config["command_timeout"])
@@ -184,6 +184,7 @@ class Updater:
         self.target = ""
         self.old_sha = ""
         self.old_codex = False
+        self.expected_commit = expected_commit
 
     def checkpoint(self, state: str) -> None:
         self.report["state"] = state
@@ -352,6 +353,8 @@ class Updater:
         self.target = self.git("rev-parse", self.config["remote"] + "/main")
         if not re.fullmatch(r"[a-f0-9]{40}", self.target):
             raise UpdateError("Remote main did not resolve to a commit")
+        if self.expected_commit is not None and self.target != self.expected_commit:
+            raise UpdateError("Remote main changed after CI verification; wait for the next check")
         self.git("merge-base", "--is-ancestor", self.old_sha, self.target)
         self.report["target_commit"] = self.target
         # A successful release is identified by the actual container, never just checkout HEAD.

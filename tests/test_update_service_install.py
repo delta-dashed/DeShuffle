@@ -121,6 +121,53 @@ class UpdateServiceInstallTests(unittest.TestCase):
             install.config_repo(self.config)
         self.assertNotIn("private-value", str(raised.exception))
 
+    def prepare_automatic(self):
+        self.config.write_text(json.dumps({'repo': str(self.repo), 'enabled': True,
+                                          'automatic_enabled': True}), encoding='utf-8')
+        (self.repo / 'ops' / 'auto_update.py').write_text('# automatic updater\n', encoding='utf-8')
+        for name in (install.AUTO_SERVICE_NAME, install.TIMER_NAME):
+            source = self.template.parent / name
+            (self.repo / 'ops' / 'systemd' / name).write_text(source.read_text(encoding='utf-8'), encoding='utf-8')
+
+    def test_explicit_automatic_install_validates_then_enables_timer_only(self):
+        self.prepare_automatic()
+        with patch.object(install.subprocess, 'run') as run:
+            install.install_service(self.config, self.python, unit_dir=self.units, automatic=True)
+        self.assertEqual(run.call_args_list[0].args[0][-1], '--check')
+        self.assertEqual(run.call_args_list[-1].args[0], ['systemctl', 'enable', '--now', install.TIMER_NAME])
+        service = (self.units / install.AUTO_SERVICE_NAME).read_text(encoding='utf-8')
+        timer = (self.units / install.TIMER_NAME).read_text(encoding='utf-8')
+        self.assertIn('auto_update.py', service)
+        self.assertNotIn('@', service)
+        self.assertIn('OnUnitInactiveSec=5min', timer)
+        self.assertIn('Unit=reshuffle-auto-update.service', timer)
+
+    def test_automatic_install_needs_both_enable_flags(self):
+        self.prepare_automatic()
+        for key in ('enabled', 'automatic_enabled'):
+            config = {'repo': str(self.repo), 'enabled': True, 'automatic_enabled': True, key: False}
+            self.config.write_text(json.dumps(config), encoding='utf-8')
+            with patch.object(install.subprocess, 'run') as run, self.assertRaises(install.InstallError):
+                install.install_service(self.config, self.python, unit_dir=self.units, automatic=True)
+            run.assert_not_called()
+
+    def test_foreign_timer_is_preserved_before_preflight_or_writes(self):
+        self.prepare_automatic()
+        timer = self.units / install.TIMER_NAME
+        timer.write_text('[Timer]\nOnActiveSec=1s\n', encoding='utf-8')
+        with patch.object(install.subprocess, 'run') as run, self.assertRaisesRegex(install.InstallError, 'unmanaged'):
+            install.install_service(self.config, self.python, unit_dir=self.units, automatic=True)
+        run.assert_not_called()
+        self.assertFalse(self.unit.exists())
+
+    def test_automatic_failed_preflight_does_not_install_or_enable_any_unit(self):
+        self.prepare_automatic()
+        with patch.object(install.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, ['check'])) as run:
+            with self.assertRaises(subprocess.CalledProcessError):
+                install.install_service(self.config, self.python, unit_dir=self.units, automatic=True)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(list(self.units.iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main()
