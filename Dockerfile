@@ -27,6 +27,9 @@ RUN if [ "$INSTALL_CODEX" = "true" ]; then \
 
 WORKDIR /app
 
+# Meeting recorder: opus decoding and the final mixdown
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libopus0     && rm -rf /var/lib/apt/lists/*
+
 # Create non-root user
 RUN useradd -m -u 1000 botuser
 RUN mkdir -p /data && chown botuser:botuser /data
@@ -37,6 +40,7 @@ COPY --from=builder /root/.local /home/botuser/.local
 # Copy application files
 COPY --chown=botuser:botuser Shuffle.py ./Shuffle.py
 COPY --chown=botuser:botuser bookclub ./bookclub
+COPY --chown=botuser:botuser recorder ./recorder
 COPY --chown=botuser:botuser questions.json ./questions.json
 
 # Switch to non-root user

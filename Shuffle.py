@@ -54,6 +54,15 @@ async def setup_hook():
                 store.import_config(guild_id, settings)
             guild_ids = set(guild_settings)
         await bot.add_cog(Club(bot, store, guild_ids=guild_ids, import_config=load_import_config()))
+    # Optional meeting recorder. Inert until an admin enables a channel with
+    # /record_channel_add; a failure here must never stop the shuffle bot.
+    if os.getenv('RECORDER_DISABLED', '').lower() not in ('1', 'true', 'yes'):
+        try:
+            from recorder.cog import setup_recorder
+            await setup_recorder(bot, os.path.dirname(VOICE_STATS_DB_FILE))
+        except Exception:
+            import logging as _logging
+            _logging.getLogger('reshuffle.recorder').exception('Recorder could not be loaded')
 
 
 USE_GUILD_ONLY_APP_COMMANDS = True

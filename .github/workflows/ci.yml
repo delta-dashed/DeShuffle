@@ -36,4 +36,4 @@ jobs:
       - name: Check imports as the image user without network or data
         run: >-
           docker run --rm --network none --entrypoint python reshuffle-ci:${{ github.sha }}
-          -c 'import discord; import bookclub.ui; import bookclub.runtime_health; print("Image imports OK")'
+          -c 'import discord; import bookclub.ui; import bookclub.runtime_health; import recorder.cog; import discord.ext.voice_recv; import davey; print("Image imports OK")'
