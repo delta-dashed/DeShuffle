@@ -1,5 +1,6 @@
 """Late failures must be visible without changing deployments or exposing bot data."""
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -157,6 +158,7 @@ class ExternalMonitorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             before = Path.cwd()
+            previous_umask = os.umask(0o077)
             os.chdir(root)
             try:
                 env = {'GITHUB_SHA': NEW, 'GITHUB_REF': 'refs/heads/main', 'GITHUB_EVENT_NAME': 'schedule',
@@ -164,11 +166,13 @@ class ExternalMonitorTests(unittest.TestCase):
                        'DEPLOY_FEEDBACK_KNOWN_HOSTS': 'secret-host-key'}
                 report = {'format': 1, 'commit': NEW, 'mode': 'check', 'checked_at': 1000,
                           'state': 'unreachable', 'reasons': ['server-or-restricted-ssh-endpoint-unreachable'], 'samples': []}
-                with patch.dict(os.environ, env), patch('ops.github_runtime_monitor.monitor', return_value=report):
+                with patch.dict(os.environ, env), patch('ops.github_runtime_monitor.monitor', return_value=report), patch(
+                        'sys.stdout', new_callable=io.StringIO):
                     self.assertEqual(main([]), 1)
                 self.assertEqual(json.loads((root / 'runtime-health-report/report.json').read_text())['state'], 'unreachable')
                 self.assertNotIn('secret', (root / 'summary.md').read_text())
             finally:
+                os.umask(previous_umask)
                 os.chdir(before)
 
 
