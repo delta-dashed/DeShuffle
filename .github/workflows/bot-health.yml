@@ -1,4 +1,5 @@
 name: Bot health
+run-name: Bot health (${{ github.event_name == 'schedule' && 'GitHub schedule' || inputs.trigger_source || 'manual' }})
 
 on:
   schedule:
@@ -6,6 +7,14 @@ on:
     # Offset from the start of the hour; GitHub schedules can still be delayed.
     - cron: '2,7,12,17,22,27,32,37,42,47,52,57 * * * *'
   workflow_dispatch:
+    inputs:
+      trigger_source:
+        description: Source of this check
+        type: choice
+        default: manual
+        options:
+          - manual
+          - external-timer
 
 permissions:
   contents: read
@@ -31,7 +40,7 @@ jobs:
           DEPLOY_FEEDBACK_KNOWN_HOSTS: ${{ secrets.DEPLOY_FEEDBACK_KNOWN_HOSTS }}
         run: python3 ops/github_runtime_monitor.py
       - name: Save incident or manual diagnostic report
-        if: always() && (failure() || github.event_name == 'workflow_dispatch')
+        if: always() && (failure() || (github.event_name == 'workflow_dispatch' && inputs.trigger_source != 'external-timer'))
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: runtime-health-${{ github.run_id }}-${{ github.run_attempt }}
