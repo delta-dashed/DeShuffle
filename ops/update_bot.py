@@ -106,6 +106,7 @@ def load_config(path: Path) -> dict:
 class Runner:
     def __init__(self, timeout: int):
         self.timeout = timeout
+        self.diagnostics = None
 
     def run(self, args: list[str], *, cwd: str | Path | None = None, timeout: float | None = None) -> str:
         env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
@@ -114,7 +115,12 @@ class Runner:
                                     text=True, encoding="utf-8", errors="replace",
                                     timeout=timeout or self.timeout, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
+            if self.diagnostics:
+                self.diagnostics.record(args, None, getattr(exc, 'stdout', ''), getattr(exc, 'stderr', ''),
+                                        timed_out=isinstance(exc, subprocess.TimeoutExpired))
             raise UpdateError("Command unavailable or timed out: " + args[0]) from exc
+        if self.diagnostics:
+            self.diagnostics.record(args, result.returncode, result.stdout, result.stderr)
         if result.returncode:
             # Docker config/logs can contain tokens. Never echo stdout/stderr or argv.
             raise UpdateError("Command failed: " + args[0])
@@ -185,11 +191,23 @@ class Updater:
         self.old_sha = ""
         self.old_codex = False
         self.expected_commit = expected_commit
+        self.diagnostics = None
 
     def checkpoint(self, state: str) -> None:
         self.report["state"] = state
-        private_json(Path(self.config["state_dir"]) / "last-report.json", self.report)
+        if self.diagnostics:
+            self.diagnostics.phase(state)
+        self.save_report()
         print("Deployment phase: " + state, flush=True)
+
+    def save_report(self):
+        state = Path(self.config['state_dir'])
+        private_json(state / 'last-report.json', self.report)
+        target = self.report.get('target_commit', '')
+        if re.fullmatch(r'[a-f0-9]{40}', target):
+            directory = state / 'deployments'
+            private_directory(directory)
+            private_json(directory / (target + '.json'), self.report)
 
     def remember_files(self) -> dict:
         filenames = list(self.config["compose_files"]) + list(self.config["external_config_files"])
@@ -369,6 +387,8 @@ class Updater:
         stage.rmdir()  # git worktree requires an absent/empty target.
         self.candidate = stage
         self.git("worktree", "add", "--detach", str(stage), self.target)
+        if self.diagnostics:
+            self.diagnostics.repo = stage
         image = self.config["project"] + "-deployment:" + self.target
         override_value = {"services": {self.service: {
             "image": image,
@@ -574,6 +594,17 @@ print(json.dumps({'sha256':digest.hexdigest(),'size':os.path.getsize(p)}))
 
     def run(self) -> dict:
         try:
+            try:
+                from .deployment_diagnostics import DeploymentDiagnostics
+            except ImportError:
+                from deployment_diagnostics import DeploymentDiagnostics
+            self.diagnostics = DeploymentDiagnostics(Path(self.config['state_dir']), self.repo)
+            self.report['diagnostics_id'] = self.diagnostics.identifier
+            if self.expected_commit:
+                self.report['target_commit'] = self.expected_commit
+            if isinstance(self.runner, Runner):
+                self.runner.diagnostics = self.diagnostics
+            self.checkpoint('preflight')
             self.preflight()
             self.build()
             if self.report["state"] != "unchanged":
@@ -583,7 +614,17 @@ print(json.dumps({'sha256':digest.hexdigest(),'size':os.path.getsize(p)}))
             self.report["failed_phase"] = self.report.get("state")
             self.report["state"] = "failed"
             self.report["error"] = str(exc) if isinstance(exc, UpdateError) else type(exc).__name__
+            # Preserve the failed candidate's log before rollback replaces it.
+            if self.deployed:
+                try:
+                    active = self.container(frozen=True)
+                    self.runner.run(['docker', 'logs', '--tail', '200', '--since',
+                                     str(int(self.report['started_at'])), active['Id']], timeout=30)
+                except Exception:
+                    self.report['runtime_log_unavailable'] = True
             try:
+                if self.diagnostics:
+                    self.diagnostics.phase('rollback')
                 self.rollback()
             except Exception as rollback_error:
                 self.report["recovery"] = "manual-recovery-required"
@@ -596,7 +637,9 @@ print(json.dumps({'sha256':digest.hexdigest(),'size':os.path.getsize(p)}))
                 except UpdateError:
                     self.report["worktree_cleanup"] = "manual-cleanup-required"
             self.report["finished_at"] = self.now()
-            private_json(Path(self.config["state_dir"]) / "last-report.json", self.report)
+            if self.diagnostics:
+                self.diagnostics.phase(self.report['state'])
+            self.save_report()
         return self.report
 
 
