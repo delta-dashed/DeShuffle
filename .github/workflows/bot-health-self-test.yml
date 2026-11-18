@@ -1,0 +1,36 @@
+name: Bot health self-test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    name: Simulated ${{ matrix.mode }}
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [unhealthy-test, unreachable-test]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Exercise the real failure-reporting path
+        env:
+          DEPLOY_FEEDBACK_HOST: ${{ secrets.DEPLOY_FEEDBACK_HOST }}
+          DEPLOY_FEEDBACK_KEY: ${{ secrets.DEPLOY_FEEDBACK_KEY }}
+          DEPLOY_FEEDBACK_KNOWN_HOSTS: ${{ secrets.DEPLOY_FEEDBACK_KNOWN_HOSTS }}
+        run: python3 ops/github_runtime_monitor.py --mode ${{ matrix.mode }}
+      - name: Save expected failure report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: runtime-health-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime-health-report/
+          retention-days: 30
+          if-no-files-found: error
