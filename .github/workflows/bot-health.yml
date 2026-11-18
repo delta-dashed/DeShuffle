@@ -1,0 +1,39 @@
+name: Bot health
+
+on:
+  schedule:
+    # Offset from the start of the hour; GitHub schedules can still be delayed.
+    - cron: '2-57/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bot-runtime-health
+  cancel-in-progress: false
+
+jobs:
+  health:
+    name: Current production health
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check server and bot readiness
+        env:
+          DEPLOY_FEEDBACK_HOST: ${{ secrets.DEPLOY_FEEDBACK_HOST }}
+          DEPLOY_FEEDBACK_KEY: ${{ secrets.DEPLOY_FEEDBACK_KEY }}
+          DEPLOY_FEEDBACK_KNOWN_HOSTS: ${{ secrets.DEPLOY_FEEDBACK_KNOWN_HOSTS }}
+        run: python3 ops/github_runtime_monitor.py
+      - name: Save incident or manual diagnostic report
+        if: always() && (failure() || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: runtime-health-${{ github.run_id }}-${{ github.run_attempt }}
+          path: runtime-health-report/
+          retention-days: 30
+          if-no-files-found: warn

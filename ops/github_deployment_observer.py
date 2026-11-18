@@ -42,23 +42,30 @@ def api(path, body):
         return json.load(response)
 
 
-def ssh_report(directory, commit, mode):
-    host = os.environ['DEPLOY_FEEDBACK_HOST']
+def ssh_report(directory, commit, mode, *, unreachable_test=False):
+    commands = {'observe': 'report', 'self-test': 'self-test', 'health': 'health',
+                'health-self-test': 'health-self-test'}
+    if mode not in commands:
+        raise ValueError('Invalid diagnostic mode')
+    host = '127.0.0.1' if unreachable_test else os.environ['DEPLOY_FEEDBACK_HOST']
     if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', host):
         raise ValueError('Invalid host configuration')
     result = subprocess.run([
-        'ssh', '-T', '-i', str(directory / 'key'), '-o', 'IdentitiesOnly=yes',
+        'ssh', '-T', '-p', '1' if unreachable_test else '22', '-i', str(directory / 'key'), '-o', 'IdentitiesOnly=yes',
         '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o',
         'UserKnownHostsFile=' + str(directory / 'known_hosts'), '-o', 'ConnectTimeout=15',
         '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=2',
-        'root@' + host, ('self-test' if mode == 'self-test' else 'report') + ' ' + commit,
-    ], capture_output=True, text=True, timeout=90)
+        'root@' + host, commands[mode] + ' ' + commit,
+    ], capture_output=True, text=True, timeout=60 if mode.startswith('health') else 90)
     if result.returncode or len(result.stdout) > 1_000_000:
         raise ValueError('Restricted server diagnostics unavailable')
     report = json.loads(result.stdout)
-    if (report.get('format') != 1 or report.get('commit') != commit
-            or report.get('state') not in {'pending', 'success', 'failure', 'error', 'superseded'}
-            or bool(report.get('test')) != (mode == 'self-test')):
+    health = mode.startswith('health')
+    states = {'healthy', 'unhealthy', 'unavailable', 'maintenance'} if health else {
+        'pending', 'success', 'failure', 'error', 'superseded'}
+    if (report.get('format') != 1 or report.get('commit') != commit or report.get('state') not in states
+            or bool(report.get('test')) != (mode in {'self-test', 'health-self-test'})
+            or (health and report.get('kind') != 'runtime-health')):
         raise ValueError('Invalid server diagnostic response')
     return report
 

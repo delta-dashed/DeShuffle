@@ -148,9 +148,9 @@ def self_test(config, commit):
 
 
 def parse_command(command):
-    match = re.fullmatch(r'(report|self-test) ([a-f0-9]{40})', command)
+    match = re.fullmatch(r'(report|self-test|health|health-self-test) ([a-f0-9]{40})', command)
     if not match:
-        raise UpdateError('Only report/self-test with one full commit SHA is allowed')
+        raise UpdateError('Only approved diagnostic commands with one full commit SHA are allowed')
     return match.groups()
 
 
@@ -163,7 +163,14 @@ def main(argv=None):
         mode, commit = parse_command(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
         config = load_config(args.config)
         private_directory(Path(config['state_dir']))
-        result = self_test(config, commit) if mode == 'self-test' else collect(config, commit)
+        if mode in {'health', 'health-self-test'}:
+            try:
+                from .runtime_monitor import health_report
+            except ImportError:
+                from runtime_monitor import health_report
+            result = health_report(config, commit, test=mode == 'health-self-test')
+        else:
+            result = self_test(config, commit) if mode == 'self-test' else collect(config, commit)
         print(json.dumps(result, ensure_ascii=True))
         return 0
     except (UpdateError, OSError, ValueError, KeyError, TypeError):

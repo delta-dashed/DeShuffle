@@ -195,6 +195,7 @@ class Updater:
 
     def checkpoint(self, state: str) -> None:
         self.report["state"] = state
+        self.report['phase_started_at'] = self.now()
         if self.diagnostics:
             self.diagnostics.phase(state)
         self.save_report()
