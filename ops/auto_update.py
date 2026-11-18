@@ -87,6 +87,7 @@ class AutomaticUpdater:
     def save(self, state, **fields):
         report = {"state": state, "checked_at": self.now(), **fields}
         private_json(self.path, report)
+        private_json(self.path.with_name('poll-status.json'), {'state': state, 'checked_at': self.now()})
         return report
 
     def run_once(self, *, retry_failed=False):
@@ -129,6 +130,7 @@ def main(argv=None):
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--retry-failed", action="store_true", help="explicitly retry the blocked revision after inspection")
     args = parser.parse_args(argv)
+    config = None
     try:
         config = load_config(args.config)
         if not isinstance(config.get("automatic_enabled", False), bool):
@@ -143,6 +145,12 @@ def main(argv=None):
         return 1 if report["state"] in {"failed", "blocked_release", "blocked_ci"} else 0
     except UpdateError as exc:
         # Keep the last deploy journal intact, especially after an interrupted release.
+        if config:
+            try:
+                private_json(Path(config['state_dir']) / 'poll-status.json',
+                             {'state': 'error', 'checked_at': time.time(), 'error': str(exc)})
+            except OSError:
+                pass
         print(str(exc), file=sys.stderr)
         return 1
 
