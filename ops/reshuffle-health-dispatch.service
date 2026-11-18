@@ -1,0 +1,21 @@
+[Unit]
+Description=Trigger a stale DeShuffle health check in GitHub
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+LoadCredential=github-token:/etc/reshuffle-monitor/github-token
+ExecStart=/usr/bin/python3 /opt/reshuffle-monitor/dispatch_health.py
+TimeoutStartSec=75
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+

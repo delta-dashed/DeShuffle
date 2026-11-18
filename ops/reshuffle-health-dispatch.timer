@@ -1,0 +1,13 @@
+[Unit]
+Description=Keep DeShuffle health checks running independently of GitHub cron
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*-*-* *:01/5:00
+Persistent=true
+AccuracySec=10s
+RandomizedDelaySec=10s
+Unit=reshuffle-health-dispatch.service
+
+[Install]
+WantedBy=timers.target

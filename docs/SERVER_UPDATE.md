@@ -74,6 +74,32 @@ sudo /path/to/python3.12 /srv/reshuffle/ops/auto_update.py \
 
 Workflow **Bot health** проверяет работоспособность независимо от развёртываний по расписанию `2,7,12,17,22,27,32,37,42,47,52,57 * * * *` (примерно каждые пять минут). Явный список минут сохраняет прежнюю частоту и позволяет заново зарегистрировать расписание при публикации изменения в `main`. Проверка запускается на GitHub runner, поэтому недоступность самого сервера тоже даёт красный результат. Используется существующий ограниченный SSH-ключ; новые секреты, доступ к shell и GitHub-токен на сервере не нужны. Workflow имеет только `contents: read` и не изменяет статусы Deployments.
 
+### Независимый резерв расписания
+
+GitHub может задерживать или пропускать события `schedule`. Для независимого запуска на втором сервере устанавливается `reshuffle-health-dispatch.timer`. Он проверяет историю **Bot health** каждые пять минут и вызывает `workflow_dispatch` для `main`, если свежей проверки нет. Проверку бота всё равно выполняет GitHub runner. В Actions источник виден в названии **Bot health (external-timer)**; у штатного cron — **Bot health (GitHub schedule)**. Это автоматические запуски через API, а не события `schedule`.
+
+Таймер размещается отдельно от сервера бота, чтобы остановка последнего не остановила мониторинг. Он не подключается к Discord, Docker или SSH бота. Для GitHub нужен отдельный fine-grained PAT: resource owner `delta-dashed`, только репозиторий `DeShuffle`, repository permission **Actions: read and write** и обязательный **Metadata: read**. Остальные права не выдаются. Actions write также позволяет управлять другими workflow этого репозитория — GitHub не предлагает отдельного права только на dispatch одного workflow. Токен хранится на втором сервере в `/etc/reshuffle-monitor/github-token` (root, `0600`, каталог `0700`), systemd передаёт его службе через `LoadCredential`. Обычный токен разработчика и ключ администратора бота не используются.
+
+Установка на независимом Linux-сервере с Python 3.9+ и systemd 247+ из проверенного checkout:
+
+```bash
+sudo install -d -m 0755 /opt/reshuffle-monitor
+sudo install -d -m 0700 /etc/reshuffle-monitor
+sudo install -m 0644 ops/dispatch_health.py /opt/reshuffle-monitor/dispatch_health.py
+sudo install -m 0644 ops/reshuffle-health-dispatch.service ops/reshuffle-health-dispatch.timer /etc/systemd/system/
+# Сохранить отдельный PAT в /etc/reshuffle-monitor/github-token безопасным способом.
+# Не помещать токен в Git, команды shell, вывод терминала или .env бота.
+sudo chmod 0600 /etc/reshuffle-monitor/github-token
+sudo systemd-analyze verify /etc/systemd/system/reshuffle-health-dispatch.service /etc/systemd/system/reshuffle-health-dispatch.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now reshuffle-health-dispatch.timer
+sudo systemctl list-timers reshuffle-health-dispatch.timer
+```
+
+После установки дождаться двух срабатываний самого timer, проверить `journalctl -u reshuffle-health-dispatch.service` и соответствующие автоматические запуски Actions. `recent-check` означает завершённую проверку моложе четырёх минут; запас до пяти минут учитывает время старта runner. `active-check` означает уже запущенную проверку моложе десяти минут. Завершённый красный результат тоже считается свежим: таймер не пытается немедленно перекрыть его зелёным. Пропущенные/отменённые запуски проверками не считаются. При ошибке GitHub API служба завершается с ошибкой и повторяется по следующему timer; токен и тело ответа не печатаются. Успешные фоновые проверки оставляют Summary и job log; артефакт сохраняется при ошибке или обычном ручном запуске.
+
+После перезагрузки таймер восстанавливается автоматически. Срок PAT нужно отслеживать и заменять токен до его истечения; после замены перезапуск timer не требуется. Ошибки самого резервного таймера видны в его systemd journal. При недоступности GitHub Actions оба способа запуска зависят от восстановления GitHub. Отключение только резерва: `sudo systemctl disable --now reshuffle-health-dispatch.timer`, затем отозвать отдельный PAT; штатное расписание GitHub продолжит действовать.
+
 Откройте **Actions → Bot health → последний запуск**: Summary и шаг **Check server and bot readiness** показывают время проверки, фактический SHA работающего контейнера, итог и безопасные коды причин. При ошибке сохраняется артефакт `runtime-health-…` с JSON и диагностическим логом на 30 дней. Для проверки прямо сейчас нажмите **Run workflow → main**; ручной запуск сохраняет артефакт и при успехе. Значок в README ведёт к истории проверок. Успешный новый запуск показывает восстановление после предыдущего сбоя.
 
 Монитор смотрит на фактический runtime, а не на последний отчёт об обновлении. Работающая старая версия после отката считается здоровой, даже если новый SHA не развернулся. Проверяются наличие единственного контейнера, его работа, SHA, свежий heartbeat, подключение к Discord и успешная свежая сверка книжного клуба. `unhealthy` означает проблему контейнера/бота; `unavailable` — сервер ответил, но получить или подтвердить диагностику не удалось; `unreachable` — недоступен сервер либо ограниченный SSH-доступ (в том числе проблема ключа/сети). Содержимое сообщений и токены не публикуются.
